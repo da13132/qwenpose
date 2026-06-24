@@ -1,0 +1,36 @@
+# Local data, checkpoints, environments, and caches
+datasets
+datasets/
+weights
+weights/
+outputs
+outputs/
+envs
+envs/
+hf_cache
+hf_cache/
+modelscope_cache
+modelscope_cache/
+old-OnePerson-Regression
+old-OnePerson-Regression/
+.cache/
+.tmp/
+.claude/
+.codex_outputs/
+ref-pdf/
+
+# Local vendored/runtime packages not tracked in the public snapshot
+src/transformers/
+src/transformers-*.dist-info/
+src/bin/
+
+# Non-public helper scripts excluded from this snapshot
+scripts/train_eagle_pose.sh
+scripts/eval_eagle_pose.sh
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/

@@ -1,0 +1,568 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+try:
+    from torchvision.ops import roi_align as torchvision_roi_align
+except Exception:  # pragma: no cover - torchvision may be unavailable in minimal envs.
+    torchvision_roi_align = None
+
+from .schemas import SCHEMA_INDICES, SCHEMA_NAMES, UNION_KEYPOINTS
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, depth: int = 3) -> None:
+        super().__init__()
+        layers = []
+        dim = in_dim
+        for _ in range(depth - 1):
+            layers.append(nn.Linear(dim, hidden_dim))
+            layers.append(nn.GELU())
+            dim = hidden_dim
+        layers.append(nn.Linear(dim, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class SinePositionEncoding(nn.Module):
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        if hidden_dim % 4 != 0:
+            raise ValueError("hidden_dim must be divisible by 4 for 2D sine PE.")
+        self.hidden_dim = hidden_dim
+
+    def forward(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        y, x = torch.meshgrid(
+            torch.linspace(0, 1, height, device=device),
+            torch.linspace(0, 1, width, device=device),
+            indexing="ij",
+        )
+        omega = torch.arange(self.hidden_dim // 4, device=device, dtype=torch.float32)
+        omega = 1.0 / (10000 ** (omega / max(len(omega), 1)))
+        pe = torch.cat(
+            [
+                torch.sin(x[..., None] * omega),
+                torch.cos(x[..., None] * omega),
+                torch.sin(y[..., None] * omega),
+                torch.cos(y[..., None] * omega),
+            ],
+            dim=-1,
+        )
+        return pe.view(height * width, self.hidden_dim)
+
+
+def _group_count(hidden_dim: int, max_groups: int = 32) -> int:
+    for groups in range(min(max_groups, hidden_dim), 0, -1):
+        if hidden_dim % groups == 0:
+            return groups
+    return 1
+
+
+class SpatialFeatureInjector(nn.Module):
+    """Near-identity spatial adapter, following Qwen3-VL-Seg's stable injection idea."""
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.norm = nn.GroupNorm(_group_count(hidden_dim), hidden_dim)
+        self.depthwise = nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim)
+        self.scale = nn.Parameter(torch.tensor(1e-3))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.scale.to(dtype=x.dtype) * F.gelu(self.depthwise(self.norm(x)))
+
+
+def canonical_joint_priors() -> torch.Tensor:
+    """Canonical joint locations inside a normalized person box."""
+    priors = {
+        "nose": (0.50, 0.16),
+        "left_eye": (0.44, 0.13),
+        "right_eye": (0.56, 0.13),
+        "left_ear": (0.38, 0.16),
+        "right_ear": (0.62, 0.16),
+        "left_shoulder": (0.36, 0.32),
+        "right_shoulder": (0.64, 0.32),
+        "left_elbow": (0.30, 0.48),
+        "right_elbow": (0.70, 0.48),
+        "left_wrist": (0.26, 0.64),
+        "right_wrist": (0.74, 0.64),
+        "left_hip": (0.42, 0.58),
+        "right_hip": (0.58, 0.58),
+        "left_knee": (0.40, 0.76),
+        "right_knee": (0.60, 0.76),
+        "left_ankle": (0.39, 0.92),
+        "right_ankle": (0.61, 0.92),
+        "neck": (0.50, 0.28),
+        "head_top": (0.50, 0.06),
+        "pelvis": (0.50, 0.60),
+        "thorax": (0.50, 0.38),
+        "upper_neck": (0.50, 0.24),
+    }
+    return torch.tensor([priors[name] for name in UNION_KEYPOINTS], dtype=torch.float32)
+
+
+def box_fourier_pe(boxes: torch.Tensor, hidden_dim: int) -> torch.Tensor:
+    """Fourier PE for normalized xyxy boxes."""
+    wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
+    log_wh = 0.2 * torch.log(wh) + 0.5
+    geom = torch.cat([boxes[..., :2], log_wh], dim=-1)
+    pe = _bounded_fourier_features(geom, hidden_dim)
+    if pe.shape[-1] < hidden_dim:
+        pe = F.pad(pe, (0, hidden_dim - pe.shape[-1]))
+    return pe[..., :hidden_dim].to(dtype=boxes.dtype)
+
+
+def _bounded_fourier_features(values: torch.Tensor, hidden_dim: int, max_log2_freq: float = 8.0) -> torch.Tensor:
+    """Stable Fourier features for low-dimensional normalized geometry.
+
+    The old 2**arange schedule reaches extreme frequencies when hidden_dim is
+    large. In fp16/bf16 that can overflow or make sin/cos return NaNs, which then
+    poisons Hungarian matching. A bounded log-spaced schedule keeps the same
+    periodic inductive bias without entering the numerically hostile range.
+    """
+    num_coords = int(values.shape[-1])
+    num_freq = max(hidden_dim // max(2 * num_coords, 1), 1)
+    values_f = values.float()
+    freq = torch.linspace(
+        0.0,
+        max_log2_freq,
+        num_freq,
+        device=values.device,
+        dtype=torch.float32,
+    )
+    freq = (2.0 ** freq) * torch.pi
+    feat = values_f[..., None] * freq
+    pe = torch.cat([torch.sin(feat), torch.cos(feat)], dim=-1).flatten(-2)
+    if pe.shape[-1] < hidden_dim:
+        pe = F.pad(pe, (0, hidden_dim - pe.shape[-1]))
+    return pe[..., :hidden_dim]
+
+
+def point_fourier_pe(points: torch.Tensor, hidden_dim: int) -> torch.Tensor:
+    """Fourier PE for normalized xy points."""
+    pe = _bounded_fourier_features(points, hidden_dim)
+    if pe.shape[-1] < hidden_dim:
+        pe = F.pad(pe, (0, hidden_dim - pe.shape[-1]))
+    return pe[..., :hidden_dim].to(dtype=points.dtype)
+
+
+def boxes_from_cxcywh(raw: torch.Tensor) -> torch.Tensor:
+    cxcy = raw[..., :2].sigmoid()
+    wh = raw[..., 2:].sigmoid() * 0.9
+    xy1 = cxcy - wh * 0.5
+    xy2 = cxcy + wh * 0.5
+    return torch.cat([xy1, xy2], dim=-1).clamp(0.0, 1.0)
+
+
+def expand_boxes_xyxy(boxes: torch.Tensor, scale: float) -> torch.Tensor:
+    scale = max(float(scale), 1e-4)
+    center = (boxes[..., :2] + boxes[..., 2:]) * 0.5
+    wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4) * scale
+    xy1 = center - wh * 0.5
+    xy2 = center + wh * 0.5
+    return torch.cat([xy1, xy2], dim=-1).clamp(0.0, 1.0)
+
+
+def box_soft_gate(
+    boxes: torch.Tensor,
+    box_mask: torch.Tensor,
+    height: int,
+    width: int,
+    expand_ratio: float = 0.15,
+    alpha: float = 20.0,
+) -> torch.Tensor:
+    """Build a differentiable per-image spatial gate from normalized boxes."""
+    b, n, _ = boxes.shape
+    y, x = torch.meshgrid(
+        torch.linspace(0, 1, height, device=boxes.device, dtype=boxes.dtype),
+        torch.linspace(0, 1, width, device=boxes.device, dtype=boxes.dtype),
+        indexing="ij",
+    )
+    xy1 = boxes[..., :2]
+    xy2 = boxes[..., 2:]
+    wh = (xy2 - xy1).clamp(min=1e-4)
+    xy1 = (xy1 - wh * (expand_ratio * 0.5)).clamp(0.0, 1.0)
+    xy2 = (xy2 + wh * (expand_ratio * 0.5)).clamp(0.0, 1.0)
+    x = x.view(1, 1, height, width)
+    y = y.view(1, 1, height, width)
+    x1 = xy1[..., 0].view(b, n, 1, 1)
+    y1 = xy1[..., 1].view(b, n, 1, 1)
+    x2 = xy2[..., 0].view(b, n, 1, 1)
+    y2 = xy2[..., 1].view(b, n, 1, 1)
+    gate = (
+        torch.sigmoid(alpha * (x - x1))
+        * torch.sigmoid(alpha * (x2 - x))
+        * torch.sigmoid(alpha * (y - y1))
+        * torch.sigmoid(alpha * (y2 - y))
+    )
+    gate = gate.masked_fill(~box_mask.view(b, n, 1, 1), 0.0)
+    return gate.max(dim=1, keepdim=True).values
+
+
+@dataclass
+class QwenPoseConfig:
+    hidden_dim: int = 448
+    external_dim: int = 2560
+    pose_decoder_layers: int = 1
+    refinement_steps: int = 3
+    decoder_heads: int = 8
+    box_condition_scale: float = 1.2
+    pose_roi_size: int = 16
+    use_uncertainty: bool = True
+    use_refinement: bool = True
+    use_aux_center: bool = True
+    use_simcc: bool = True
+    simcc_bins: int = 128
+
+
+class QwenPoseModel(nn.Module):
+    def __init__(self, config: QwenPoseConfig) -> None:
+        super().__init__()
+        self.config = config
+        c = config.hidden_dim
+        self.external_feature_proj = nn.Conv2d(config.external_dim, c, 1)
+        self.spatial_injector = SpatialFeatureInjector(c)
+        self.external_text_proj = nn.Sequential(
+            nn.LayerNorm(config.external_dim),
+            nn.Linear(config.external_dim, c),
+            nn.GELU(),
+        )
+        self.pos_encoding = SinePositionEncoding(c)
+
+        self.schema_embed = nn.Embedding(len(SCHEMA_NAMES), c)
+        self.task_embed = nn.Embedding(2, c)
+        self.joint_embed = nn.Embedding(len(UNION_KEYPOINTS), c)
+        self.register_buffer("union_joint_priors", canonical_joint_priors(), persistent=False)
+        self.box_query_proj = nn.Sequential(
+            nn.LayerNorm(c),
+            MLP(c, c, c, depth=2),
+            nn.LayerNorm(c),
+        )
+        self.roi_memory_norm = nn.LayerNorm(c)
+        self.roi_pool_proj = nn.Sequential(
+            nn.LayerNorm(c),
+            MLP(c, c, c, depth=2),
+            nn.LayerNorm(c),
+        )
+        same_joint_layer = nn.TransformerEncoderLayer(
+            d_model=c,
+            nhead=config.decoder_heads,
+            dim_feedforward=c * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.same_joint_context = nn.TransformerEncoder(same_joint_layer, num_layers=1)
+        self.instance_query_norm = nn.LayerNorm(c)
+        self.pose_query_norm = nn.LayerNorm(c)
+        max_schema_keypoints = max(int(indices.numel()) for indices in SCHEMA_INDICES.values())
+        schema_joint_indices = torch.zeros(len(SCHEMA_NAMES), max_schema_keypoints, dtype=torch.long)
+        schema_joint_valid = torch.zeros(len(SCHEMA_NAMES), max_schema_keypoints, dtype=torch.bool)
+        for schema_id, schema_name in enumerate(SCHEMA_NAMES):
+            indices = SCHEMA_INDICES[schema_name].long()
+            schema_joint_indices[schema_id, : indices.numel()] = indices
+            schema_joint_valid[schema_id, : indices.numel()] = True
+        self.register_buffer("schema_joint_indices", schema_joint_indices, persistent=False)
+        self.register_buffer("schema_joint_valid", schema_joint_valid, persistent=False)
+        pose_decoder_layer = nn.TransformerDecoderLayer(
+            d_model=c,
+            nhead=config.decoder_heads,
+            dim_feedforward=c * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.pose_decoder = nn.TransformerDecoder(pose_decoder_layer, num_layers=config.pose_decoder_layers)
+        self.pose_xy_head = MLP(c, c, 2, depth=3)
+        self.pose_vis_head = MLP(c, c, 1, depth=3)
+        self.pose_sigma_head = MLP(c, c, 2, depth=3) if config.use_uncertainty else None
+        simcc_bins = max(int(config.simcc_bins), 2)
+        self.simcc_x_head = MLP(c, c, simcc_bins, depth=3) if config.use_simcc else None
+        self.simcc_y_head = MLP(c, c, simcc_bins, depth=3) if config.use_simcc else None
+        if config.use_refinement:
+            self.local_proj = nn.Conv2d(c, c, 1)
+            joint_context_layer = nn.TransformerEncoderLayer(
+                d_model=c,
+                nhead=config.decoder_heads,
+                dim_feedforward=c * 4,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+            )
+            self.joint_context = nn.TransformerEncoder(joint_context_layer, num_layers=1)
+            refinement_steps = max(int(config.refinement_steps), 1)
+            self.refine_heads = nn.ModuleList([MLP(c * 3, c, 2, depth=3) for _ in range(refinement_steps)])
+            self.refine_token_fusers = nn.ModuleList([MLP(c * 3, c, c, depth=2) for _ in range(refinement_steps)])
+            self.refine_step_scales = nn.Parameter(torch.full((refinement_steps,), -1.4))
+            for head in self.refine_heads:
+                self._zero_init_last_linear(head)
+            for fuser in self.refine_token_fusers:
+                self._zero_init_last_linear(fuser)
+        else:
+            self.local_proj = None
+            self.joint_context = None
+            self.refine_heads = None
+            self.refine_token_fusers = None
+            self.refine_step_scales = None
+        self.aux_center_head = nn.Conv2d(c, 1, 1) if config.use_aux_center else None
+        self._zero_init_last_linear(self.pose_xy_head)
+
+    def forward(
+        self,
+        schema_ids: torch.Tensor,
+        task_ids: torch.Tensor,
+        external_feature_map: torch.Tensor | None = None,
+        external_text_embed: torch.Tensor | None = None,
+        target_boxes: torch.Tensor | None = None,
+        target_box_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if external_feature_map is None or external_text_embed is None:
+            raise ValueError("QwenPoseModel now requires Qwen3-VL external_feature_map and external_text_embed.")
+        if target_boxes is None or target_box_mask is None:
+            raise ValueError("QwenPoseModel requires box conditions from the LLM/teacher-forced targets.")
+        target_boxes = target_boxes.to(device=external_feature_map.device).clamp(0.0, 1.0)
+        target_box_mask = target_box_mask.to(device=external_feature_map.device).bool()
+        pose_boxes = expand_boxes_xyxy(target_boxes, self.config.box_condition_scale)
+        dtype = self.external_feature_proj.weight.dtype
+        feature_map = self.external_feature_proj(external_feature_map.to(dtype=dtype))
+        feature_map = self.spatial_injector(feature_map)
+        image_embed = feature_map.mean(dim=(2, 3))
+        text_dtype = next(self.external_text_proj.parameters()).dtype
+        text_embed = self.external_text_proj(external_text_embed.to(dtype=text_dtype))
+        b, c, h, w = feature_map.shape
+
+        input_boxes = target_boxes.to(dtype=feature_map.dtype)
+        boxes = pose_boxes.to(dtype=feature_map.dtype)
+        box_mask = target_box_mask
+        num_boxes = boxes.shape[1]
+        box_embed = self.box_query_proj(box_fourier_pe(boxes, c))
+        roi_size = max(int(self.config.pose_roi_size), 2)
+        roi_features = self._sample_box_feature_maps(feature_map, boxes, roi_size)
+        roi_features = roi_features * box_mask.view(b, num_boxes, 1, 1, 1).to(dtype=roi_features.dtype)
+        roi_pooled = roi_features.mean(dim=(-2, -1))
+        roi_embed = self.roi_pool_proj(roi_pooled)
+        instance = self.instance_query_norm(
+            box_embed + roi_embed + image_embed[:, None, :] + 0.2 * text_embed[:, None, :]
+        )
+        person_logits = torch.where(
+            box_mask,
+            torch.full_like(boxes[..., 0], 10.0),
+            torch.full_like(boxes[..., 0], -10.0),
+        )
+        ref_logits = person_logits
+
+        schema_joint_indices = self.schema_joint_indices[schema_ids]
+        schema_joint_valid = self.schema_joint_valid[schema_ids]
+        active_k = max(int(schema_joint_valid.sum(dim=1).max().item()), 1)
+        schema_joint_indices = schema_joint_indices[:, :active_k]
+        schema_joint_valid = schema_joint_valid[:, :active_k]
+        schema_scatter_map = self._build_schema_scatter_map(
+            schema_joint_indices,
+            schema_joint_valid,
+            union_dim=len(UNION_KEYPOINTS),
+            dtype=feature_map.dtype,
+        )
+        joint_base = self.joint_embed(schema_joint_indices).view(b, 1, active_k, c)
+        joint_prior = self.union_joint_priors.to(device=feature_map.device, dtype=feature_map.dtype)
+        joint_prior = joint_prior[schema_joint_indices]
+        joint_prior_pe = point_fourier_pe(joint_prior, c).view(b, 1, active_k, c)
+        schema = self.schema_embed(schema_ids).view(b, 1, 1, c)
+        task = self.task_embed(task_ids).view(b, 1, 1, c)
+        box_pe = box_embed.view(b, num_boxes, 1, c)
+        text = text_embed.view(b, 1, 1, c)
+        pose_tokens = self.pose_query_norm(
+            instance[:, :, None, :] + joint_base + joint_prior_pe + schema + task + box_pe + 0.2 * text
+        )
+        pose_valid = schema_joint_valid[:, None, :].expand(b, num_boxes, active_k) & box_mask[:, :, None]
+        same_joint_tokens = pose_tokens.permute(0, 2, 1, 3).reshape(b * active_k, num_boxes, c)
+        same_joint_valid = (
+            schema_joint_valid[:, :, None].expand(b, active_k, num_boxes) & box_mask[:, None, :]
+        ).reshape(b * active_k, num_boxes)
+        same_joint_padding_mask = ~same_joint_valid
+        same_joint_padding_mask = same_joint_padding_mask.masked_fill(
+            same_joint_padding_mask.all(dim=1, keepdim=True),
+            False,
+        )
+        same_joint_tokens = self.same_joint_context(
+            same_joint_tokens,
+            src_key_padding_mask=same_joint_padding_mask,
+        )
+        pose_tokens = same_joint_tokens.view(b, active_k, num_boxes, c).permute(0, 2, 1, 3)
+
+        roi_memory = roi_features.flatten(3).permute(0, 1, 3, 2)
+        roi_pe = self.pos_encoding(roi_size, roi_size, feature_map.device).to(dtype=roi_memory.dtype)
+        roi_memory = self.roi_memory_norm(roi_memory + roi_pe.view(1, 1, roi_size * roi_size, c))
+        roi_memory = roi_memory.reshape(b * num_boxes, roi_size * roi_size, c)
+        pose_tokens = pose_tokens.reshape(b * num_boxes, active_k, c)
+        pose_padding_mask = ~pose_valid.reshape(b * num_boxes, active_k)
+        pose_padding_mask = pose_padding_mask.masked_fill(pose_padding_mask.all(dim=1, keepdim=True), False)
+        pose_tokens = self.pose_decoder(
+            pose_tokens,
+            roi_memory,
+            tgt_key_padding_mask=pose_padding_mask,
+        )
+        pose_tokens = pose_tokens.view(b, num_boxes, active_k, c)
+
+        prior_logits = torch.logit(joint_prior.clamp(1e-4, 1.0 - 1e-4)).view(b, 1, active_k, 2)
+        rel_xy = torch.sigmoid(prior_logits + self.pose_xy_head(pose_tokens))
+        wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
+        keypoint_xy = boxes[..., None, :2] + rel_xy * wh[..., None, :]
+        keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
+
+        refine_keypoint_xy_steps: list[torch.Tensor] = []
+        if (
+            self.refine_heads is not None
+            and self.refine_token_fusers is not None
+            and self.joint_context is not None
+            and self.local_proj is not None
+        ):
+            local_feature_map = self.local_proj(feature_map)
+            context_mask = ~pose_valid.reshape(b * num_boxes, active_k)
+            context_mask = context_mask.masked_fill(context_mask.all(dim=1, keepdim=True), False)
+            for refine_idx, (refine_head, token_fuser) in enumerate(zip(self.refine_heads, self.refine_token_fusers)):
+                pose_tokens = self.joint_context(
+                    pose_tokens.reshape(b * num_boxes, active_k, c),
+                    src_key_padding_mask=context_mask,
+                ).reshape(b, num_boxes, active_k, c)
+                local = self._sample_local_features(local_feature_map, keypoint_xy)
+                point_pe = point_fourier_pe(keypoint_xy, c)
+                refine_input = torch.cat([pose_tokens, local, point_pe], dim=-1)
+                delta = torch.tanh(refine_head(refine_input))
+                scale = self.refine_step_scales[refine_idx].sigmoid().to(dtype=delta.dtype) * 0.25
+                keypoint_xy = (keypoint_xy + delta * wh[..., None, :] * scale).clamp(0.0, 1.0)
+                refine_keypoint_xy_steps.append(keypoint_xy)
+                pose_tokens = pose_tokens + token_fuser(refine_input)
+
+        keypoint_vis = self.pose_vis_head(pose_tokens).sigmoid()
+        schema_keypoints = torch.cat([keypoint_xy, keypoint_vis], dim=-1)
+        keypoints = self._scatter_schema_keypoints(schema_keypoints, schema_scatter_map)
+        keypoint_valid_mask = schema_scatter_map.bool().any(dim=1)
+        outputs = {
+            "person_logits": person_logits,
+            "boxes": input_boxes,
+            "pose_boxes": boxes,
+            "box_mask": box_mask,
+            "keypoints": keypoints,
+            "keypoint_valid_mask": keypoint_valid_mask,
+            "ref_logits": ref_logits,
+            "instance_emb": instance,
+            "schema_joint_indices": schema_joint_indices,
+            "schema_joint_valid": schema_joint_valid,
+        }
+        if refine_keypoint_xy_steps:
+            outputs["refine_keypoints"] = [
+                self._scatter_schema_keypoints(torch.cat([xy, keypoint_vis], dim=-1), schema_scatter_map)
+                for xy in refine_keypoint_xy_steps
+            ]
+        if self.simcc_x_head is not None and self.simcc_y_head is not None:
+            outputs["simcc_x_logits"] = self.simcc_x_head(pose_tokens)
+            outputs["simcc_y_logits"] = self.simcc_y_head(pose_tokens)
+        if self.pose_sigma_head is not None:
+            outputs["keypoint_sigma"] = self._scatter_schema_keypoints(
+                self.pose_sigma_head(pose_tokens),
+                schema_scatter_map,
+            )
+        if self.aux_center_head is not None:
+            outputs["aux_center_logits"] = self.aux_center_head(feature_map)
+        return outputs
+
+    @staticmethod
+    def _build_schema_scatter_map(
+        schema_joint_indices: torch.Tensor,
+        schema_joint_valid: torch.Tensor,
+        union_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        scatter_map = F.one_hot(schema_joint_indices, num_classes=union_dim).to(dtype=dtype)
+        return scatter_map * schema_joint_valid[..., None].to(dtype=dtype)
+
+    @staticmethod
+    def _scatter_schema_keypoints(
+        values: torch.Tensor,
+        schema_scatter_map: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.einsum("bqkd,bku->bqud", values, schema_scatter_map)
+
+    @staticmethod
+    def _sample_local_features(feature_map: torch.Tensor, keypoint_xy: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = feature_map.shape
+        q, u = keypoint_xy.shape[1], keypoint_xy.shape[2]
+        grid = keypoint_xy * 2.0 - 1.0
+        grid = grid.view(b, q * u, 1, 2)
+        sampled = F.grid_sample(feature_map, grid, align_corners=False)
+        sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, u, c)
+        return sampled
+
+    @staticmethod
+    def _sample_box_feature_maps(feature_map: torch.Tensor, boxes: torch.Tensor, roi_size: int) -> torch.Tensor:
+        b, c, _, _ = feature_map.shape
+        num_boxes = boxes.shape[1]
+        if num_boxes == 0:
+            return feature_map.new_zeros(b, 0, c, roi_size, roi_size)
+        if torchvision_roi_align is not None:
+            feature_h, feature_w = feature_map.shape[-2:]
+            flat_boxes = boxes.to(dtype=feature_map.dtype).reshape(b * num_boxes, 4)
+            scales = flat_boxes.new_tensor([feature_w, feature_h, feature_w, feature_h])
+            flat_boxes = flat_boxes * scales
+            # Keep zero-padded/degenerate boxes numerically safe; the caller will
+            # mask them out afterwards via box_mask.
+            flat_boxes[:, 2] = torch.maximum(flat_boxes[:, 2], flat_boxes[:, 0] + 1e-4)
+            flat_boxes[:, 3] = torch.maximum(flat_boxes[:, 3], flat_boxes[:, 1] + 1e-4)
+            batch_indices = (
+                torch.arange(b, device=feature_map.device)
+                .repeat_interleave(num_boxes)
+                .to(dtype=feature_map.dtype)
+                .unsqueeze(1)
+            )
+            rois = torch.cat([batch_indices, flat_boxes], dim=1)
+            # Some torchvision builds do not provide a CUDA roi_align kernel for
+            # bfloat16. Run roi_align in float32 and cast back so the rest of the
+            # pose head can stay in the original mixed-precision dtype.
+            roi_feature_map = feature_map
+            roi_rois = rois
+            if feature_map.dtype == torch.bfloat16:
+                roi_feature_map = feature_map.float()
+                roi_rois = rois.float()
+            pooled = torchvision_roi_align(
+                roi_feature_map,
+                roi_rois,
+                output_size=(roi_size, roi_size),
+                spatial_scale=1.0,
+                sampling_ratio=-1,
+                aligned=True,
+            )
+            return pooled.to(dtype=feature_map.dtype).view(b, num_boxes, c, roi_size, roi_size)
+        y, x = torch.meshgrid(
+            torch.linspace(0.0, 1.0, roi_size, device=feature_map.device, dtype=feature_map.dtype),
+            torch.linspace(0.0, 1.0, roi_size, device=feature_map.device, dtype=feature_map.dtype),
+            indexing="ij",
+        )
+        base = torch.stack([x, y], dim=-1).view(1, 1, roi_size, roi_size, 2)
+        sample_boxes = boxes.to(dtype=feature_map.dtype)
+        xy1 = sample_boxes[..., :2].unsqueeze(2).unsqueeze(2)
+        wh = (sample_boxes[..., 2:] - sample_boxes[..., :2]).clamp(min=1e-4).unsqueeze(2).unsqueeze(2)
+        grid = (xy1 + base * wh).clamp(0.0, 1.0) * 2.0 - 1.0
+        flat_grid = grid.view(b * num_boxes, roi_size, roi_size, 2)
+        batch_indices = torch.arange(b, device=feature_map.device, dtype=torch.long).repeat_interleave(num_boxes)
+        flat_features = feature_map.index_select(0, batch_indices)
+        sampled = F.grid_sample(flat_features, flat_grid, align_corners=False)
+        return sampled.view(b, num_boxes, c, roi_size, roi_size)
+
+    @staticmethod
+    def _zero_init_last_linear(module: nn.Module) -> None:
+        for child in reversed(list(module.modules())):
+            if isinstance(child, nn.Linear):
+                nn.init.zeros_(child.weight)
+                if child.bias is not None:
+                    nn.init.zeros_(child.bias)
+                return
+
+
+def count_trainable_parameters(model: nn.Module) -> tuple[int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable, total

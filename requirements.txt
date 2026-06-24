@@ -1,10 +1,18 @@
-# Install torch, torchvision, and flash-attn separately for your CUDA stack first.
-# Example (adjust to your machine/CUDA):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-#   pip install flash-attn --no-build-isolation
+# Runtime dependencies for the public Qwen3-VL QwenPose workflow.
+# Tested with Python 3.11.15 and CUDA 12.6.
+#
+# Install the PyTorch stack first so that flash-attn and the rest of the
+# training stack resolve against the correct CUDA build, for example:
+#   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+#     --index-url https://download.pytorch.org/whl/cu126
+#
+# Then install:
+#   pip install -r requirements.txt
 
 accelerate==1.7.0
 deepspeed==0.17.1
+flash-attn==2.8.3
+huggingface_hub==0.36.2
 numpy==2.2.6
 peft==0.17.1
 Pillow==12.2.0
@@ -12,5 +20,6 @@ pycocotools==2.0.11
 safetensors==0.7.0
 scipy==1.17.1
 sentencepiece==0.2.1
+tokenizers==0.22.2
 tqdm==4.67.3
 transformers==4.57.6

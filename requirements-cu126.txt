@@ -1,0 +1,14 @@
+# Exact tested installation target for QwenPose v0.1.0.
+# This file is for Linux + Python 3.11 + CUDA 12.6 reproduction.
+#
+# Install with:
+#   pip install -r requirements-cu126.txt
+
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+
+-r requirements.txt

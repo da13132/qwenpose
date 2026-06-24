@@ -26,7 +26,7 @@ from .schemas import SCHEMA_TO_ID, UNION_KEYPOINTS, get_schema, mpii_to_union, s
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 6
+RECORD_CACHE_VERSION = 7
 
 
 def _distributed_rank() -> int:
@@ -575,7 +575,7 @@ def _load_aic_image_sizes(
     disable_cache: bool,
     show_progress: bool,
 ) -> dict[str, tuple[int, int]]:
-    ann_path = root / "ai_challenger_keypoint_train_annotations_20170909" / "keypoint_train_annotations_20170909.json"
+    ann_path = resolve_aic_annotation_path(root)
     source_paths = [ann_path, image_root]
     target_annotations = annotations if max_images is None else annotations[: max(int(max_images), 0)]
     cache_path = None
@@ -642,6 +642,36 @@ def _load_aic_image_sizes(
             f"({time.perf_counter() - started:.2f}s)"
         )
     return size_map
+
+
+def resolve_aic_annotation_path(root: Path) -> Path:
+    candidates = [
+        root / "ai_challenger_keypoint_train_annotations_20170909" / "keypoint_train_annotations_20170909.json",
+        root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_annotations_20170902.json",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find the AIC annotation JSON. Supported layouts are: "
+        "ai_challenger_keypoint_train_annotations_20170909/keypoint_train_annotations_20170909.json "
+        "or ai_challenger_keypoint_train_20170902/keypoint_train_annotations_20170902.json. "
+        f"Tried: {', '.join(str(path) for path in candidates)}"
+    )
+
+
+def resolve_aic_image_root(root: Path) -> Path:
+    candidates = [
+        root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_images_20170902",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find the AIC image directory. Expected: "
+        "ai_challenger_keypoint_train_20170902/keypoint_train_images_20170902. "
+        f"Tried: {', '.join(str(path) for path in candidates)}"
+    )
 
 
 def load_coco_records(
@@ -742,8 +772,8 @@ def load_aic_records(
 ) -> list[PoseRecord]:
     if split not in ("train", "trainval"):
         _data_log(f"AIC split {split!r} is not available in this local tree; falling back to train.")
-    ann_path = root / "ai_challenger_keypoint_train_annotations_20170909" / "keypoint_train_annotations_20170909.json"
-    image_root = root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_images_20170902"
+    ann_path = resolve_aic_annotation_path(root)
+    image_root = resolve_aic_image_root(root)
     data = json.load(open(ann_path, encoding="utf-8"))
     image_size_map = _load_aic_image_sizes(
         root=root,
@@ -1037,11 +1067,7 @@ def build_datasets(
             )
         elif name == "aic":
             root = dataset_root / "aic"
-            source_paths = [
-                root
-                / "ai_challenger_keypoint_train_annotations_20170909"
-                / "keypoint_train_annotations_20170909.json"
-            ]
+            source_paths = [resolve_aic_annotation_path(root)]
             records = _load_records_cached(
                 dataset_name=name,
                 root=root,

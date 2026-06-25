@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v0.2.1`
+Release: `v0.2.2`
 
 English | [中文说明](README_zh.md)
 
@@ -14,7 +14,6 @@ This public release is intentionally scoped to the Qwen3-VL path. The Eagle shel
 ## Included Scope
 
 - `scripts/train_qwenpose_two_stage.sh`: main two-stage training entrypoint
-- `scripts/train_qwenpose_one_stage.sh`: compatibility wrapper for the renamed script
 - `scripts/eval_qwenpose.sh`: evaluation entrypoint
 - `scripts/zero2.json`, `scripts/zero3.json`, `scripts/zero3_offload.json`: DeepSpeed presets
 - `src/qwenpose/`: data loading, model definition, training, evaluation, checkpointing, and LoRA merge utilities
@@ -31,7 +30,6 @@ qwenpose/
 ├── requirements-cu126.txt
 ├── scripts/
 │   ├── eval_qwenpose.sh
-│   ├── train_qwenpose_one_stage.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
@@ -375,6 +373,6 @@ This repository now uses explicit release versioning:
 
 New releases should update `VERSION`, prepend a new entry to `CHANGELOG.md`, and push a matching git tag so the latest version is easy to identify on GitHub.
 
-## Compatibility Note
+## Official Entrypoint
 
-`scripts/train_qwenpose_one_stage.sh` is kept only as a compatibility wrapper for older local habits. The maintained public entrypoint is `scripts/train_qwenpose_two_stage.sh`.
+The maintained public training entrypoint is `scripts/train_qwenpose_two_stage.sh`.

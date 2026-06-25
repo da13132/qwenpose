@@ -2,6 +2,12 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v0.2.1 - 2026-06-25
+
+- Clarified the public README and Chinese README so the documented defaults match the live `scripts/train_qwenpose_two_stage.sh` behavior.
+- Added explicit guidance for `scripts/zero2.json`, `scripts/zero3.json`, and `scripts/zero3_offload.json`, including when to use each ZeRO preset.
+- Corrected the RefHuman documentation to show that the public default recipe stays on COCO unless RefHuman is enabled explicitly.
+
 ## v0.2.0 - 2026-06-25
 
 - Integrated the latest local QwenPose two-stage training updates centered on `scripts/train_qwenpose_two_stage.sh`.

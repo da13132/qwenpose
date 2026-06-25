@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v0.2.0`
+版本：`v0.2.1`
 
 [English](README.md) | 中文
 
@@ -240,8 +240,16 @@ datasets/refhuman/
 说明：
 
 - RefHuman 提供的是带文本描述的 `REF_POSE` 样本
-- 两阶段默认配置中，RefHuman 会在 stage 2 使用
+- 当前公开默认配方不会自动启用 RefHuman，需要时请手动加入
 - `REFHUMAN_MAX_CAPTIONS_PER_INSTANCE` 用于控制每个实例最多保留多少条 caption
+
+示例：
+
+```bash
+STAGE2_TRAIN_DATASETS=coco,refhuman \
+STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE=1 \
+scripts/train_qwenpose_two_stage.sh
+```
 
 ## 默认训练配方
 
@@ -264,6 +272,13 @@ scripts/train_qwenpose_two_stage.sh
 - Stage 1 epoch：`2`
 - Stage 2 epoch：`1`
 - 默认 ZeRO 方案：`zero2`
+
+DeepSpeed 预设选择：
+
+- `ZERO_STAGE=zero2`：使用 `scripts/zero2.json`，是标准多卡训练的默认推荐方案
+- `ZERO_STAGE=zero3`：使用 `scripts/zero3.json`，进一步节省显存，但运行开销更高
+- `ZERO_STAGE=zero3_offload`：使用 `scripts/zero3_offload.json`，显存占用最低，但通常也是最慢的方案
+- `ZERO_STAGE=none`：禁用 DeepSpeed，主要用于 CPU 或单进程调试
 
 如果希望在 stage 1 中加入 AIC，可以显式传入：
 

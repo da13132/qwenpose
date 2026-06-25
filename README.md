@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v0.2.0`
+Release: `v0.2.1`
 
 English | [中文说明](README_zh.md)
 
@@ -240,8 +240,16 @@ datasets/refhuman/
 Notes:
 
 - RefHuman contributes `REF_POSE` samples with text descriptions
-- By default, the two-stage shell script uses RefHuman in stage 2
+- The public default recipe does not enable RefHuman automatically; add it explicitly when needed
 - `REFHUMAN_MAX_CAPTIONS_PER_INSTANCE` controls how many captions are kept for each person instance
+
+Example:
+
+```bash
+STAGE2_TRAIN_DATASETS=coco,refhuman \
+STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE=1 \
+scripts/train_qwenpose_two_stage.sh
+```
 
 ## Default Training Recipe
 
@@ -264,6 +272,13 @@ Default stage configuration:
 - Stage 1 epochs: `2`
 - Stage 2 epochs: `1`
 - ZeRO preset: `zero2`
+
+DeepSpeed preset selection:
+
+- `ZERO_STAGE=zero2`: uses `scripts/zero2.json`, recommended default for standard multi-GPU training
+- `ZERO_STAGE=zero3`: uses `scripts/zero3.json`, lowers GPU memory usage further at the cost of more runtime overhead
+- `ZERO_STAGE=zero3_offload`: uses `scripts/zero3_offload.json`, saves the most GPU memory but is usually the slowest option
+- `ZERO_STAGE=none`: disables DeepSpeed and is mainly intended for CPU or single-process debugging
 
 If you want AIC in stage 1, pass it explicitly, for example:
 

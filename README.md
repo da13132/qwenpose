@@ -1,19 +1,21 @@
 # QwenPose
 
-Release: `v0.2.2`
+Release: `v0.3.0`
 
 English | [中文说明](README_zh.md)
 
-QwenPose is a public training snapshot for box-conditioned human pose estimation built on top of Qwen3-VL. This repository publishes the Qwen3-VL two-stage workflow used in this branch:
+QwenPose is a public training snapshot for box-conditioned human pose estimation built on top of Qwen3-VL. This repository publishes the Qwen3-VL three-stage workflow used in this branch:
 
-- `stage1_freeze_qwen`: freeze the Qwen backbone and warm up the pose modules.
-- `stage2_qwen_lora_lm`: enable Qwen LoRA and optionally use LM supervision for short joint finetuning.
+- `stage1_freeze_qwen`: freeze the Qwen backbone and warm up the pose modules with GT boxes.
+- `stage2_teacher_forcing`: enable Qwen LoRA, learn GT bbox JSON with teacher forcing, and train PoseHead with jittered GT boxes.
+- `stage3_qwen_box_closed_loop`: generate bbox JSON with Qwen, parse boxes, and train PoseHead on generated boxes matched to GT keypoints.
 
 This public release is intentionally scoped to the Qwen3-VL path. The Eagle shell entrypoints are excluded from the published workflow.
 
 ## Included Scope
 
-- `scripts/train_qwenpose_two_stage.sh`: main two-stage training entrypoint
+- `scripts/train_qwenpose_three_stage.sh`: main three-stage training entrypoint
+- `scripts/train_qwenpose_two_stage.sh`: deprecated compatibility wrapper that forwards to the three-stage entrypoint
 - `scripts/eval_qwenpose.sh`: evaluation entrypoint
 - `scripts/zero2.json`, `scripts/zero3.json`, `scripts/zero3_offload.json`: DeepSpeed presets
 - `src/qwenpose/`: data loading, model definition, training, evaluation, checkpointing, and LoRA merge utilities
@@ -31,6 +33,7 @@ qwenpose/
 ├── scripts/
 │   ├── eval_qwenpose.sh
 │   ├── train_qwenpose_two_stage.sh
+│   ├── train_qwenpose_three_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
 │   └── zero3_offload.json
@@ -246,7 +249,7 @@ Example:
 ```bash
 STAGE2_TRAIN_DATASETS=coco,refhuman \
 STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE=1 \
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
 ## Default Training Recipe
@@ -254,21 +257,27 @@ scripts/train_qwenpose_two_stage.sh
 The main published entrypoint is:
 
 ```bash
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
 Default stage configuration:
 
 - Stage 1 output: `stage1_freeze_qwen`
-- Stage 2 output: `stage2_qwen_lora_lm`
-- Output root: `outputs/qwenpose_two_stage_qwen`
+- Stage 2 output: `stage2_teacher_forcing`
+- Stage 3 output: `stage3_qwen_box_closed_loop`
+- Output root: `outputs/qwenpose_three_stage_qwen`
 - Optional merged release weights when `MERGE_FINAL_WEIGHTS=1`: `weights/<run_name>-merged-<timestamp>`
 - Stage 1 datasets: `coco`
 - Stage 2 datasets: `coco`
+- Stage 3 datasets: `coco`
 - Stage 1 batch size: `4` per GPU
 - Stage 2 batch size: `1` per GPU
-- Stage 1 epochs: `2`
-- Stage 2 epochs: `1`
+- Stage 3 batch size: `1` per GPU
+- Stage 1 epochs: `20`
+- Stage 2 epochs: `3`
+- Stage 3 epochs: `12`
+- Stage 2 box source: `gt`
+- Stage 3 box source: `qwen_generate`
 - ZeRO preset: `zero2`
 
 DeepSpeed preset selection:
@@ -277,6 +286,10 @@ DeepSpeed preset selection:
 - `ZERO_STAGE=zero3`: uses `scripts/zero3.json`, lowers GPU memory usage further at the cost of more runtime overhead
 - `ZERO_STAGE=zero3_offload`: uses `scripts/zero3_offload.json`, saves the most GPU memory but is usually the slowest option
 - `ZERO_STAGE=none`: disables DeepSpeed and is mainly intended for CPU or single-process debugging
+
+Stage-3 note:
+
+- `STAGE3_BOX_SOURCE=qwen_generate` calls `model.generate` during training and currently supports `ZERO_STAGE=zero2` or `ZERO_STAGE=none`
 
 If you want AIC in stage 1, pass it explicitly, for example:
 
@@ -296,10 +309,10 @@ ZERO_STAGE=none \
 DEVICE=cpu \
 DRY_RUN_DATA=1 \
 MAX_SAMPLES_PER_DATASET=2 \
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
-### 2. Launch two-stage training
+### 2. Launch three-stage training
 
 Minimal multi-GPU example:
 
@@ -311,7 +324,7 @@ CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=2 \
 QWEN_MODEL_PATH=weights/Qwen3-VL-4B-Instruct \
 DATASET_ROOT=datasets \
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
 ### 3. Resume an existing run
@@ -319,38 +332,48 @@ scripts/train_qwenpose_two_stage.sh
 Resume from a previous run directory:
 
 ```bash
-scripts/train_qwenpose_two_stage.sh \
-  --resume outputs/qwenpose_two_stage_qwen/<run_name>
+scripts/train_qwenpose_three_stage.sh \
+  --resume outputs/qwenpose_three_stage_qwen/<run_name>
 ```
 
-The script automatically resolves stage-2 checkpoint resume when possible. If stage 2 has not started yet, it can initialize stage 2 from the stage-1 weights.
+The script resolves resume paths stage-aware. If stage 3 already has checkpoints, `--resume` resumes stage 3. Otherwise it can initialize stage 3 from stage 2, or initialize stage 2 from stage 1 when needed.
 
 ### 4. Evaluate a run
 
 ```bash
 PYTHON=python \
-TRAIN_OUTPUT_DIR=outputs/qwenpose_two_stage_qwen/<run_name> \
+TRAIN_OUTPUT_DIR=outputs/qwenpose_three_stage_qwen/<run_name> \
 scripts/eval_qwenpose.sh
 ```
 
-When given a full two-stage run directory, the evaluation script prefers:
+When given a full three-stage run directory, the evaluation script prefers:
 
 ```text
-<run>/stage2_qwen_lora_lm
+<run>/stage3_qwen_box_closed_loop
+<run>/stage2_teacher_forcing
+<run>/stage1_freeze_qwen
 ```
 
-If no stage-2 checkpoint is available, it falls back to stage 1.
+The evaluation default is the closed-loop path with `BOX_SOURCE=qwen_generate`. To inspect the GT-box-conditioned upper bound instead, run:
+
+```bash
+BOX_SOURCE=gt \
+TRAIN_OUTPUT_DIR=outputs/qwenpose_three_stage_qwen/<run_name> \
+scripts/eval_qwenpose.sh
+```
 
 ## Output Structure
 
 A typical run directory looks like:
 
 ```text
-outputs/qwenpose_two_stage_qwen/<run_name>/
+outputs/qwenpose_three_stage_qwen/<run_name>/
 ├── logs/
 ├── stage1_freeze_qwen/
 ├── stage2_init_weights/
-├── stage2_qwen_lora_lm/
+├── stage2_teacher_forcing/
+├── stage3_init_weights/
+├── stage3_qwen_box_closed_loop/
 └── eval_pose_<timestamp>/
 ```
 
@@ -375,4 +398,5 @@ New releases should update `VERSION`, prepend a new entry to `CHANGELOG.md`, and
 
 ## Official Entrypoint
 
-The maintained public training entrypoint is `scripts/train_qwenpose_two_stage.sh`.
+The maintained public training entrypoint is `scripts/train_qwenpose_three_stage.sh`.
+`scripts/train_qwenpose_two_stage.sh` remains in the repository only as a deprecated compatibility wrapper.

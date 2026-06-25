@@ -38,6 +38,7 @@ from qwenpose.train_pose import (
     checkpoint_step,
     move_batch_to_device,
     prepare_box_conditioning,
+    prepare_qwen_generated_box_conditioning,
     save_pose_visualization,
 )
 
@@ -272,6 +273,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--box_condition_scale", type=float, default=1.2)
     parser.add_argument("--pose_roi_size", type=int, default=16)
+    parser.add_argument("--box_source", choices=["gt", "qwen_generate"], default="qwen_generate")
+    parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
+    parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
+    parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
     parser.add_argument("--disable_refinement", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -512,6 +517,14 @@ def main() -> None:
         raise ValueError("--visualize_max_samples must be non-negative.")
     if args.visualize_max_instances <= 0:
         raise ValueError("--visualize_max_instances must be positive.")
+    if args.qwen_box_max_new_tokens <= 0:
+        raise ValueError("--qwen_box_max_new_tokens must be positive.")
+    if not 0.0 <= args.box_match_iou_thresh <= 1.0:
+        raise ValueError("--box_match_iou_thresh must be in [0, 1].")
+    if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
+        raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
+    if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
+        raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
     if args.qwen_min_pixels is not None and args.qwen_min_pixels <= 0:
         raise ValueError("--qwen_min_pixels must be positive when set.")
     if args.qwen_max_pixels is not None and args.qwen_max_pixels <= 0:
@@ -604,12 +617,32 @@ def main() -> None:
                 data_time = batch_ready - last_iter_end
                 prep_started = time.perf_counter()
                 batch = move_batch_to_device(batch, device)
-                target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
+                _, _, gt_targets_for_eval = prepare_box_conditioning(
                     batch["targets"],
                     batch["task_ids"],
                     device,
                     max_instances=args.max_instances,
                 )
+                if args.box_source == "qwen_generate":
+                    target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
+                        model,
+                        qwen_processor,
+                        batch,
+                        device,
+                        max_instances=args.max_instances,
+                        max_new_tokens=args.qwen_box_max_new_tokens,
+                        match_iou_thresh=args.box_match_iou_thresh,
+                        nms_iou_thresh=args.box_nms_iou_thresh,
+                        min_pixels=args.qwen_min_pixels,
+                        max_pixels=args.qwen_max_pixels,
+                    )
+                else:
+                    target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
+                        batch["targets"],
+                        batch["task_ids"],
+                        device,
+                        max_instances=args.max_instances,
+                    )
                 backbone_name = getattr(args, "backbone", "qwen3vl")
                 if qwen_processor is None:
                     qwen_inputs = None
@@ -646,10 +679,11 @@ def main() -> None:
                 for key, value in loss_dict.items():
                     totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
 
-                rows = tensor_to_prediction_rows(outputs, {**batch, "targets": pose_targets}, args)
+                rows = tensor_to_prediction_rows(outputs, {**batch, "targets": gt_targets_for_eval}, args)
                 for row in rows:
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    # Collect GT for AP
+                    # Collect full task GT for AP. In qwen_generate mode pose_targets only contains
+                    # matched predictions, so using it here would hide missed people and inflate AP.
                     ds_name = row.get("dataset", "unknown")
                     target_for_gt = {
                         "image_id": row["image_id"],
@@ -659,10 +693,9 @@ def main() -> None:
                         "keypoints": torch.zeros(0, len(UNION_KEYPOINTS), 3),
                         "keypoint_valid": torch.zeros(0, len(UNION_KEYPOINTS), dtype=torch.bool),
                     }
-                    # Find matching target from pose_targets
-                    for pt in pose_targets:
-                        if str(pt["image_id"]) == str(row["image_id"]):
-                            target_for_gt = pt
+                    for gt_target in gt_targets_for_eval:
+                        if str(gt_target["image_id"]) == str(row["image_id"]):
+                            target_for_gt = gt_target
                             break
                     all_gt_targets.append(target_for_gt)
                     dataset_gt[ds_name].append(target_for_gt)

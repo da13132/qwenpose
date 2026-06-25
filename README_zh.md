@@ -1,19 +1,21 @@
 # QwenPose 中文说明
 
-版本：`v0.2.2`
+版本：`v0.3.0`
 
 [English](README.md) | 中文
 
-QwenPose 是一个基于 Qwen3-VL 的 box-conditioned 人体姿态估计公开训练快照。这个仓库发布的是当前分支里的 Qwen3-VL 两阶段训练主线：
+QwenPose 是一个基于 Qwen3-VL 的 box-conditioned 人体姿态估计公开训练快照。这个仓库发布的是当前分支里的 Qwen3-VL 三阶段训练主线：
 
-- `stage1_freeze_qwen`：冻结 Qwen 主体，先把 pose 模块 warm up 起来
-- `stage2_qwen_lora_lm`：打开 Qwen LoRA，并可选启用 LM 辅助监督做短程联合微调
+- `stage1_freeze_qwen`：冻结 Qwen 主体，使用 GT box 先把 pose 模块 warm up 起来
+- `stage2_teacher_forcing`：打开 Qwen LoRA，用 GT bbox JSON 做 teacher forcing，并让 PoseHead 吃带扰动的 GT box
+- `stage3_qwen_box_closed_loop`：由 Qwen 生成 bbox JSON，解析框后再喂给 PoseHead，用匹配到的 GT keypoints 做闭环监督
 
 这次公开发布只覆盖 Qwen3-VL 工作流，不把 Eagle 相关 shell 入口作为公开主线的一部分。
 
 ## 仓库内容
 
-- `scripts/train_qwenpose_two_stage.sh`：两阶段训练主入口
+- `scripts/train_qwenpose_three_stage.sh`：三阶段训练主入口
+- `scripts/train_qwenpose_two_stage.sh`：兼容旧命令的弃用包装器，会转发到三阶段入口
 - `scripts/eval_qwenpose.sh`：验证入口
 - `scripts/zero2.json`、`scripts/zero3.json`、`scripts/zero3_offload.json`：DeepSpeed 预设
 - `src/qwenpose/`：数据加载、模型、训练、验证、checkpoint、LoRA 合并等核心代码
@@ -31,6 +33,7 @@ qwenpose/
 ├── scripts/
 │   ├── eval_qwenpose.sh
 │   ├── train_qwenpose_two_stage.sh
+│   ├── train_qwenpose_three_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
 │   └── zero3_offload.json
@@ -246,7 +249,7 @@ datasets/refhuman/
 ```bash
 STAGE2_TRAIN_DATASETS=coco,refhuman \
 STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE=1 \
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
 ## 默认训练配方
@@ -254,21 +257,27 @@ scripts/train_qwenpose_two_stage.sh
 当前公开主入口是：
 
 ```bash
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
 默认阶段设置：
 
 - Stage 1 输出目录：`stage1_freeze_qwen`
-- Stage 2 输出目录：`stage2_qwen_lora_lm`
-- 总输出根目录：`outputs/qwenpose_two_stage_qwen`
+- Stage 2 输出目录：`stage2_teacher_forcing`
+- Stage 3 输出目录：`stage3_qwen_box_closed_loop`
+- 总输出根目录：`outputs/qwenpose_three_stage_qwen`
 - 当 `MERGE_FINAL_WEIGHTS=1` 时自动导出的发布权重：`weights/<run_name>-merged-<timestamp>`
 - Stage 1 数据集：`coco`
 - Stage 2 数据集：`coco`
+- Stage 3 数据集：`coco`
 - Stage 1 batch size：每张 GPU `4`
 - Stage 2 batch size：每张 GPU `1`
-- Stage 1 epoch：`2`
-- Stage 2 epoch：`1`
+- Stage 3 batch size：每张 GPU `1`
+- Stage 1 epoch：`20`
+- Stage 2 epoch：`3`
+- Stage 3 epoch：`12`
+- Stage 2 条件框来源：`gt`
+- Stage 3 条件框来源：`qwen_generate`
 - 默认 ZeRO 方案：`zero2`
 
 DeepSpeed 预设选择：
@@ -277,6 +286,10 @@ DeepSpeed 预设选择：
 - `ZERO_STAGE=zero3`：使用 `scripts/zero3.json`，进一步节省显存，但运行开销更高
 - `ZERO_STAGE=zero3_offload`：使用 `scripts/zero3_offload.json`，显存占用最低，但通常也是最慢的方案
 - `ZERO_STAGE=none`：禁用 DeepSpeed，主要用于 CPU 或单进程调试
+
+Stage 3 说明：
+
+- `STAGE3_BOX_SOURCE=qwen_generate` 会在训练中调用 `model.generate`，当前仅支持 `ZERO_STAGE=zero2` 或 `ZERO_STAGE=none`
 
 如果希望在 stage 1 中加入 AIC，可以显式传入：
 
@@ -296,10 +309,10 @@ ZERO_STAGE=none \
 DEVICE=cpu \
 DRY_RUN_DATA=1 \
 MAX_SAMPLES_PER_DATASET=2 \
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
-### 2. 启动两阶段训练
+### 2. 启动三阶段训练
 
 一个最小多卡示例：
 
@@ -311,7 +324,7 @@ CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=2 \
 QWEN_MODEL_PATH=weights/Qwen3-VL-4B-Instruct \
 DATASET_ROOT=datasets \
-scripts/train_qwenpose_two_stage.sh
+scripts/train_qwenpose_three_stage.sh
 ```
 
 ### 3. 断点续训
@@ -319,38 +332,48 @@ scripts/train_qwenpose_two_stage.sh
 对已有 run 目录继续训练：
 
 ```bash
-scripts/train_qwenpose_two_stage.sh \
-  --resume outputs/qwenpose_two_stage_qwen/<run_name>
+scripts/train_qwenpose_three_stage.sh \
+  --resume outputs/qwenpose_three_stage_qwen/<run_name>
 ```
 
-脚本会优先自动解析 stage 2 的真实 checkpoint 续训；如果 stage 2 还未开始，也会尽量用 stage 1 结果初始化 stage 2。
+脚本会按阶段自动解析续训路径：如果 stage 3 已经有 checkpoint，就优先续训 stage 3；否则会尽量用 stage 2 初始化 stage 3，或者在需要时用 stage 1 初始化 stage 2。
 
 ### 4. 执行验证
 
 ```bash
 PYTHON=python \
-TRAIN_OUTPUT_DIR=outputs/qwenpose_two_stage_qwen/<run_name> \
+TRAIN_OUTPUT_DIR=outputs/qwenpose_three_stage_qwen/<run_name> \
 scripts/eval_qwenpose.sh
 ```
 
-当传入完整两阶段 run 目录时，验证脚本会优先选择：
+当传入完整三阶段 run 目录时，验证脚本会优先选择：
 
 ```text
-<run>/stage2_qwen_lora_lm
+<run>/stage3_qwen_box_closed_loop
+<run>/stage2_teacher_forcing
+<run>/stage1_freeze_qwen
 ```
 
-如果没有 stage 2 checkpoint，则回退到 stage 1。
+验证默认走闭环路径，也就是 `BOX_SOURCE=qwen_generate`。如果想看 GT box 条件下的上限，可以这样运行：
+
+```bash
+BOX_SOURCE=gt \
+TRAIN_OUTPUT_DIR=outputs/qwenpose_three_stage_qwen/<run_name> \
+scripts/eval_qwenpose.sh
+```
 
 ## 输出目录
 
 一次典型训练的目录结构如下：
 
 ```text
-outputs/qwenpose_two_stage_qwen/<run_name>/
+outputs/qwenpose_three_stage_qwen/<run_name>/
 ├── logs/
 ├── stage1_freeze_qwen/
 ├── stage2_init_weights/
-├── stage2_qwen_lora_lm/
+├── stage2_teacher_forcing/
+├── stage3_init_weights/
+├── stage3_qwen_box_closed_loop/
 └── eval_pose_<timestamp>/
 ```
 
@@ -375,4 +398,5 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 
 ## 正式入口
 
-公开仓库维护的正式训练入口是 `scripts/train_qwenpose_two_stage.sh`。
+公开仓库维护的正式训练入口是 `scripts/train_qwenpose_three_stage.sh`。
+`scripts/train_qwenpose_two_stage.sh` 仅作为兼容旧命令的弃用包装器保留。

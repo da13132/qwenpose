@@ -1,4 +1,4 @@
-# Exact tested installation target for QwenPose v0.2.2.
+# Exact tested installation target for QwenPose v0.3.0.
 # This file is for Linux + Python 3.11 + CUDA 12.6 reproduction.
 #
 # Install with:

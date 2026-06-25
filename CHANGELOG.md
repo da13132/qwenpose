@@ -2,6 +2,14 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v0.3.0 - 2026-06-25
+
+- Promoted `scripts/train_qwenpose_three_stage.sh` to the maintained public training entrypoint and kept `scripts/train_qwenpose_two_stage.sh` as a deprecated compatibility wrapper.
+- Published the public three-stage Qwen3-VL workflow: GT-box warmup, teacher-forcing bbox JSON warmup, and closed-loop Qwen-generated box training.
+- Added generated-box conditioning support across training and evaluation, including bbox JSON parsing, NMS, GT matching, stage-aware resume resolution, and stage-aware checkpoint discovery.
+- Updated evaluation defaults to prefer `stage3_qwen_box_closed_loop`, while keeping `BOX_SOURCE=gt` available for GT-box upper-bound evaluation.
+- Refreshed the English and Chinese READMEs, output-structure docs, and version metadata for the three-stage public snapshot.
+
 ## v0.2.2 - 2026-06-25
 
 - Removed `scripts/train_qwenpose_one_stage.sh` from the public repository so the published training workflow exposes only the maintained two-stage entrypoint.

@@ -13,8 +13,8 @@ set -Eeuo pipefail
 # 注意：
 #   QwenPose 的姿态结果来自回归式 PoseHead，不是 vLLM 文本生成；
 #   因此这里不调用 vLLM，而是直接运行模型 forward。
-#   当前 box-conditioned 结构默认使用标注/RefHuman 指定框做 teacher-forced pose 评估；
-#   它评估的是“给定框后的关键点能力”，不是 LLM 生成 box 的端到端 grounding 质量。
+#   默认走 Qwen 生成框闭环评估：Qwen generate bbox JSON 后再交给 PoseHead。
+#   如需查看 GT-box-conditioned 上限，可设置 BOX_SOURCE=gt。
 #   默认验证数据集：COCO / MPII / CrowdPose / RefHuman（默认不含 AIC）。
 ###############################################################################
 
@@ -78,10 +78,16 @@ dir_has_checkpoints() {
 
 resolve_default_checkpoint_target() {
   local run_dir="$1"
-  local stage2_dir="${run_dir}/stage2_qwen_lora_lm"
+  local stage3_dir="${run_dir}/stage3_qwen_box_closed_loop"
+  local stage2_dir="${run_dir}/stage2_teacher_forcing"
+  local old_stage2_dir="${run_dir}/stage2_qwen_lora_lm"
   local stage1_dir="${run_dir}/stage1_freeze_qwen"
-  if dir_has_checkpoints "${stage2_dir}"; then
+  if dir_has_checkpoints "${stage3_dir}"; then
+    printf '%s\n' "${stage3_dir}"
+  elif dir_has_checkpoints "${stage2_dir}"; then
     printf '%s\n' "${stage2_dir}"
+  elif dir_has_checkpoints "${old_stage2_dir}"; then
+    printf '%s\n' "${old_stage2_dir}"
   elif dir_has_checkpoints "${stage1_dir}"; then
     printf '%s\n' "${stage1_dir}"
   else
@@ -93,7 +99,7 @@ resolve_default_checkpoint_target() {
 EVAL_TS="${EVAL_TS:-$(date +%Y%m%d-%H%M%S)}"
 
 # TRAIN_OUTPUT_ROOT：训练 run 的根目录。未指定 TRAIN_OUTPUT_DIR 时，会从这里找最近一次 run。
-TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/qwenpose_two_stage_qwen}"
+TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/qwenpose_three_stage_qwen}"
 
 # DEFAULT_TRAIN_OUTPUT_DIR：自动解析出的最近训练 run 目录。
 DEFAULT_TRAIN_OUTPUT_DIR="$(resolve_latest_train_dir "${TRAIN_OUTPUT_ROOT}")"
@@ -101,11 +107,11 @@ DEFAULT_TRAIN_OUTPUT_DIR="$(resolve_latest_train_dir "${TRAIN_OUTPUT_ROOT}")"
 # TRAIN_OUTPUT_DIR：要验证的训练输出目录。默认使用最近一次 run。
 TRAIN_OUTPUT_DIR="${TRAIN_OUTPUT_DIR:-${DEFAULT_TRAIN_OUTPUT_DIR}}"
 
-# DEFAULT_CHECKPOINT_TARGET：默认优先验证 stage2_qwen_lora_lm，其次回退 stage1 或 run 根目录。
+# DEFAULT_CHECKPOINT_TARGET：默认优先验证 stage3_qwen_box_closed_loop，其次回退 stage2/stage1 或 run 根目录。
 DEFAULT_CHECKPOINT_TARGET="$(resolve_default_checkpoint_target "${TRAIN_OUTPUT_DIR}")"
 
 # CHECKPOINT：checkpoint 文件、checkpoint-* 目录、stage 目录或训练 run 目录。
-# 传两阶段 run 目录时，脚本会优先选择其中的 stage2_qwen_lora_lm。
+# 传三阶段 run 目录时，脚本会优先选择其中的 stage3_qwen_box_closed_loop。
 CHECKPOINT="${CHECKPOINT:-${DEFAULT_CHECKPOINT_TARGET}}"
 
 # EVAL_OUTPUT_DIR：验证结果输出目录，默认放到训练 run 下的 eval_pose_时间戳/。
@@ -228,6 +234,15 @@ BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
 # POSE_ROI_SIZE：每个扩大后 bbox 从 Qwen grid 上采样出的局部特征边长，必须匹配训练。
 POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
 
+# BOX_SOURCE：验证时 PoseHead 条件框来源。默认 qwen_generate，走最终闭环路径；gt 用于看 GT box 上限。
+BOX_SOURCE="${BOX_SOURCE:-qwen_generate}"
+# QWEN_BOX_MAX_NEW_TOKENS：Qwen 生成 bbox JSON 最大新 token 数。
+QWEN_BOX_MAX_NEW_TOKENS="${QWEN_BOX_MAX_NEW_TOKENS:-4096}"
+# BOX_MATCH_IOU_THRESH：闭环验证中生成框和 GT 框匹配阈值，仅用于 loss/GT 对齐。
+BOX_MATCH_IOU_THRESH="${BOX_MATCH_IOU_THRESH:-0.10}"
+# BOX_NMS_IOU_THRESH：闭环验证中生成框 NMS 阈值。
+BOX_NMS_IOU_THRESH="${BOX_NMS_IOU_THRESH:-0.70}"
+
 # DECODER_HEADS：Pose decoder 注意力头数，必须和训练 checkpoint 一致。
 DECODER_HEADS="${DECODER_HEADS:-8}"
 
@@ -307,6 +322,7 @@ require_nonnegative_int() {
 require_positive_int BATCH_SIZE "${BATCH_SIZE}"
 require_positive_int REFINEMENT_STEPS "${REFINEMENT_STEPS}"
 require_positive_int POSE_ROI_SIZE "${POSE_ROI_SIZE}"
+require_positive_int QWEN_BOX_MAX_NEW_TOKENS "${QWEN_BOX_MAX_NEW_TOKENS}"
 require_nonnegative_int NUM_WORKERS "${NUM_WORKERS}"
 require_positive_int MAX_PREDICTIONS_PER_IMAGE "${MAX_PREDICTIONS_PER_IMAGE}"
 require_nonnegative_int VISUALIZE_MAX_SAMPLES "${VISUALIZE_MAX_SAMPLES}"
@@ -325,6 +341,10 @@ fi
 
 if [[ "${BACKBONE}" != "qwen3vl" ]]; then
   echo "BACKBONE=${BACKBONE} is no longer supported. The lightweight smoke backbone was removed; use BACKBONE=qwen3vl." >&2
+  exit 1
+fi
+if [[ "${BOX_SOURCE}" != "gt" && "${BOX_SOURCE}" != "qwen_generate" ]]; then
+  echo "BOX_SOURCE must be gt or qwen_generate, got: ${BOX_SOURCE}" >&2
   exit 1
 fi
 
@@ -396,6 +416,14 @@ ARGS=(
   --box_condition_scale "${BOX_CONDITION_SCALE}"
   # --pose_roi_size：每个 bbox 的 box-local ROI feature 边长，必须匹配训练。
   --pose_roi_size "${POSE_ROI_SIZE}"
+  # --box_source：验证条件框来源，默认 qwen_generate 走闭环路径。
+  --box_source "${BOX_SOURCE}"
+  # --qwen_box_max_new_tokens：Qwen 生成 bbox JSON 最大新 token 数。
+  --qwen_box_max_new_tokens "${QWEN_BOX_MAX_NEW_TOKENS}"
+  # --box_match_iou_thresh：生成框和 GT 框匹配阈值。
+  --box_match_iou_thresh "${BOX_MATCH_IOU_THRESH}"
+  # --box_nms_iou_thresh：生成框 NMS 阈值。
+  --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}"
   # --decoder_heads：pose decoder 注意力头数，必须匹配训练。
   --decoder_heads "${DECODER_HEADS}"
   # --device：验证设备。
@@ -470,6 +498,10 @@ echo "POSE_DECODER_LAYERS=${POSE_DECODER_LAYERS}"
 echo "REFINEMENT_STEPS=${REFINEMENT_STEPS}"
 echo "BOX_CONDITION_SCALE=${BOX_CONDITION_SCALE}"
 echo "POSE_ROI_SIZE=${POSE_ROI_SIZE}"
+echo "BOX_SOURCE=${BOX_SOURCE}"
+echo "QWEN_BOX_MAX_NEW_TOKENS=${QWEN_BOX_MAX_NEW_TOKENS}"
+echo "BOX_MATCH_IOU_THRESH=${BOX_MATCH_IOU_THRESH}"
+echo "BOX_NMS_IOU_THRESH=${BOX_NMS_IOU_THRESH}"
 echo "VISUALIZE_MAX_SAMPLES=${VISUALIZE_MAX_SAMPLES}"
 echo "VISUALIZE_MAX_INSTANCES=${VISUALIZE_MAX_INSTANCES}"
 echo "W_OKS=${W_OKS}"

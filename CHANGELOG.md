@@ -2,13 +2,19 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v0.3.1 - 2026-06-25
+
+- Removed `scripts/train_qwenpose_three_stage.sh` from the public repository after reverting the maintained workflow back to the two-stage closed-loop recipe.
+- Kept `scripts/train_qwenpose_two_stage.sh` as the sole published training entrypoint and cleaned the English and Chinese READMEs so they no longer mention the removed three-stage wrapper.
+- Preserved compatibility in training and evaluation code for reading legacy three-stage output directories, stage names, and checkpoints.
+
 ## v0.3.0 - 2026-06-25
 
-- Promoted `scripts/train_qwenpose_three_stage.sh` to the maintained public training entrypoint and kept `scripts/train_qwenpose_two_stage.sh` as a deprecated compatibility wrapper.
-- Published the public three-stage Qwen3-VL workflow: GT-box warmup, teacher-forcing bbox JSON warmup, and closed-loop Qwen-generated box training.
+- Collapsed the experimental three-stage recipe back into the maintained `scripts/train_qwenpose_two_stage.sh` entrypoint.
+- Removed the standalone teacher-forcing middle stage: stage 1 remains GT-box pose warmup, and stage 2 now directly runs closed-loop Qwen-generated box training.
+- Kept `scripts/train_qwenpose_three_stage.sh` only as a deprecated compatibility wrapper that forwards to the two-stage script.
 - Added generated-box conditioning support across training and evaluation, including bbox JSON parsing, NMS, GT matching, stage-aware resume resolution, and stage-aware checkpoint discovery.
-- Updated evaluation defaults to prefer `stage3_qwen_box_closed_loop`, while keeping `BOX_SOURCE=gt` available for GT-box upper-bound evaluation.
-- Refreshed the English and Chinese READMEs, output-structure docs, and version metadata for the three-stage public snapshot.
+- Updated evaluation defaults to prefer `stage2_qwen_box_closed_loop`, while keeping `BOX_SOURCE=gt` available for GT-box upper-bound evaluation.
 
 ## v0.2.2 - 2026-06-25
 

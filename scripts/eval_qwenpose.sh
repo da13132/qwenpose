@@ -78,16 +78,19 @@ dir_has_checkpoints() {
 
 resolve_default_checkpoint_target() {
   local run_dir="$1"
-  local stage3_dir="${run_dir}/stage3_qwen_box_closed_loop"
-  local stage2_dir="${run_dir}/stage2_teacher_forcing"
-  local old_stage2_dir="${run_dir}/stage2_qwen_lora_lm"
+  local stage2_closed_loop_dir="${run_dir}/stage2_qwen_box_closed_loop"
+  local legacy_stage3_dir="${run_dir}/stage3_qwen_box_closed_loop"
+  local legacy_stage2_tf_dir="${run_dir}/stage2_teacher_forcing"
+  local legacy_stage2_lm_dir="${run_dir}/stage2_qwen_lora_lm"
   local stage1_dir="${run_dir}/stage1_freeze_qwen"
-  if dir_has_checkpoints "${stage3_dir}"; then
-    printf '%s\n' "${stage3_dir}"
-  elif dir_has_checkpoints "${stage2_dir}"; then
-    printf '%s\n' "${stage2_dir}"
-  elif dir_has_checkpoints "${old_stage2_dir}"; then
-    printf '%s\n' "${old_stage2_dir}"
+  if dir_has_checkpoints "${stage2_closed_loop_dir}"; then
+    printf '%s\n' "${stage2_closed_loop_dir}"
+  elif dir_has_checkpoints "${legacy_stage3_dir}"; then
+    printf '%s\n' "${legacy_stage3_dir}"
+  elif dir_has_checkpoints "${legacy_stage2_tf_dir}"; then
+    printf '%s\n' "${legacy_stage2_tf_dir}"
+  elif dir_has_checkpoints "${legacy_stage2_lm_dir}"; then
+    printf '%s\n' "${legacy_stage2_lm_dir}"
   elif dir_has_checkpoints "${stage1_dir}"; then
     printf '%s\n' "${stage1_dir}"
   else
@@ -99,7 +102,7 @@ resolve_default_checkpoint_target() {
 EVAL_TS="${EVAL_TS:-$(date +%Y%m%d-%H%M%S)}"
 
 # TRAIN_OUTPUT_ROOT：训练 run 的根目录。未指定 TRAIN_OUTPUT_DIR 时，会从这里找最近一次 run。
-TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/qwenpose_three_stage_qwen}"
+TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/qwenpose_two_stage_qwen}"
 
 # DEFAULT_TRAIN_OUTPUT_DIR：自动解析出的最近训练 run 目录。
 DEFAULT_TRAIN_OUTPUT_DIR="$(resolve_latest_train_dir "${TRAIN_OUTPUT_ROOT}")"
@@ -107,11 +110,11 @@ DEFAULT_TRAIN_OUTPUT_DIR="$(resolve_latest_train_dir "${TRAIN_OUTPUT_ROOT}")"
 # TRAIN_OUTPUT_DIR：要验证的训练输出目录。默认使用最近一次 run。
 TRAIN_OUTPUT_DIR="${TRAIN_OUTPUT_DIR:-${DEFAULT_TRAIN_OUTPUT_DIR}}"
 
-# DEFAULT_CHECKPOINT_TARGET：默认优先验证 stage3_qwen_box_closed_loop，其次回退 stage2/stage1 或 run 根目录。
+# DEFAULT_CHECKPOINT_TARGET：默认优先验证 stage2_qwen_box_closed_loop，其次兼容旧 stage3/stage2/stage1 或 run 根目录。
 DEFAULT_CHECKPOINT_TARGET="$(resolve_default_checkpoint_target "${TRAIN_OUTPUT_DIR}")"
 
 # CHECKPOINT：checkpoint 文件、checkpoint-* 目录、stage 目录或训练 run 目录。
-# 传三阶段 run 目录时，脚本会优先选择其中的 stage3_qwen_box_closed_loop。
+# 传两阶段 run 目录时，脚本会优先选择其中的 stage2_qwen_box_closed_loop。
 CHECKPOINT="${CHECKPOINT:-${DEFAULT_CHECKPOINT_TARGET}}"
 
 # EVAL_OUTPUT_DIR：验证结果输出目录，默认放到训练 run 下的 eval_pose_时间戳/。

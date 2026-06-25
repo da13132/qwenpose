@@ -635,6 +635,7 @@ def main() -> None:
                         nms_iou_thresh=args.box_nms_iou_thresh,
                         min_pixels=args.qwen_min_pixels,
                         max_pixels=args.qwen_max_pixels,
+                        keep_unmatched_predictions=True,
                     )
                 else:
                     target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(

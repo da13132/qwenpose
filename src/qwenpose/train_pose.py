@@ -899,6 +899,7 @@ def prepare_qwen_generated_box_conditioning(
     nms_iou_thresh: float,
     min_pixels: int | None = None,
     max_pixels: int | None = None,
+    keep_unmatched_predictions: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
     if processor is None:
         raise ValueError("Qwen processor is required for --box_source=qwen_generate.")
@@ -943,13 +944,30 @@ def prepare_qwen_generated_box_conditioning(
 
         selected = dict(target)
         if matches:
-            selected_condition_boxes.append(pred_boxes[pred_index_tensor].clone())
-            selected["boxes"] = gt_boxes[matched_gt_index_tensor].clone()
-            selected["keypoints"] = target["keypoints"][gt_index_tensor[matched_gt_index_tensor]].clone()
-            selected["keypoint_valid"] = target["keypoint_valid"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            matched_pred_boxes = pred_boxes[pred_index_tensor].clone()
+            matched_gt_boxes = gt_boxes[matched_gt_index_tensor].clone()
+            matched_keypoints = target["keypoints"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            matched_keypoint_valid = target["keypoint_valid"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            if keep_unmatched_predictions:
+                matched_pred_set = set(pred_match_indices)
+                unmatched_pred_indices = [idx for idx in range(int(pred_boxes.shape[0])) if idx not in matched_pred_set]
+                if unmatched_pred_indices:
+                    unmatched_index_tensor = torch.as_tensor(unmatched_pred_indices, dtype=torch.long)
+                    condition_boxes = torch.cat([matched_pred_boxes, pred_boxes[unmatched_index_tensor].clone()], dim=0)
+                else:
+                    condition_boxes = matched_pred_boxes
+            else:
+                condition_boxes = matched_pred_boxes
+            selected_condition_boxes.append(condition_boxes[:max_instances].clone())
+            selected["boxes"] = matched_gt_boxes
+            selected["keypoints"] = matched_keypoints
+            selected["keypoint_valid"] = matched_keypoint_valid
             selected["ref_target"] = torch.tensor(0 if task_id == 1 else -1, dtype=torch.long)
         else:
-            selected_condition_boxes.append(gt_boxes_all[:0].clone())
+            if keep_unmatched_predictions and pred_boxes.numel() > 0:
+                selected_condition_boxes.append(pred_boxes[:max_instances].clone())
+            else:
+                selected_condition_boxes.append(gt_boxes_all[:0].clone())
             selected["boxes"] = gt_boxes_all[:0].clone()
             selected["keypoints"] = target["keypoints"][:0].clone()
             selected["keypoint_valid"] = target["keypoint_valid"][:0].clone()
@@ -1804,9 +1822,10 @@ def resolve_qwenpose_checkpoint_payload(path: Path) -> Path | None:
 
     search_roots = [path]
     for child_name in (
-        "stage3_qwen_box_closed_loop",
-        "stage2_teacher_forcing",
-        "stage2_qwen_lora_lm",  # legacy public snapshot name
+        "stage2_qwen_box_closed_loop",
+        "stage3_qwen_box_closed_loop",  # legacy removed three-stage layout
+        "stage2_teacher_forcing",       # legacy removed middle stage
+        "stage2_qwen_lora_lm",          # legacy public snapshot name
         "stage1_freeze_qwen",
     ):
         child = path / child_name
@@ -1837,9 +1856,10 @@ def resolve_qwen_lora_adapter_dir(requested_path: Path, checkpoint_payload_path:
             candidates.append(requested_path)
         candidates.append(requested_path / "qwen_lora_adapter")
         for stage_name in (
-            "stage3_qwen_box_closed_loop",
-            "stage2_teacher_forcing",
-            "stage2_qwen_lora_lm",  # legacy public snapshot name
+            "stage2_qwen_box_closed_loop",
+            "stage3_qwen_box_closed_loop",  # legacy removed three-stage layout
+            "stage2_teacher_forcing",       # legacy removed middle stage
+            "stage2_qwen_lora_lm",          # legacy public snapshot name
         ):
             stage_dir = requested_path / stage_name
             if stage_dir.is_dir():

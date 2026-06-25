@@ -265,34 +265,22 @@ VISUALIZE_MAX_SAMPLES="${VISUALIZE_MAX_SAMPLES:-100}"
 VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-8}"
 
 # W_OKS：OKS loss 权重，和训练脚本保持同名同默认值。
-W_OKS="${W_OKS:-0.5}"
+W_OKS="${W_OKS:-0.2}"
 
 # W_COORD：关键点坐标回归 loss 权重，和训练脚本保持同名同默认值。
-W_COORD="${W_COORD:-3.0}"
+W_COORD="${W_COORD:-5.0}"
 
 # W_VIS：关键点可见性/有效性 BCE loss 权重，和训练脚本保持同名同默认值。
 W_VIS="${W_VIS:-0.05}"
 
-# W_HARD_JOINT：hard keypoint mining loss 权重，和训练脚本保持同名同默认值。
-W_HARD_JOINT="${W_HARD_JOINT:-0.15}"
+# W_HARD_JOINT：hard keypoint mining loss 权重，和训练脚本保持同名同默认值；默认关闭。
+W_HARD_JOINT="${W_HARD_JOINT:-0}"
 
 # HARD_JOINT_FRACTION：hard mining 选取的可见关键点比例，和训练脚本保持一致。
-HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.3}"
-
-# W_UNCERTAINTY：不确定性辅助 loss 权重，和训练脚本保持同名同默认值。
-W_UNCERTAINTY="${W_UNCERTAINTY:-0.02}"
-
-# W_AUX_CENTER：dense center 辅助 loss 权重，和训练脚本保持同名同默认值。
-W_AUX_CENTER="${W_AUX_CENTER:-0.05}"
-
-# DISABLE_UNCERTAINTY：设为 1 时按关闭不确定性分支的模型结构加载 checkpoint。
-DISABLE_UNCERTAINTY="${DISABLE_UNCERTAINTY:-0}"
+HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.2}"
 
 # DISABLE_REFINEMENT：设为 1 时按关闭关键点细化分支的模型结构加载 checkpoint。
 DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
-
-# DISABLE_AUX_CENTER：设为 1 时按关闭 dense center 辅助分支的模型结构加载 checkpoint。
-DISABLE_AUX_CENTER="${DISABLE_AUX_CENTER:-0}"
 
 ###############################################################################
 # 参数检查
@@ -430,10 +418,6 @@ ARGS=(
   --w_hard_joint "${W_HARD_JOINT}"
   # --hard_joint_fraction：hard mining 选取的可见关键点比例。
   --hard_joint_fraction "${HARD_JOINT_FRACTION}"
-  # --w_uncertainty：关键点不确定性 loss 权重。
-  --w_uncertainty "${W_UNCERTAINTY}"
-  # --w_aux_center：dense center 辅助 loss 权重。
-  --w_aux_center "${W_AUX_CENTER}"
 )
 
 if [[ -n "${MAX_SAMPLES_PER_DATASET}" ]]; then
@@ -456,17 +440,9 @@ if [[ "${PROGRESS_BAR}" == "0" ]]; then
   # --disable_progress：关闭 tqdm 进度条和 ETA。
   ARGS+=(--disable_progress)
 fi
-if [[ "${DISABLE_UNCERTAINTY}" == "1" ]]; then
-  # --disable_uncertainty：按关闭不确定性分支的模型结构执行验证。
-  ARGS+=(--disable_uncertainty)
-fi
 if [[ "${DISABLE_REFINEMENT}" == "1" ]]; then
   # --disable_refinement：按关闭关键点细化分支的模型结构执行验证。
   ARGS+=(--disable_refinement)
-fi
-if [[ "${DISABLE_AUX_CENTER}" == "1" ]]; then
-  # --disable_aux_center：按关闭 dense center 辅助分支的模型结构执行验证。
-  ARGS+=(--disable_aux_center)
 fi
 
 echo "================ QwenPose 验证配置 ================"
@@ -501,8 +477,6 @@ echo "W_COORD=${W_COORD}"
 echo "W_VIS=${W_VIS}"
 echo "W_HARD_JOINT=${W_HARD_JOINT}"
 echo "HARD_JOINT_FRACTION=${HARD_JOINT_FRACTION}"
-echo "W_UNCERTAINTY=${W_UNCERTAINTY}"
-echo "W_AUX_CENTER=${W_AUX_CENTER}"
 echo "DEVICE=${DEVICE}"
 echo "===================================================="
 

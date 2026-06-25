@@ -51,6 +51,11 @@ from qwenpose.eagle_lora import (
 )
 from qwenpose.schemas import ID_TO_SCHEMA, UNION_KEYPOINTS
 
+try:
+    from qwenpose.eagle_lora import build_eagle_lm_inputs
+except ImportError:  # pragma: no cover - optional for the Qwen-focused public snapshot.
+    build_eagle_lm_inputs = None
+
 
 CHECKPOINT_PAYLOAD_NAME = "qwenpose_checkpoint.pt"
 DEEPSPEED_TAG = "deepspeed"
@@ -80,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated datasets. RefHuman contributes REF_POSE; others contribute ALL_POSE.",
     )
     parser.add_argument("--max_instances", type=int, default=80)
+    parser.add_argument("--image_size", type=int, default=256, help="Fixed RGB tensor size for the lightweight pose visual branch.")
+    parser.add_argument(
+        "--disable_image_tensors",
+        action="store_true",
+        help="Disable loading fixed-size RGB tensors for the pose visual branch.",
+    )
     parser.add_argument("--max_samples_per_dataset", type=int, default=None)
     parser.add_argument(
         "--refhuman_max_captions_per_instance",
@@ -115,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     # new pose modules are fully trainable by default.
     # ---------------------------------------------------------------------
     parser.add_argument("--hidden_dim", type=int, default=448)
-    parser.add_argument("--backbone", choices=["qwen3vl", "eagle"], default="qwen3vl")
+    parser.add_argument("--backbone", choices=["qwen3vl", "eagle", "locatepose"], default="qwen3vl")
     parser.add_argument("--qwen_model_path", type=str, default="weights/Qwen3-VL-4B-Instruct")
     parser.add_argument("--qwen_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
     parser.add_argument("--qwen_attn_implementation", type=str, default="flash_attention_2")
@@ -156,11 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--box_condition_scale", type=float, default=1.2)
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--simcc_bins", type=int, default=128)
-    parser.add_argument("--disable_uncertainty", action="store_true")
     parser.add_argument("--disable_refinement", action="store_true")
-    parser.add_argument("--disable_aux_center", action="store_true")
-    parser.add_argument("--disable_simcc", action="store_true")
 
     # ---------------------------------------------------------------------
     # Optimization section.
@@ -178,6 +185,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--qwen_lora_lr_scale", type=float, default=1.0)
     parser.add_argument("--qwen_vision_lr_scale", type=float, default=0.01)
+    parser.add_argument("--locate_lr_scale", type=float, default=0.05)
+    parser.add_argument("--locate_vision_scale", type=float, default=0.02)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -204,22 +213,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", -1)))
 
     # ---------------------------------------------------------------------
-    # Loss weights. Defaults follow the design doc: OKS is a main pose loss,
-    # SmoothL1 stabilizes early regression, and center aux helps small people.
+    # Loss weights. Keep the training target clean: coord + OKS + vis are the
+    # main pose losses, Stage2 may add bbox LM supervision, and hard_joint is
+    # retained only as an off-by-default ablation knob.
     # ---------------------------------------------------------------------
-    parser.add_argument("--w_oks", type=float, default=0.5)
-    parser.add_argument("--w_coord", type=float, default=3.0)
+    parser.add_argument("--w_oks", type=float, default=0.2)
+    parser.add_argument("--w_coord", type=float, default=5.0)
     parser.add_argument("--w_vis", type=float, default=0.05)
-    parser.add_argument("--w_uncertainty", type=float, default=0.02)
-    parser.add_argument("--w_aux_center", type=float, default=0.05)
-    parser.add_argument("--w_lm", type=float, default=0.1)
-    parser.add_argument("--w_hard_joint", type=float, default=0.15)
-    parser.add_argument("--hard_joint_fraction", type=float, default=0.3)
-    parser.add_argument("--w_simcc", type=float, default=0.2)
-    parser.add_argument("--w_deep_supervision", type=float, default=0.3)
-    parser.add_argument("--w_bone", type=float, default=0.05)
+    parser.add_argument("--w_lm", type=float, default=0.05)
+    parser.add_argument("--w_hard_joint", type=float, default=0.0)
+    parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
     parser.add_argument("--box_jitter_scale", type=float, default=0.05)
     parser.add_argument("--box_jitter_shift", type=float, default=0.0)
+    parser.add_argument("--w_locate_box_lm", type=float, default=0.0)
+    parser.add_argument("--w_locate_point_lm", type=float, default=0.0)
+    parser.add_argument("--locate_lm_loss_every", type=int, default=2)
+    parser.add_argument("--locate_lm_max_instances", type=int, default=20)
+    parser.add_argument("--locate_lm_max_points", type=int, default=8)
+    parser.add_argument("--disable_locate_grounding_aux", action="store_true")
 
     # ---------------------------------------------------------------------
     # Validation/debug section.
@@ -240,7 +251,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm_max_answer_instances", type=int, default=10)
     parser.add_argument("--visualize_every", type=int, default=0, help="Save one training visualization every N optimizer steps. Use 0 to disable.")
     parser.add_argument("--visualize_max_instances", type=int, default=8)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.backbone == "locatepose":
+        args.backbone = "eagle"
+    return args
 
 
 def set_seed(seed: int) -> None:
@@ -250,6 +264,8 @@ def set_seed(seed: int) -> None:
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
+    if "images" in batch:
+        batch["images"] = batch["images"].to(device, non_blocking=True)
     batch["schema_ids"] = batch["schema_ids"].to(device, non_blocking=True)
     batch["task_ids"] = batch["task_ids"].to(device, non_blocking=True)
     return batch
@@ -487,6 +503,62 @@ def build_lm_responses(batch: dict, max_instances: int = 10) -> list[str]:
     return responses
 
 
+def _locate_coord_token(value: float, upper: float) -> str:
+    if upper <= 0:
+        scaled = 0
+    else:
+        scaled = int(round(max(0.0, min(float(value), float(upper))) / float(upper) * 1000.0))
+    scaled = max(0, min(scaled, 1000))
+    return "<" + f"{scaled:03d}" + ">"
+
+
+def build_locate_grounding_responses(
+    batch: dict,
+    max_instances: int = 20,
+    max_points: int = 8,
+) -> tuple[list[str], list[str]]:
+    box_responses: list[str] = []
+    point_responses: list[str] = []
+    box_start = "<" + "box>"
+    box_end = "<" + "/box>"
+    for sample_idx, target in enumerate(batch["targets"]):
+        width = float(target["width"])
+        height = float(target["height"])
+        boxes = target["boxes"].detach().cpu()
+        keypoints = target["keypoints"].detach().cpu()
+        keypoint_mask = target["keypoint_mask"].detach().cpu().bool()
+        task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+        if task_id == 1:
+            ref_target = int(target["ref_target"].detach().cpu().item())
+            instance_indices = [ref_target] if 0 <= ref_target < int(boxes.shape[0]) else []
+        else:
+            instance_indices = list(range(min(int(boxes.shape[0]), max_instances)))
+        box_chunks: list[str] = []
+        point_chunks: list[str] = []
+        for person_idx in instance_indices:
+            box = boxes[person_idx].tolist()
+            box_chunks.append(
+                box_start
+                + _locate_coord_token(box[0] * width, width)
+                + _locate_coord_token(box[1] * height, height)
+                + _locate_coord_token(box[2] * width, width)
+                + _locate_coord_token(box[3] * height, height)
+                + box_end
+            )
+            visible_indices = torch.nonzero(keypoint_mask[person_idx], as_tuple=False).flatten().tolist()
+            for joint_idx in visible_indices[: max(0, int(max_points))]:
+                xy = keypoints[person_idx, joint_idx].tolist()
+                point_chunks.append(
+                    box_start
+                    + _locate_coord_token(xy[0] * width, width)
+                    + _locate_coord_token(xy[1] * height, height)
+                    + box_end
+                )
+        box_responses.append("".join(box_chunks) if box_chunks else "None")
+        point_responses.append("".join(point_chunks) if point_chunks else "None")
+    return box_responses, point_responses
+
+
 def prepare_box_conditioning(
     targets: list[dict[str, torch.Tensor]],
     task_ids: torch.Tensor,
@@ -618,6 +690,7 @@ class QwenPoseTrainingModel(torch.nn.Module):
         qwen_lm_inputs: dict[str, torch.Tensor] | None = None,
         target_boxes: torch.Tensor | None = None,
         target_box_mask: torch.Tensor | None = None,
+        images: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         extra = {}
         lm_loss = None
@@ -659,7 +732,11 @@ class QwenPoseTrainingModel(torch.nn.Module):
                         freeze_qwen=self.freeze_backbone,
                     )
                 if qwen_lm_inputs is not None and not self.freeze_backbone:
-                    lm_forward_inputs = qwen_forward_kwargs(qwen_lm_inputs)
+                    if self.backbone_name == "eagle":
+                        allowed = {"pixel_values", "image_grid_hws", "image_flags", "input_ids", "attention_mask"}
+                        lm_forward_inputs = {key: value for key, value in qwen_lm_inputs.items() if key in allowed}
+                    else:
+                        lm_forward_inputs = qwen_forward_kwargs(qwen_lm_inputs)
                     lm_forward_inputs["labels"] = qwen_lm_inputs["labels"]
                     lm_outputs = self.backbone_model(**lm_forward_inputs, use_cache=False)
                     lm_loss = lm_outputs.loss
@@ -670,6 +747,7 @@ class QwenPoseTrainingModel(torch.nn.Module):
         outputs = self.pose_model(
             schema_ids=schema_ids,
             task_ids=task_ids,
+            images=images,
             target_boxes=target_boxes,
             target_box_mask=target_box_mask,
             **extra,
@@ -831,18 +909,8 @@ class HomogeneousDatasetBatchSampler:
 def build_progress_loss_postfix(
     loss_metrics: dict[str, float],
     weights: LossWeights,
-    *,
-    use_uncertainty: bool,
-    use_aux_center: bool,
-    use_refinement: bool = True,
-    use_simcc: bool = True,
 ) -> dict[str, str]:
-    """Build tqdm/log postfix with explicit enabled loss names.
-
-    Values are the raw loss_dict scalars, not weighted aggregates. This keeps the
-    display debuggable: a negative RLE/NLL term is shown as unc_nll instead of
-    being hidden inside a misleading generic aux bucket.
-    """
+    """Build tqdm/log postfix for the active clean pose/LM objectives."""
 
     def _enabled(weight: float, key: str, flag: bool = True) -> bool:
         return bool(flag) and float(weight) > 0.0 and key in loss_metrics
@@ -856,11 +924,6 @@ def build_progress_loss_postfix(
     _add(postfix, "coord", "loss_coord", weights.coord)
     _add(postfix, "hard", "loss_hard_joint", weights.hard_joint)
     _add(postfix, "vis", "loss_vis", weights.vis)
-    _add(postfix, "unc_nll", "loss_uncertainty", weights.uncertainty, use_uncertainty)
-    _add(postfix, "center", "loss_aux_center", weights.aux_center, use_aux_center)
-    _add(postfix, "simcc", "loss_simcc", weights.simcc, use_simcc)
-    _add(postfix, "deep", "loss_deep_supervision", weights.deep_supervision, use_refinement)
-    _add(postfix, "bone", "loss_bone", weights.bone)
     _add(postfix, "lm", "loss_lm", weights.lm)
     return postfix
 
@@ -1330,19 +1393,27 @@ def save_checkpoint(
     if training_state is not None:
         payload["training_state"] = training_state
     if module.qwen_model is not None:
-        payload["qwen_trainable"] = trainable_state_dict(module.qwen_model)
+        backbone_state = trainable_state_dict(module.qwen_model)
+        payload["backbone_trainable"] = backbone_state
+        payload["qwen_trainable"] = backbone_state
     if module.qwen_extractor is not None:
-        payload["qwen_feature_config"] = {
+        feature_config = {
             "output_size": int(module.qwen_extractor.output_size),
         }
+        payload["backbone_feature_config"] = feature_config
+        payload["qwen_feature_config"] = feature_config
     if module.qwen_extractor is not None and module.qwen_extractor.feature_refiner.num_layers > 0:
         refiner = module.qwen_extractor.feature_refiner
-        payload["qwen_feature_refiner"] = refiner.state_dict()
-        payload["qwen_feature_refiner_config"] = {
+        refiner_state = refiner.state_dict()
+        refiner_config = {
             "layers": int(refiner.num_layers),
             "bottleneck_dim": int(refiner.bottleneck_dim),
             "init_scale": float(refiner.init_scale),
         }
+        payload["backbone_feature_refiner"] = refiner_state
+        payload["backbone_feature_refiner_config"] = refiner_config
+        payload["qwen_feature_refiner"] = refiner_state
+        payload["qwen_feature_refiner_config"] = refiner_config
     torch.save(payload, checkpoint_dir / CHECKPOINT_PAYLOAD_NAME)
     with (checkpoint_dir / "qwenpose_state.json").open("w", encoding="utf-8") as f:
         json.dump(
@@ -1359,7 +1430,9 @@ def save_checkpoint(
         )
         f.write("\n")
     if module.qwen_model is not None and hasattr(module.qwen_model, "save_pretrained"):
-        adapter_dir = checkpoint_dir / "qwen_lora_adapter"
+        backbone_name = str(getattr(module, "backbone_name", "qwen3vl"))
+        adapter_dir_name = "backbone_lora_adapter" if backbone_name == "eagle" else "qwen_lora_adapter"
+        adapter_dir = checkpoint_dir / adapter_dir_name
         module.qwen_model.save_pretrained(adapter_dir)
         if qwen_processor is not None:
             qwen_processor.save_pretrained(adapter_dir)
@@ -1558,10 +1631,11 @@ def load_training_checkpoint(
     payload = torch.load(payload_path, map_location="cpu")
     module = unwrap_training_model(model)
     module.pose_model.load_state_dict(payload["model"])
-    if module.qwen_model is not None and "qwen_trainable" in payload:
-        module.qwen_model.load_state_dict(payload["qwen_trainable"], strict=False)
-    if module.qwen_extractor is not None and "qwen_feature_refiner" in payload:
-        module.qwen_extractor.feature_refiner.load_state_dict(payload["qwen_feature_refiner"], strict=True)
+    backbone_state = payload.get("backbone_trainable", payload.get("qwen_trainable"))
+    if module.qwen_model is not None and backbone_state is not None:
+        module.qwen_model.load_state_dict(backbone_state, strict=False)
+    if module.qwen_extractor is not None and ("backbone_feature_refiner" in payload or "qwen_feature_refiner" in payload):
+        module.qwen_extractor.feature_refiner.load_state_dict(payload["backbone_feature_refiner"] if "backbone_feature_refiner" in payload else payload["qwen_feature_refiner"], strict=True)
     optimizer_loaded = False
     if load_optimizer and optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
@@ -1623,11 +1697,10 @@ def build_optimizer_param_groups(
         stats[group_name][0] += 1
         stats[group_name][1] += param.numel()
 
-    # Use eagle-specific lr scales if backbone is eagle, otherwise use qwen scales
     backbone_name = getattr(args, "backbone", "qwen3vl")
     if backbone_name == "eagle":
-        lora_lr_scale = getattr(args, "qwen_lora_lr_scale", 1.0)
-        vision_lr_scale = getattr(args, "qwen_vision_lr_scale", 0.01)
+        lora_lr_scale = getattr(args, "locate_lr_scale", args.qwen_lora_lr_scale)
+        vision_lr_scale = getattr(args, "locate_vision_scale", args.qwen_vision_lr_scale)
     else:
         lora_lr_scale = args.qwen_lora_lr_scale
         vision_lr_scale = args.qwen_vision_lr_scale
@@ -1772,6 +1845,8 @@ def main() -> None:
         dataset_root=args.dataset_root,
         names=dataset_names,
         max_instances=args.max_instances,
+        image_size=args.image_size,
+        load_image_tensors=not args.disable_image_tensors,
         split=args.split,
         max_samples_per_dataset=args.max_samples_per_dataset,
         refhuman_max_captions_per_instance=args.refhuman_max_captions_per_instance,
@@ -1946,11 +2021,7 @@ def main() -> None:
             decoder_heads=int(saved_pose_config.get("decoder_heads", args.decoder_heads)),
             box_condition_scale=float(saved_pose_config.get("box_condition_scale", args.box_condition_scale)),
             pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
-            use_uncertainty=bool(saved_pose_config.get("use_uncertainty", not args.disable_uncertainty)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
-            use_aux_center=bool(saved_pose_config.get("use_aux_center", not args.disable_aux_center)),
-            use_simcc=bool(saved_pose_config.get("use_simcc", False)),
-            simcc_bins=int(saved_pose_config.get("simcc_bins", args.simcc_bins)),
         )
     else:
         model_config = QwenPoseConfig(
@@ -1961,11 +2032,7 @@ def main() -> None:
             decoder_heads=args.decoder_heads,
             box_condition_scale=args.box_condition_scale,
             pose_roi_size=args.pose_roi_size,
-            use_uncertainty=not args.disable_uncertainty,
             use_refinement=not args.disable_refinement,
-            use_aux_center=not args.disable_aux_center,
-            use_simcc=not args.disable_simcc,
-            simcc_bins=args.simcc_bins,
         )
     model = QwenPoseModel(model_config).to(device)
     trainable, total = count_trainable_parameters(model)
@@ -2037,7 +2104,6 @@ def main() -> None:
         print(f"Freeze backbone/LoRA: {freeze_backbone}")
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
-        print(f"SimCC: enabled={model_config.use_simcc}, bins={model_config.simcc_bins}")
         print(f"Box jitter: scale={args.box_jitter_scale}, shift={args.box_jitter_shift}")
         print(
             "Qwen feature refiner: "
@@ -2088,14 +2154,9 @@ def main() -> None:
         oks=args.w_oks,
         coord=args.w_coord,
         vis=args.w_vis,
-        uncertainty=args.w_uncertainty,
-        aux_center=args.w_aux_center,
         lm=args.w_lm,
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
-        simcc=args.w_simcc,
-        deep_supervision=args.w_deep_supervision,
-        bone=args.w_bone,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     global_step = 0
@@ -2304,7 +2365,38 @@ def main() -> None:
                         min_pixels=args.eagle_min_pixels,
                         max_pixels=args.eagle_max_pixels,
                     )
-                    trace_qwen_inputs = qwen_inputs
+                    locate_aux_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
+                    use_lm_loss = (
+                        locate_aux_weight > 0.0
+                        and not args.disable_locate_grounding_aux
+                        and not args.freeze_eagle
+                        and args.locate_lm_loss_every > 0
+                        and micro_step % args.locate_lm_loss_every == 0
+                    )
+                    if use_lm_loss:
+                        if build_eagle_lm_inputs is None:
+                            raise RuntimeError(
+                                "Locate grounding LM auxiliary training requires build_eagle_lm_inputs in qwenpose.eagle_lora."
+                            )
+                        box_responses, point_responses = build_locate_grounding_responses(
+                            batch,
+                            max_instances=args.locate_lm_max_instances,
+                            max_points=args.locate_lm_max_points,
+                        )
+                        locate_responses = [
+                            f"Boxes: {box_text}\nPoints: {point_text}"
+                            for box_text, point_text in zip(box_responses, point_responses)
+                        ]
+                        qwen_lm_inputs = build_eagle_lm_inputs(
+                            backbone_processor,
+                            batch["image_paths"],
+                            batch["prompts"],
+                            locate_responses,
+                            device,
+                            min_pixels=args.eagle_min_pixels,
+                            max_pixels=args.eagle_max_pixels,
+                        )
+                    trace_qwen_inputs = qwen_lm_inputs if qwen_lm_inputs is not None else qwen_inputs
                 else:
                     use_lm_loss = (
                         args.w_lm > 0.0
@@ -2351,12 +2443,17 @@ def main() -> None:
                         qwen_lm_inputs=qwen_lm_inputs,
                         target_boxes=target_boxes,
                         target_box_mask=target_box_mask,
+                        images=batch.get("images"),
                     )
                     loss, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
                     if "lm_loss" in outputs:
                         lm_loss = outputs["lm_loss"].float()
-                        loss = loss + weights.lm * lm_loss
+                        lm_weight = weights.lm
+                        if backbone_name == "eagle":
+                            lm_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
+                        loss = loss + lm_weight * lm_loss
                         loss_dict["loss_lm"] = lm_loss
+                        loss_dict["loss_lm_weight"] = torch.as_tensor(lm_weight, device=loss.device)
                         loss_dict["loss_total"] = loss
 
                 # --- Loss spike detection ---
@@ -2455,14 +2552,7 @@ def main() -> None:
             if is_main_process():
                 if progress_bar is not None:
                     loss_metrics = {k: float(v.detach().cpu()) for k, v in loss_dict.items()}
-                    progress_loss_postfix = build_progress_loss_postfix(
-                        loss_metrics,
-                        weights,
-                        use_uncertainty=not args.disable_uncertainty,
-                        use_aux_center=not args.disable_aux_center,
-                        use_refinement=not args.disable_refinement,
-                        use_simcc=not args.disable_simcc,
-                    )
+                    progress_loss_postfix = build_progress_loss_postfix(loss_metrics, weights)
                     update_progress_bar(
                         progress_bar,
                         {
@@ -2516,14 +2606,7 @@ def main() -> None:
                     if loss_metrics is None:
                         loss_metrics = {k: float(v.detach().cpu()) for k, v in loss_dict.items()}
                     if progress_loss_postfix is None:
-                        progress_loss_postfix = build_progress_loss_postfix(
-                            loss_metrics,
-                            weights,
-                            use_uncertainty=not args.disable_uncertainty,
-                            use_aux_center=not args.disable_aux_center,
-                            use_refinement=not args.disable_refinement,
-                            use_simcc=not args.disable_simcc,
-                        )
+                        progress_loss_postfix = build_progress_loss_postfix(loss_metrics, weights)
                     current_lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else args.lr
                     timing_count = max(int(timing_sums["micro"]), 1)
                     timing_message = (

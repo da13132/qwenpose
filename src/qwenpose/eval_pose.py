@@ -252,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     # Eagle backbone options
     parser.add_argument("--eagle_model_path", type=str, default="weights/LocateAnything-3B")
     parser.add_argument("--eagle_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
-    parser.add_argument("--eagle_attn_implementation", type=str, default="flash_attention_2")
+    parser.add_argument("--eagle_attn_implementation", type=str, default="sdpa")
     parser.add_argument("--eagle_min_pixels", type=int, default=None)
     parser.add_argument("--eagle_max_pixels", type=int, default=None)
     parser.add_argument("--eagle_feature_size", type=int, default=32)
@@ -272,11 +272,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--box_condition_scale", type=float, default=1.2)
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--simcc_bins", type=int, default=128)
-    parser.add_argument("--disable_uncertainty", action="store_true")
     parser.add_argument("--disable_refinement", action="store_true")
-    parser.add_argument("--disable_aux_center", action="store_true")
-    parser.add_argument("--disable_simcc", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     parser.add_argument("--score_threshold", type=float, default=0.05)
@@ -284,13 +280,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize_max_samples", type=int, default=100)
     parser.add_argument("--visualize_max_instances", type=int, default=8)
 
-    parser.add_argument("--w_oks", type=float, default=1.0)
-    parser.add_argument("--w_coord", type=float, default=2.0)
-    parser.add_argument("--w_vis", type=float, default=0.5)
-    parser.add_argument("--w_uncertainty", type=float, default=0.05)
-    parser.add_argument("--w_aux_center", type=float, default=0.2)
+    parser.add_argument("--w_oks", type=float, default=0.2)
+    parser.add_argument("--w_coord", type=float, default=5.0)
+    parser.add_argument("--w_vis", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
-    parser.add_argument("--hard_joint_fraction", type=float, default=0.3)
+    parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
     return parser.parse_args()
 
 
@@ -335,8 +329,8 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
                 attn_implementation=args.eagle_attn_implementation,
             )
         )
-        if "qwen_trainable" in checkpoint:
-            backbone_model.load_state_dict(checkpoint["qwen_trainable"], strict=False)
+        if "backbone_trainable" in checkpoint or "qwen_trainable" in checkpoint:
+            backbone_model.load_state_dict(checkpoint["backbone_trainable"] if "backbone_trainable" in checkpoint else checkpoint["qwen_trainable"], strict=False)
         backbone_model.to(device)
         backbone_model.eval()
         external_dim = eagle_hidden_size(backbone_model)
@@ -365,8 +359,9 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
                     attn_implementation=args.qwen_attn_implementation,
                 )
             )
-        if not backbone_merged and "qwen_trainable" in checkpoint:
-            backbone_model.load_state_dict(checkpoint["qwen_trainable"], strict=False)
+        qwen_state = checkpoint.get("backbone_trainable", checkpoint.get("qwen_trainable"))
+        if not backbone_merged and qwen_state is not None:
+            backbone_model.load_state_dict(qwen_state, strict=False)
         backbone_model.to(device)
         backbone_model.eval()
         external_dim = qwen_hidden_size(backbone_model)
@@ -385,11 +380,7 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
             "decoder_heads": args.decoder_heads,
             "box_condition_scale": args.box_condition_scale,
             "pose_roi_size": args.pose_roi_size,
-            "use_uncertainty": not args.disable_uncertainty,
             "use_refinement": not args.disable_refinement,
-            "use_aux_center": not args.disable_aux_center,
-            "use_simcc": not args.disable_simcc,
-            "simcc_bins": args.simcc_bins,
         }
         if saved_pose_config is None
         else {
@@ -401,9 +392,9 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
     pose_config_kwargs["external_dim"] = external_dim
     pose_model = QwenPoseModel(QwenPoseConfig(**pose_config_kwargs))
     pose_model.load_state_dict(checkpoint["model"], strict=True)
-    refiner_config = checkpoint.get("qwen_feature_refiner_config", {})
-    feature_config = checkpoint.get("qwen_feature_config", {})
-    has_refiner_checkpoint = "qwen_feature_refiner" in checkpoint
+    refiner_config = checkpoint.get("backbone_feature_refiner_config", checkpoint.get("qwen_feature_refiner_config", {}))
+    feature_config = checkpoint.get("backbone_feature_config", checkpoint.get("qwen_feature_config", {}))
+    has_refiner_checkpoint = "backbone_feature_refiner" in checkpoint or "qwen_feature_refiner" in checkpoint
     feature_size = int(feature_config.get("output_size", default_feature_size))
     refiner_layers = int(refiner_config.get("layers", default_refiner_layers)) if has_refiner_checkpoint else 0
     refiner_bottleneck_dim = int(refiner_config.get("bottleneck_dim", default_refiner_bottleneck_dim))
@@ -436,7 +427,7 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
         backbone_name=backbone_name,
     ).to(device)
     if has_refiner_checkpoint:
-        model.backbone_extractor.feature_refiner.load_state_dict(checkpoint["qwen_feature_refiner"], strict=True)
+        model.backbone_extractor.feature_refiner.load_state_dict(checkpoint["backbone_feature_refiner"] if "backbone_feature_refiner" in checkpoint else checkpoint["qwen_feature_refiner"], strict=True)
     model.eval()
     return model, backbone_processor
 
@@ -576,8 +567,6 @@ def main() -> None:
         oks=args.w_oks,
         coord=args.w_coord,
         vis=args.w_vis,
-        uncertainty=args.w_uncertainty,
-        aux_center=args.w_aux_center,
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
     )
@@ -650,6 +639,7 @@ def main() -> None:
                     qwen_inputs=qwen_inputs,
                     target_boxes=target_boxes,
                     target_box_mask=target_box_mask,
+                    images=batch.get("images"),
                 )
                 _, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
                 forward_time = time.perf_counter() - forward_started

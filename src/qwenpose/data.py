@@ -132,20 +132,46 @@ def box_from_keypoints(keypoints: torch.Tensor, valid: torch.Tensor) -> list[flo
     return [max(x1 - pad_x, 0.0), max(y1 - pad_y, 0.0), min(x2 + pad_x, 1.0), min(y2 + pad_y, 1.0)]
 
 
+def read_image_tensor(path: Path, image_size: int) -> tuple[torch.Tensor, int, int]:
+    """Read an RGB image for the lightweight pose visual branch.
+
+    Qwen still reads the original image path separately; this tensor is a
+    fixed-size, normalized RGB view used only by QwenPoseModel's local visual
+    branch.
+    """
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        width, height = img.size
+        img = img.resize((image_size, image_size), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+    return tensor, width, height
+
+
 class PoseRecordDataset(Dataset):
     def __init__(
         self,
         records: list[PoseRecord],
         max_instances: int = 80,
+        image_size: int = 256,
+        load_image_tensors: bool = True,
     ) -> None:
         self.records = records
         self.max_instances = max_instances
+        self.image_size = image_size
+        self.load_image_tensors = load_image_tensors
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
+        if self.load_image_tensors:
+            image, _, _ = read_image_tensor(record.image_path, self.image_size)
+        else:
+            # Keep a tiny placeholder so the model can fall back to the pure-Qwen
+            # path without forcing a second PIL read in the DataLoader workers.
+            image = torch.zeros(3, 1, 1, dtype=torch.float32)
         n = min(record.boxes_xyxy.shape[0], self.max_instances)
         boxes = record.boxes_xyxy[:n].clone()
         keypoints = record.keypoints[:n].clone()
@@ -155,6 +181,7 @@ class PoseRecordDataset(Dataset):
             ref_target = -1
         text = record.prompt
         return {
+            "image": image,
             "image_path": str(record.image_path),
             "schema_id": torch.tensor(SCHEMA_TO_ID[record.schema], dtype=torch.long),
             "task_id": torch.tensor(TASK_TO_ID[record.task], dtype=torch.long),
@@ -302,6 +329,7 @@ class InterleavedPoseDataset(Dataset):
 
 def pose_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
+        "images": torch.stack([item["image"] for item in batch], dim=0),
         "schema_ids": torch.stack([item["schema_id"] for item in batch], dim=0),
         "task_ids": torch.stack([item["task_id"] for item in batch], dim=0),
         "targets": [item["target"] for item in batch],
@@ -709,9 +737,8 @@ def load_coco_records(
             masks,
             "COCO17",
             "ALL_POSE",
-            "Locate every person in the image. "
-            "The target pose annotation schema is COCO17 with 17 human keypoints. "
-            "Report bbox_2d coordinates in JSON format only.",
+            "Locate all the instances that match the following description: person. "
+            "Estimate the human pose for each located person using the COCO17 keypoint schema.",
             "coco",
             str(image_id),
         )
@@ -751,9 +778,9 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
             masks,
             "CrowdPose14",
             "ALL_POSE",
-            "Locate every person in the image. "
-            "The target pose annotation schema is CrowdPose14 with 14 human keypoints. "
-            "Report bbox_2d coordinates in JSON format only.",
+            "Locate all the instances that match the following description: person. "
+            "Estimate the human pose for each located person. "
+            "Use the available keypoint schema.",
             "crowdpose",
             str(image_id),
         )
@@ -829,9 +856,8 @@ def load_aic_records(
             masks,
             "AIC14",
             "ALL_POSE",
-            "Locate every person in the image. "
-            "The target pose annotation schema is AIC14 with 14 human keypoints. "
-            "Report bbox_2d coordinates in JSON format only.",
+            "Locate all the instances that match the following description: person. "
+            "Estimate the human pose for each located person using the AIC14 keypoint schema.",
             "aic",
             str(item["image_id"]),
         )
@@ -894,9 +920,8 @@ def load_mpii_records(root: Path, split: str = "train", max_samples: int | None 
             masks,
             "MPII16",
             "ALL_POSE",
-            "Locate every person in the image. "
-            "The target pose annotation schema is MPII16 with 16 human keypoints. "
-            "Report bbox_2d coordinates in JSON format only.",
+            "Locate all the instances that match the following description: person. "
+            "Estimate the human pose for each located person using the MPII16 keypoint schema.",
             "mpii",
             image_name,
         )
@@ -954,10 +979,9 @@ def load_refhuman_records(
         if ref_target < 0:
             continue
         prompt = (
-            "Locate the person that matches the following description in the image: "
+            "Locate a single person that matches the following description: "
             f"\"{caption}\". "
-            "The target pose annotation schema is COCO17 with 17 human keypoints. "
-            "Report bbox_2d coordinates in JSON format only."
+            "Estimate the human pose for the located person using the COCO17 keypoint schema."
         )
         _record_if_valid(
             records,
@@ -1019,6 +1043,8 @@ def build_datasets(
     dataset_root: Path,
     names: list[str],
     max_instances: int,
+    image_size: int = 256,
+    load_image_tensors: bool = True,
     split: str = "train",
     max_samples_per_dataset: int | None = None,
     refhuman_max_captions_per_instance: int = 2,
@@ -1146,7 +1172,17 @@ def build_datasets(
             raise ValueError(f"Unknown dataset {name!r}")
         if not records:
             raise RuntimeError(f"Dataset {name!r} produced no records.")
-        named_datasets.append((name, PoseRecordDataset(records, max_instances)))
+        named_datasets.append(
+            (
+                name,
+                PoseRecordDataset(
+                    records,
+                    max_instances=max_instances,
+                    image_size=image_size,
+                    load_image_tensors=load_image_tensors,
+                ),
+            )
+        )
         dataset_elapsed = time.perf_counter() - dataset_started
         total_elapsed = time.perf_counter() - overall_started
         remaining_count = max(total_datasets - dataset_index, 0)

@@ -9,33 +9,33 @@ set -Eeuo pipefail
 #
 # 所有脚本变量都支持通过命令行覆盖，命令行解析发生在默认值赋值之前，因此下面任意
 # 大写变量均可用以下三种写法传入：
-#   1. --变量名 值，例如：--STAGE1_BATCH_SIZE 8
+#   1. --变量名 值，例如：--STAGE1_BATCH_SIZE 4
 #   2. --变量名=值，例如：--STAGE2_EPOCHS=1
 #   3. --kebab-case-name 值，例如：--stage2-train-datasets coco,refhuman
 # 脚本会把 kebab-case / snake_case 统一转换为大写下划线变量名。
 #
 # Stage 1 / FREEZE_QWEN warmup：
-#   - 默认冻结 Qwen 主体与 LoRA，只训练 Qwen feature refiner 和 PoseHead。
-#   - 默认数据：coco,aic,mpii,crowdpose。
-#   - 默认采用更偏吞吐的 warmup 组合：per-GPU micro batch size = 8，grad accum = 1。
-#   - 默认关闭 LM 辅助损失，避免冻结 Qwen 时浪费 LM loss 计算。
-#   - 默认关闭 stage1 可视化和 batch trace，减少频繁 I/O 对吞吐的干扰。
+#   - 默认冻结 Qwen 主体与 LoRA，只训练 RGB 视觉分支、Qwen feature refiner 和 PoseHead。
+#   - 默认数据：coco。
+#   - 默认使用稳定 warmup 组合：per-GPU micro batch size = 4，grad accum = 2。
+#   - 默认关闭 LM 辅助损失，只保留 coord + OKS + vis pose 监督。
+#   - 默认关闭 stage1 batch trace，减少频繁 I/O 对吞吐的干扰。
 #
-# Stage 2 / Qwen LoRA + LM：
+# Stage 2 / Qwen LoRA + bbox LM：
 #   - 默认打开 Qwen LoRA，使 Qwen 主体中的 LoRA 参数可训练。
-#   - 默认启用 LM 辅助损失 W_LM="${W_LM:-1}"。
-#   - 默认数据：coco,mpii,crowdpose,refhuman。
-#   - 默认训练 1 epoch，per-GPU micro batch size = 2。
+#   - 默认启用低权重 bbox JSON LM 监督：W_LM=0.05，LM_LOSS_EVERY=2。
+#   - 默认数据：coco。
+#   - 默认训练 1 epoch，per-GPU micro batch size = 1，grad accum = 8。
 #   - 默认 REFHUMAN_MAX_CAPTIONS_PER_INSTANCE="${REFHUMAN_MAX_CAPTIONS_PER_INSTANCE:-1}"。
 #
 # 示例：
 #   scripts/train_qwenpose_two_stage.sh \
 #     --CUDA_VISIBLE_DEVICES 0,1 \
 #     --NPROC_PER_NODE 2 \
-#     --STAGE1_EPOCHS 10 \
-#     --STAGE1_BATCH_SIZE 8 \
+#     --STAGE1_EPOCHS 2 \
+#     --STAGE1_BATCH_SIZE 4 \
 #     --STAGE2_EPOCHS 1 \
-#     --STAGE2_BATCH_SIZE 2
+#     --STAGE2_BATCH_SIZE 1
 ###############################################################################
 
 DEFAULT_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,8 +56,8 @@ Options:
                   Examples:
                     --CUDA_VISIBLE_DEVICES 0,1
                     --NPROC_PER_NODE 2
-                    --STAGE1_BATCH_SIZE 8
-                    --stage2-train-datasets coco,mpii,crowdpose,refhuman
+                    --STAGE1_BATCH_SIZE 4
+                    --stage2-train-datasets coco
   --VAR=VALUE     Same as above, using inline assignment.
   -h, --help      Show this help message.
 EOF
@@ -382,7 +382,7 @@ trap 'status=$?; echo "========== qwenpose two-stage train exit status ${status}
 # ZERO_STAGE：DeepSpeed ZeRO 策略。zero2 默认推荐；zero3 更省显存；zero3_offload 更省显存但慢；none 用于调试。
 ZERO_STAGE="${ZERO_STAGE:-zero2}"
 
-# CUDA_VISIBLE_DEVICES：可见 GPU 列表。默认使用 0,1,2,3；单卡可传 --CUDA_VISIBLE_DEVICES 0。
+# CUDA_VISIBLE_DEVICES：可见 GPU 列表。默认使用 0,1；单卡可传 --CUDA_VISIBLE_DEVICES 0。
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 # NPROC_PER_NODE：本机启动的训练进程数，通常等于可见 GPU 数。
@@ -472,8 +472,8 @@ QWEN_MIN_PIXELS="${QWEN_MIN_PIXELS:-}"
 QWEN_MAX_PIXELS="${QWEN_MAX_PIXELS:-}"
 # QWEN_FEATURE_SIZE：Qwen image tokens 汇聚后给 PoseHead 的固定空间网格边长。
 QWEN_FEATURE_SIZE="${QWEN_FEATURE_SIZE:-64}"
-# QWEN_FEATURE_REFINER_LAYERS：Qwen feature refiner 残差细化层数。0 表示不用 refiner。
-QWEN_FEATURE_REFINER_LAYERS="${QWEN_FEATURE_REFINER_LAYERS:-2}"
+# QWEN_FEATURE_REFINER_LAYERS：Qwen feature refiner 残差细化层数。默认 1，避免 stage1 过度复杂。
+QWEN_FEATURE_REFINER_LAYERS="${QWEN_FEATURE_REFINER_LAYERS:-1}"
 # QWEN_FEATURE_REFINER_BOTTLENECK_DIM：feature refiner bottleneck 通道数，影响新增参数和计算量。
 QWEN_FEATURE_REFINER_BOTTLENECK_DIM="${QWEN_FEATURE_REFINER_BOTTLENECK_DIM:-256}"
 # QWEN_FEATURE_REFINER_INIT_SCALE：feature refiner 残差初始强度，较小值有助于 warmup 稳定。
@@ -488,8 +488,6 @@ REFINEMENT_STEPS="${REFINEMENT_STEPS:-3}"
 BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
 # POSE_ROI_SIZE：每个人体 bbox 从 Qwen grid 上采样出的 ROI feature 空间边长。
 POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
-# SIMCC_BINS：SimCC 辅助头在 person box 内的 x/y 离散 bin 数。
-SIMCC_BINS="${SIMCC_BINS:-128}"
 # DECODER_HEADS：Pose decoder 多头注意力头数，必须整除 HIDDEN_DIM。
 DECODER_HEADS="${DECODER_HEADS:-8}"
 # QWEN_LORA_R：Qwen LLM LoRA rank，越大可训练容量越强，但显存和参数量也更高。
@@ -509,7 +507,7 @@ QWEN_VISION_LORA_DROPOUT="${QWEN_VISION_LORA_DROPOUT:-0.05}"
 # 通用训练超参数
 ###############################################################################
 
-# BATCH_SIZE：可选全局 per-GPU micro batch size。留空时 stage1 默认 8、stage2 默认 2。
+# BATCH_SIZE：可选全局 per-GPU micro batch size。留空时 stage1 默认 4、stage2 默认 1。
 BATCH_SIZE="${BATCH_SIZE:-}"
 # GRAD_ACCUM_STEPS：全局梯度累积步数。stage 未单独覆盖时继承它。
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
@@ -561,31 +559,21 @@ SEED="${SEED:-42}"
 ###############################################################################
 
 # W_OKS：OKS loss 权重，作为关键点几何定位监督。
-W_OKS="${W_OKS:-0.5}"
-# W_COORD：关键点坐标回归 loss 权重，通常是 pose 定位主监督。
-W_COORD="${W_COORD:-3.0}"
+W_OKS="${W_OKS:-0.2}"
+# W_COORD：关键点坐标回归 loss 权重，pose 定位主监督。
+W_COORD="${W_COORD:-5.0}"
 # W_VIS：关键点可见性/有效性 BCE loss 权重。
 W_VIS="${W_VIS:-0.05}"
-# W_HARD_JOINT：hard keypoint mining loss 权重。
-W_HARD_JOINT="${W_HARD_JOINT:-0.15}"
+# W_HARD_JOINT：hard keypoint mining loss 权重。保留给后续实验，默认关闭。
+W_HARD_JOINT="${W_HARD_JOINT:-0}"
 # HARD_JOINT_FRACTION：hard mining 选择的可见关键点比例。
-HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.3}"
-# W_UNCERTAINTY：关键点不确定性/RLE 风格辅助 loss 权重。
-W_UNCERTAINTY="${W_UNCERTAINTY:-0.02}"
-# W_AUX_CENTER：dense center 辅助 loss 权重。
-W_AUX_CENTER="${W_AUX_CENTER:-0.05}"
-# W_SIMCC：SimCC x/y Gaussian soft-label 辅助 loss 权重。
-W_SIMCC="${W_SIMCC:-0.2}"
-# W_DEEP_SUPERVISION：refinement 中间步骤 deep supervision 权重。
-W_DEEP_SUPERVISION="${W_DEEP_SUPERVISION:-0.3}"
-# W_BONE：骨架方向/长度一致性弱约束权重。
-W_BONE="${W_BONE:-0.05}"
-# W_LM：全局 LM 辅助损失权重。stage2 默认继承它；stage1 默认强制为 0。
-W_LM="${W_LM:-0.1}"
-# LM_LOSS_EVERY：全局 LM loss 计算频率，单位为 micro batch。0 表示关闭。
-LM_LOSS_EVERY="${LM_LOSS_EVERY:-1}"
+HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.2}"
+# W_LM：全局 LM bbox 监督权重。stage1 默认强制为 0，stage2 默认继承它。
+W_LM="${W_LM:-0.05}"
+# LM_LOSS_EVERY：全局 LM loss 计算频率，单位为 micro batch。stage2 默认隔步计算。
+LM_LOSS_EVERY="${LM_LOSS_EVERY:-2}"
 # LM_MAX_ANSWER_INSTANCES：ALL_POSE LM answer 中最多监督的人体实例数。
-LM_MAX_ANSWER_INSTANCES="${LM_MAX_ANSWER_INSTANCES:-30}"
+LM_MAX_ANSWER_INSTANCES="${LM_MAX_ANSWER_INSTANCES:-10}"
 # BOX_JITTER_SCALE：训练时对条件框宽高的随机缩放扰动强度。
 BOX_JITTER_SCALE="${BOX_JITTER_SCALE:-0.0}"
 # BOX_JITTER_SHIFT：训练时对条件框中心的随机平移扰动强度。
@@ -599,14 +587,8 @@ BOX_JITTER_SHIFT="${BOX_JITTER_SHIFT:-0.0}"
 DRY_RUN_DATA="${DRY_RUN_DATA:-0}"
 # PROGRESS_BAR：1 显示 tqdm 进度条；0 关闭动态进度条。
 PROGRESS_BAR="${PROGRESS_BAR:-1}"
-# DISABLE_UNCERTAINTY：1 表示关闭关键点不确定性分支及其 loss。
-DISABLE_UNCERTAINTY="${DISABLE_UNCERTAINTY:-0}"
 # DISABLE_REFINEMENT：1 表示关闭 decoder 后关键点 refinement 分支。
 DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
-# DISABLE_AUX_CENTER：1 表示关闭 dense center 辅助分支。
-DISABLE_AUX_CENTER="${DISABLE_AUX_CENTER:-0}"
-# DISABLE_SIMCC：1 表示关闭 SimCC 辅助头及其 loss。
-DISABLE_SIMCC="${DISABLE_SIMCC:-0}"
 # DISABLE_HOMOGENEOUS_BATCHES：1 表示允许一个 batch 混合多个数据集；默认 0 表示单 batch 单数据集。
 DISABLE_HOMOGENEOUS_BATCHES="${DISABLE_HOMOGENEOUS_BATCHES:-0}"
 # DISABLE_BATCH_TRACE：1 表示关闭每个 batch 的 JSONL trace。
@@ -627,9 +609,9 @@ STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_DIR}/stage2_qwen_lora_lm}"
 # STAGE2_INIT_WEIGHTS_DIR：自动生成的 stage2 weight-only init checkpoint 存放目录。
 STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_weights}"
 # STAGE1_TRAIN_DATASETS：stage1 训练数据集列表，逗号分隔。 # coco,mpii,crowdpose,aic,refhuman #
-STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose}"
+STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco}"
 # STAGE2_TRAIN_DATASETS：stage2 训练数据集列表，逗号分隔。
-STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
+STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco}"
 # STAGE1_MIXING_STRATEGY：stage1 多数据集混合策略；默认继承 MIXING_STRATEGY。
 STAGE1_MIXING_STRATEGY="${STAGE1_MIXING_STRATEGY:-${MIXING_STRATEGY}}"
 # STAGE2_MIXING_STRATEGY：stage2 多数据集混合策略；默认继承 MIXING_STRATEGY。
@@ -646,25 +628,22 @@ STAGE2_MAX_SAMPLES_PER_DATASET="${STAGE2_MAX_SAMPLES_PER_DATASET:-${MAX_SAMPLES_
 STAGE1_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE="${STAGE1_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE:-${REFHUMAN_MAX_CAPTIONS_PER_INSTANCE:-1}}"
 # STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE：stage2 RefHuman 单实例最多 caption 数。默认 1。
 STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE="${STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE:-${REFHUMAN_MAX_CAPTIONS_PER_INSTANCE:-1}}"
-# STAGE1_EPOCHS：stage1 训练 epoch 数。默认 10。
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-10}"
-# STAGE2_EPOCHS：stage2 训练 epoch 数。默认 1。
+# STAGE1_EPOCHS：stage1 训练 epoch 数。默认 2，用于 RGB 视觉分支 pose warmup。
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-2}"
+# STAGE2_EPOCHS：stage2 训练 epoch 数。默认 1，只做 LoRA + bbox LM 适配。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-1}"
-# Stage1 warmup 推荐组合：
-#   - 默认吞吐档：batch=8, accum=1。
-#   - 若显存吃紧：优先退到 batch=6, accum=1；再不够则用 batch=4, accum=2。
-# STAGE1_BATCH_SIZE：stage1 每张 GPU 的 micro batch size。默认 8。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-${BATCH_SIZE:-8}}"
-# STAGE2_BATCH_SIZE：stage2 每张 GPU 的 micro batch size。默认 2。
-STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-${BATCH_SIZE:-2}}"
-# STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。默认 1，尽量把吞吐换成真实 batch。
-STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
-# STAGE2_GRAD_ACCUM_STEPS：stage2 梯度累积步数。
-STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-${GRAD_ACCUM_STEPS}}"
-# STAGE1_MAX_STEPS：stage1 最大 optimizer step 截断。0 表示按 epoch 完整训练。
-STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-${MAX_STEPS}}"
-# STAGE2_MAX_STEPS：stage2 最大 optimizer step 截断。0 表示按 epoch 完整训练。
-STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-${MAX_STEPS}}"
+# STAGE1_BATCH_SIZE：stage1 每张 GPU 的 micro batch size。默认 4。
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-${BATCH_SIZE:-4}}"
+# STAGE2_BATCH_SIZE：stage2 每张 GPU 的 micro batch size。默认 1。
+STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-${BATCH_SIZE:-1}}"
+# STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。默认 2。
+STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-2}"
+# STAGE2_GRAD_ACCUM_STEPS：stage2 梯度累积步数。默认 8。
+STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-8}"
+# STAGE1_MAX_STEPS：stage1 最大 optimizer step 截断。默认 7000。
+STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-7000}"
+# STAGE2_MAX_STEPS：stage2 最大 optimizer step 截断。默认 3000。
+STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-3000}"
 # STAGE1_FREEZE_QWEN：stage1 是否冻结 Qwen 主体/LoRA。默认 1。
 STAGE1_FREEZE_QWEN="${STAGE1_FREEZE_QWEN:-1}"
 # STAGE2_FREEZE_QWEN：stage2 是否冻结 Qwen 主体/LoRA。默认 0。
@@ -679,8 +658,8 @@ STAGE1_LM_LOSS_EVERY="${STAGE1_LM_LOSS_EVERY:-0}"
 STAGE2_LM_LOSS_EVERY="${STAGE2_LM_LOSS_EVERY:-${LM_LOSS_EVERY}}"
 # STAGE1_LR：stage1 基础学习率。默认继承 LR。
 STAGE1_LR="${STAGE1_LR:-${LR}}"
-# STAGE2_LR：stage2 基础学习率。默认继承 LR。
-STAGE2_LR="${STAGE2_LR:-${LR}}"
+# STAGE2_LR：stage2 基础学习率。默认 1e-4。
+STAGE2_LR="${STAGE2_LR:-1e-4}"
 # STAGE1_QWEN_LORA_LR_SCALE：stage1 LLM LoRA lr scale；冻结 Qwen 时通常不生效。
 STAGE1_QWEN_LORA_LR_SCALE="${STAGE1_QWEN_LORA_LR_SCALE:-${QWEN_LORA_LR_SCALE}}"
 # STAGE2_QWEN_LORA_LR_SCALE：stage2 LLM LoRA lr scale。
@@ -734,7 +713,7 @@ STAGE2_INIT_CHECKPOINT="${STAGE2_INIT_CHECKPOINT:-}"
 # STAGE2_INIT_FROM_STAGE1：stage2 是否默认从 stage1 输出生成 weight-only init。1 表示是。
 STAGE2_INIT_FROM_STAGE1="${STAGE2_INIT_FROM_STAGE1:-1}"
 # MERGE_FINAL_WEIGHTS：stage2 正常结束后是否自动合并 LoRA 为完整发布权重。
-MERGE_FINAL_WEIGHTS="${MERGE_FINAL_WEIGHTS:-1}"
+MERGE_FINAL_WEIGHTS="${MERGE_FINAL_WEIGHTS:-0}"
 # MERGED_WEIGHTS_ROOT：自动合并后的完整权重输出根目录。
 MERGED_WEIGHTS_ROOT="${MERGED_WEIGHTS_ROOT:-weights}"
 # MERGED_WEIGHTS_DIR：自动合并后的完整权重目录，默认带 run 名和当前时间戳。
@@ -831,10 +810,7 @@ require_bool DRY_RUN_DATA "${DRY_RUN_DATA}"
 require_bool PROGRESS_BAR "${PROGRESS_BAR}"
 require_bool SYNC_TIMING "${SYNC_TIMING}"
 require_bool DISABLE_RECORD_CACHE "${DISABLE_RECORD_CACHE}"
-require_bool DISABLE_UNCERTAINTY "${DISABLE_UNCERTAINTY}"
 require_bool DISABLE_REFINEMENT "${DISABLE_REFINEMENT}"
-require_bool DISABLE_AUX_CENTER "${DISABLE_AUX_CENTER}"
-require_bool DISABLE_SIMCC "${DISABLE_SIMCC}"
 require_bool DISABLE_HOMOGENEOUS_BATCHES "${DISABLE_HOMOGENEOUS_BATCHES}"
 require_bool DISABLE_BATCH_TRACE "${DISABLE_BATCH_TRACE}"
 require_bool STAGE1_DISABLE_BATCH_TRACE "${STAGE1_DISABLE_BATCH_TRACE}"
@@ -1094,7 +1070,6 @@ run_stage() {
     --refinement_steps "${REFINEMENT_STEPS}"
     --box_condition_scale "${BOX_CONDITION_SCALE}"
     --pose_roi_size "${POSE_ROI_SIZE}"
-    --simcc_bins "${SIMCC_BINS}"
     --decoder_heads "${DECODER_HEADS}"
 
     --output_dir "${output_dir}"
@@ -1124,16 +1099,11 @@ run_stage() {
     --w_vis "${W_VIS}"
     --w_hard_joint "${W_HARD_JOINT}"
     --hard_joint_fraction "${HARD_JOINT_FRACTION}"
-    --w_uncertainty "${W_UNCERTAINTY}"
-    --w_aux_center "${W_AUX_CENTER}"
-    --w_simcc "${W_SIMCC}"
-    --w_deep_supervision "${W_DEEP_SUPERVISION}"
-    --w_bone "${W_BONE}"
     --w_lm "${w_lm}"
     --lm_loss_every "${lm_loss_every}"
     --lm_max_answer_instances "${LM_MAX_ANSWER_INSTANCES}"
-    --box_jitter_scale "${BOX_JITTER_SCALE:-0.05}"
-    --box_jitter_shift "${BOX_JITTER_SHIFT:-0.03}"
+    --box_jitter_scale "${BOX_JITTER_SCALE}"
+    --box_jitter_shift "${BOX_JITTER_SHIFT}"
   )
 
   if [[ -n "${max_samples_per_dataset}" ]]; then
@@ -1169,17 +1139,8 @@ run_stage() {
   if [[ "${DISABLE_RECORD_CACHE}" == "1" ]]; then
     args+=(--disable_record_cache)
   fi
-  if [[ "${DISABLE_UNCERTAINTY}" == "1" ]]; then
-    args+=(--disable_uncertainty)
-  fi
   if [[ "${DISABLE_REFINEMENT}" == "1" ]]; then
     args+=(--disable_refinement)
-  fi
-  if [[ "${DISABLE_AUX_CENTER}" == "1" ]]; then
-    args+=(--disable_aux_center)
-  fi
-  if [[ "${DISABLE_SIMCC}" == "1" ]]; then
-    args+=(--disable_simcc)
   fi
   if [[ "${DISABLE_HOMOGENEOUS_BATCHES}" == "1" ]]; then
     args+=(--disable_homogeneous_batches)
@@ -1312,7 +1273,7 @@ if [[ "${RUN_STAGE2}" == "1" ]]; then
   fi
 
   run_stage \
-    "Stage 2 / Qwen LoRA + LM" \
+    "Stage 2 / Qwen LoRA + bbox LM" \
     "${STAGE2_OUTPUT_DIR}" \
     "${STAGE2_TRAIN_DATASETS}" \
     "${STAGE2_BATCH_SIZE}" \

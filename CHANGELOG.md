@@ -2,6 +2,15 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v0.2.0 - 2026-06-25
+
+- Integrated the latest local QwenPose two-stage training updates centered on `scripts/train_qwenpose_two_stage.sh`.
+- Added the new RGB visual branch data path through `PoseRecordDataset`, `QwenPoseModel`, training, and evaluation so train and eval both use the same image tensor input route.
+- Simplified the default pose loss recipe to the current clean configuration used by the two-stage shell pipeline.
+- Updated the public default two-stage recipe to the current COCO-first setup and aligned README defaults with the live shell script.
+- Restored the compatibility wrapper `scripts/train_qwenpose_one_stage.sh` and kept Eagle/LocatePose entry scripts out of the public snapshot.
+- Verified the refreshed snapshot with shell syntax checks, Python import and compile checks, a model forward smoke test, and a full two-stage `DRY_RUN_DATA=1` shell run.
+
 ## v0.1.0 - 2026-06-25
 
 - First versioned public release of the QwenPose two-stage Qwen3-VL training snapshot.

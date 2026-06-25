@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v0.1.0`
+Release: `v0.2.0`
 
 English | [中文说明](README_zh.md)
 
@@ -256,12 +256,12 @@ Default stage configuration:
 - Stage 1 output: `stage1_freeze_qwen`
 - Stage 2 output: `stage2_qwen_lora_lm`
 - Output root: `outputs/qwenpose_two_stage_qwen`
-- Automatic merged release weights: `weights/<run_name>-merged-<timestamp>`
-- Stage 1 datasets: `coco,mpii,crowdpose`
-- Stage 2 datasets: `coco,mpii,crowdpose,refhuman`
-- Stage 1 batch size: `8` per GPU
-- Stage 2 batch size: `2` per GPU
-- Stage 1 epochs: `10`
+- Optional merged release weights when `MERGE_FINAL_WEIGHTS=1`: `weights/<run_name>-merged-<timestamp>`
+- Stage 1 datasets: `coco`
+- Stage 2 datasets: `coco`
+- Stage 1 batch size: `4` per GPU
+- Stage 2 batch size: `1` per GPU
+- Stage 1 epochs: `2`
 - Stage 2 epochs: `1`
 - ZeRO preset: `zero2`
 

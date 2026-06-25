@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v0.1.0`
+版本：`v0.2.0`
 
 [English](README.md) | 中文
 
@@ -256,12 +256,12 @@ scripts/train_qwenpose_two_stage.sh
 - Stage 1 输出目录：`stage1_freeze_qwen`
 - Stage 2 输出目录：`stage2_qwen_lora_lm`
 - 总输出根目录：`outputs/qwenpose_two_stage_qwen`
-- 自动合并后的发布权重：`weights/<run_name>-merged-<timestamp>`
-- Stage 1 数据集：`coco,mpii,crowdpose`
-- Stage 2 数据集：`coco,mpii,crowdpose,refhuman`
-- Stage 1 batch size：每张 GPU `8`
-- Stage 2 batch size：每张 GPU `2`
-- Stage 1 epoch：`10`
+- 当 `MERGE_FINAL_WEIGHTS=1` 时自动导出的发布权重：`weights/<run_name>-merged-<timestamp>`
+- Stage 1 数据集：`coco`
+- Stage 2 数据集：`coco`
+- Stage 1 batch size：每张 GPU `4`
+- Stage 2 batch size：每张 GPU `1`
+- Stage 1 epoch：`2`
 - Stage 2 epoch：`1`
 - 默认 ZeRO 方案：`zero2`
 

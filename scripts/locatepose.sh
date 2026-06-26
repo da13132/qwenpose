@@ -570,7 +570,7 @@ STAGE1_LR="${STAGE1_LR:-2e-4}"
 # STAGE2_LR：stage2 基础学习率。
 STAGE2_LR="${STAGE2_LR:-5e-5}"
 # STAGE1_MAX_STEPS：stage1 最大 optimizer step；0 表示按 epoch 跑满。
-STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-${MAX_STEPS:-7000}}"
+STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-${MAX_STEPS:-0}}"
 # STAGE2_MAX_STEPS：stage2 最大 optimizer step；0 表示按 epoch 跑满。
 STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-0}"
 # STAGE1_FREEZE_LOCATE：stage1 是否冻结 LocateAnything。

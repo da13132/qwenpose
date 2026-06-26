@@ -38,6 +38,7 @@ from qwenpose.train_pose import (
     checkpoint_step,
     move_batch_to_device,
     prepare_box_conditioning,
+    prepare_locate_generated_box_conditioning,
     prepare_qwen_generated_box_conditioning,
     save_pose_visualization,
 )
@@ -234,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_record_cache", action="store_true")
     parser.add_argument("--disable_progress", action="store_true")
 
-    parser.add_argument("--backbone", choices=["qwen3vl", "eagle"], default="qwen3vl")
+    parser.add_argument("--backbone", choices=["qwen3vl", "eagle", "locatepose"], default="qwen3vl")
     parser.add_argument("--qwen_model_path", type=str, default="weights/Qwen3-VL-4B-Instruct")
     parser.add_argument("--qwen_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
     parser.add_argument("--qwen_attn_implementation", type=str, default="flash_attention_2")
@@ -251,21 +252,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen_vision_lora_alpha", type=int, default=32)
     parser.add_argument("--qwen_vision_lora_dropout", type=float, default=0.05)
     # Eagle backbone options
-    parser.add_argument("--eagle_model_path", type=str, default="weights/LocateAnything-3B")
-    parser.add_argument("--eagle_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
-    parser.add_argument("--eagle_attn_implementation", type=str, default="sdpa")
-    parser.add_argument("--eagle_min_pixels", type=int, default=None)
-    parser.add_argument("--eagle_max_pixels", type=int, default=None)
-    parser.add_argument("--eagle_feature_size", type=int, default=32)
-    parser.add_argument("--eagle_feature_refiner_layers", type=int, default=0)
-    parser.add_argument("--eagle_feature_refiner_bottleneck_dim", type=int, default=256)
-    parser.add_argument("--eagle_feature_refiner_init_scale", type=float, default=0.1)
-    parser.add_argument("--eagle_lora_r", type=int, default=32)
-    parser.add_argument("--eagle_lora_alpha", type=int, default=64)
-    parser.add_argument("--eagle_lora_dropout", type=float, default=0.05)
-    parser.add_argument("--eagle_vision_lora_r", type=int, default=16)
-    parser.add_argument("--eagle_vision_lora_alpha", type=int, default=32)
-    parser.add_argument("--eagle_vision_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--locate_model_path", "--eagle_model_path", dest="eagle_model_path", type=str, default="weights/LocateAnything-3B")
+    parser.add_argument("--locate_dtype", "--eagle_dtype", dest="eagle_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
+    parser.add_argument("--locate_attn_implementation", "--eagle_attn_implementation", dest="eagle_attn_implementation", type=str, default="sdpa")
+    parser.add_argument("--locate_min_pixels", "--eagle_min_pixels", dest="eagle_min_pixels", type=int, default=None)
+    parser.add_argument("--locate_max_pixels", "--eagle_max_pixels", dest="eagle_max_pixels", type=int, default=None)
+    parser.add_argument("--locate_image_token_limit", "--eagle_image_token_limit", dest="eagle_image_token_limit", type=int, default=None)
+    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=32)
+    parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
+    parser.add_argument(
+        "--locate_feature_refiner_bottleneck_dim",
+        "--eagle_feature_refiner_bottleneck_dim",
+        dest="eagle_feature_refiner_bottleneck_dim",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--locate_feature_refiner_init_scale",
+        "--eagle_feature_refiner_init_scale",
+        dest="eagle_feature_refiner_init_scale",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument("--locate_lora_r", "--eagle_lora_r", dest="eagle_lora_r", type=int, default=32)
+    parser.add_argument("--locate_lora_alpha", "--eagle_lora_alpha", dest="eagle_lora_alpha", type=int, default=64)
+    parser.add_argument("--locate_lora_dropout", "--eagle_lora_dropout", dest="eagle_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--locate_vision_lora_r", "--eagle_vision_lora_r", dest="eagle_vision_lora_r", type=int, default=16)
+    parser.add_argument("--locate_vision_lora_alpha", "--eagle_vision_lora_alpha", dest="eagle_vision_lora_alpha", type=int, default=32)
+    parser.add_argument("--locate_vision_lora_dropout", "--eagle_vision_lora_dropout", dest="eagle_vision_lora_dropout", type=float, default=0.05)
 
     parser.add_argument("--hidden_dim", type=int, default=448)
     parser.add_argument("--pose_decoder_layers", type=int, default=1)
@@ -273,8 +287,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--box_condition_scale", type=float, default=1.2)
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--box_source", choices=["gt", "qwen_generate"], default="qwen_generate")
+    parser.add_argument("--box_source", choices=["gt", "qwen_generate", "locate_generate"], default=None)
     parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
+    parser.add_argument("--locate_box_max_new_tokens", type=int, default=8192)
+    parser.add_argument("--locate_generation_mode", choices=["fast", "slow", "hybrid"], default="hybrid")
     parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
     parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
     parser.add_argument("--disable_refinement", action="store_true")
@@ -507,6 +523,10 @@ def tensor_to_prediction_rows(outputs: dict[str, torch.Tensor], batch: dict, arg
 
 def main() -> None:
     args = parse_args()
+    if args.backbone == "locatepose":
+        args.backbone = "eagle"
+    if args.box_source is None:
+        args.box_source = "locate_generate" if args.backbone == "eagle" else "qwen_generate"
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
     if args.pose_roi_size <= 1:
@@ -519,12 +539,16 @@ def main() -> None:
         raise ValueError("--visualize_max_instances must be positive.")
     if args.qwen_box_max_new_tokens <= 0:
         raise ValueError("--qwen_box_max_new_tokens must be positive.")
+    if args.locate_box_max_new_tokens <= 0:
+        raise ValueError("--locate_box_max_new_tokens must be positive.")
     if not 0.0 <= args.box_match_iou_thresh <= 1.0:
         raise ValueError("--box_match_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
     if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
+    if args.box_source == "locate_generate" and args.backbone != "eagle":
+        raise ValueError("--box_source=locate_generate currently requires --backbone eagle/locatepose.")
     if args.qwen_min_pixels is not None and args.qwen_min_pixels <= 0:
         raise ValueError("--qwen_min_pixels must be positive when set.")
     if args.qwen_max_pixels is not None and args.qwen_max_pixels <= 0:
@@ -545,6 +569,8 @@ def main() -> None:
         and args.eagle_max_pixels < args.eagle_min_pixels
     ):
         raise ValueError("--eagle_max_pixels must be >= --eagle_min_pixels.")
+    if args.eagle_image_token_limit is not None and args.eagle_image_token_limit <= 0:
+        raise ValueError("--locate_image_token_limit/--eagle_image_token_limit must be positive when set.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = resolve_checkpoint(args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -575,7 +601,7 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
     loader = DataLoader(dataset, **loader_kwargs)
-    model, qwen_processor = load_eval_model(args, checkpoint, device)
+    model, backbone_processor = load_eval_model(args, checkpoint, device)
     weights = LossWeights(
         oks=args.w_oks,
         coord=args.w_coord,
@@ -626,7 +652,7 @@ def main() -> None:
                 if args.box_source == "qwen_generate":
                     target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
                         model,
-                        qwen_processor,
+                        backbone_processor,
                         batch,
                         device,
                         max_instances=args.max_instances,
@@ -637,6 +663,21 @@ def main() -> None:
                         max_pixels=args.qwen_max_pixels,
                         keep_unmatched_predictions=True,
                     )
+                elif args.box_source == "locate_generate":
+                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning(
+                        model,
+                        backbone_processor,
+                        batch,
+                        device,
+                        max_instances=args.max_instances,
+                        max_new_tokens=args.locate_box_max_new_tokens,
+                        generation_mode=args.locate_generation_mode,
+                        match_iou_thresh=args.box_match_iou_thresh,
+                        nms_iou_thresh=args.box_nms_iou_thresh,
+                        min_pixels=args.eagle_min_pixels,
+                        max_pixels=args.eagle_max_pixels,
+                        image_token_limit=args.eagle_image_token_limit,
+                    )
                 else:
                     target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
                         batch["targets"],
@@ -645,20 +686,21 @@ def main() -> None:
                         max_instances=args.max_instances,
                     )
                 backbone_name = getattr(args, "backbone", "qwen3vl")
-                if qwen_processor is None:
+                if backbone_processor is None:
                     qwen_inputs = None
                 elif backbone_name == "eagle":
                     qwen_inputs = build_eagle_inputs(
-                        qwen_processor,
+                        backbone_processor,
                         batch["image_paths"],
                         batch["prompts"],
                         device,
                         min_pixels=args.eagle_min_pixels,
                         max_pixels=args.eagle_max_pixels,
+                        image_token_limit=args.eagle_image_token_limit,
                     )
                 else:
                     qwen_inputs = build_qwen_inputs(
-                        qwen_processor,
+                        backbone_processor,
                         batch["image_paths"],
                         batch["prompts"],
                         device,
@@ -790,6 +832,8 @@ def main() -> None:
     # ── Summary ────────────────────────────────────────────────────────────
     summary = {
         "checkpoint": str(checkpoint_path),
+        "backbone": args.backbone,
+        "box_source": args.box_source,
         "datasets": dataset_names,
         "split": args.split,
         "samples": samples,
@@ -806,9 +850,11 @@ def main() -> None:
 
     # ── Report ─────────────────────────────────────────────────────────────
     report = [
-        "# QwenPose Eval Report",
+        "# Pose Eval Report",
         "",
         f"- checkpoint: `{checkpoint_path}`",
+        f"- backbone: `{args.backbone}`",
+        f"- box_source: `{args.box_source}`",
         f"- datasets: `{','.join(dataset_names)}`",
         f"- split: `{args.split}`",
         f"- samples: `{samples}`",

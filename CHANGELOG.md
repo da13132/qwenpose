@@ -2,6 +2,14 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v1.0 - 2026-06-26
+
+- Promoted the LocatePose workflow to a first-class public entrypoint with `scripts/locatepose.sh` and `scripts/eval_locatepose.sh`, placing the LocateAnything-based recipe alongside the maintained Qwen3-VL recipe in the published snapshot.
+- Published the LocatePose backend updates across data loading, LocateAnything LoRA loading, generated-box closed-loop training, and evaluation so the public code can train and validate `locate_generate` end to end.
+- Kept `scripts/train_qwenpose_two_stage.sh` as the maintained QwenPose training entrypoint, synchronized its documentation with the current two-stage defaults, and removed stale one-stage/three-stage references from the public release narrative.
+- Rewrote the English and Chinese READMEs for public reproducibility, including shared environment setup, dataset directory layouts, model download locations, DeepSpeed preset guidance, and separate LocatePose/QwenPose usage sections.
+- Bumped the repository snapshot version to `v1.0` through `VERSION`, `qwenpose.__version__`, dependency headers, and the Git tag convention used for public releases.
+
 ## v0.3.1 - 2026-06-25
 
 - Removed `scripts/train_qwenpose_three_stage.sh` from the public repository after reverting the maintained workflow back to the two-stage closed-loop recipe.

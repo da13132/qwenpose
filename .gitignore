@@ -27,8 +27,6 @@ src/bin/
 # Non-public helper scripts excluded from this snapshot
 scripts/train_eagle_pose.sh
 scripts/eval_eagle_pose.sh
-scripts/locatepose.sh
-scripts/eval_locatepose.sh
 
 # Python caches
 __pycache__/

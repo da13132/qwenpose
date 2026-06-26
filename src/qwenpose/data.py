@@ -197,6 +197,7 @@ class PoseRecordDataset(Dataset):
                 "height": record.height,
             },
             "prompt": text,
+            "ref_text": record.ref_text,
         }
 
 
@@ -334,6 +335,7 @@ def pose_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "task_ids": torch.stack([item["task_id"] for item in batch], dim=0),
         "targets": [item["target"] for item in batch],
         "prompts": [item["prompt"] for item in batch],
+        "ref_texts": [item.get("ref_text", "") for item in batch],
         "image_paths": [item["image_path"] for item in batch],
         "source_datasets": [item.get("source_dataset", item["target"].get("dataset", "")) for item in batch],
     }

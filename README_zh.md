@@ -1,22 +1,24 @@
 # QwenPose 中文说明
 
-版本：`v0.3.1`
+版本：`v1.0`
 
 [English](README.md) | 中文
 
-QwenPose 是一个基于 Qwen3-VL 的 box-conditioned 人体姿态估计公开训练快照。这个仓库发布的是当前分支里的 Qwen3-VL 两阶段闭环训练主线：
+这是一个面向公开复现的 box-conditioned 人体姿态估计训练快照。当前仓库维护两条基于同一套 PoseHead、数据管线和验证代码的主线：
 
-- `stage1_freeze_qwen`：冻结 Qwen 主体，使用 GT box 先把 pose 模块 warm up 起来
-- `stage2_qwen_box_closed_loop`：由 Qwen 生成 bbox JSON，解析框后再喂给 PoseHead，用匹配到的 GT keypoints 做闭环监督
+- `LocatePose`：基于 `LocateAnything-3B` 的两阶段闭环训练方案
+- `QwenPose`：基于 `Qwen3-VL-4B-Instruct` 的两阶段闭环训练方案
 
-这次公开发布只覆盖 Qwen3-VL 工作流，不把 Eagle 相关 shell 入口作为公开主线的一部分。
+下面的文档顺序也与此保持一致：先讲共享环境和数据，再讲 `LocatePose`，最后讲 `QwenPose`。
 
-## 仓库内容
+## 仓库公开内容
 
-- `scripts/train_qwenpose_two_stage.sh`：两阶段闭环训练主入口
-- `scripts/eval_qwenpose.sh`：验证入口
-- `scripts/zero2.json`、`scripts/zero3.json`、`scripts/zero3_offload.json`：DeepSpeed 预设
-- `src/qwenpose/`：数据加载、模型、训练、验证、checkpoint、LoRA 合并等核心代码
+- `scripts/locatepose.sh`：LocatePose 两阶段训练主入口
+- `scripts/eval_locatepose.sh`：LocatePose 验证入口
+- `scripts/train_qwenpose_two_stage.sh`：QwenPose 两阶段训练主入口
+- `scripts/eval_qwenpose.sh`：QwenPose 验证入口
+- `scripts/zero2.json`、`scripts/zero3.json`、`scripts/zero3_offload.json`：两条主线共用的 DeepSpeed 预设
+- `src/qwenpose/`：数据集加载、模型、训练、验证、checkpoint、backbone 适配等核心实现
 
 ## 仓库结构
 
@@ -29,30 +31,42 @@ qwenpose/
 ├── requirements.txt
 ├── requirements-cu126.txt
 ├── scripts/
+│   ├── eval_locatepose.sh
 │   ├── eval_qwenpose.sh
+│   ├── locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
 │   └── zero3_offload.json
 └── src/
     └── qwenpose/
+        ├── data.py
+        ├── eagle_lora.py
+        ├── eval_pose.py
+        ├── losses.py
+        ├── merge_full_weights.py
+        ├── model.py
+        ├── qwen_lora.py
+        ├── schemas.py
+        └── train_pose.py
 ```
 
-运行时建议在仓库根目录旁准备以下目录：
+## 运行时目录约定
+
+脚本默认假设仓库根目录旁边还有这些目录。它们既可以是真实目录，也可以是符号链接。
 
 ```text
 qwenpose/
 ├── datasets/
 ├── outputs/
 └── weights/
+    ├── LocateAnything-3B/
     └── Qwen3-VL-4B-Instruct/
 ```
 
-这些路径既可以是真实目录，也可以是符号链接。
+## 已验证环境
 
-## 复现实验环境
-
-当前版本在以下软件栈上验证通过：
+这个 `v1.0` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -64,9 +78,11 @@ qwenpose/
 - DeepSpeed `0.17.1`
 - Accelerate `1.7.0`
 - PEFT `0.17.1`
+- Hugging Face Hub `0.36.2`
 - NumPy `2.2.6`
 - Pillow `12.2.0`
 - pycocotools `2.0.11`
+- safetensors `0.7.0`
 - SciPy `1.17.1`
 - sentencepiece `0.2.1`
 - tokenizers `0.22.2`
@@ -74,7 +90,7 @@ qwenpose/
 
 依赖文件说明：
 
-- `requirements.txt`：公开 Qwen3-VL 工作流的运行时依赖版本
+- `requirements.txt`：适合自定义 CUDA 环境时使用的运行时依赖版本
 - `requirements-cu126.txt`：Linux + Python 3.11 + CUDA 12.6 的精确验证版本
 
 ## 环境安装
@@ -90,7 +106,7 @@ pip install -r requirements-cu126.txt
 
 ### 方案 B：按自己的 CUDA 环境安装
 
-如果你的机器不是 CUDA 12.6，可以先安装匹配自己环境的 PyTorch，再安装仓库依赖。下面给的是已验证的 CUDA 12.6 示例；如果使用别的 CUDA 版本，请把对应的 index URL 替换掉：
+先安装和自己机器匹配的 PyTorch，再安装仓库依赖：
 
 ```bash
 python -m venv envs/qwenpose
@@ -101,49 +117,77 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
 pip install -r requirements.txt
 ```
 
-如果当前平台无法使用 `flash-attn`，可以先安装其余依赖，并在运行时使用：
+如果当前平台无法使用 `flash-attn`，可以先安装其余依赖，再在运行时切换 attention 后端：
 
 ```bash
+LOCATE_ATTN_IMPLEMENTATION=sdpa
 QWEN_ATTN_IMPLEMENTATION=sdpa
 ```
 
-脚本会优先使用本地 `envs/qwenpose/bin/python` 和 `envs/qwenpose/bin/torchrun`。如果这两个路径不存在，就回退到当前环境里的 `python` 和 `torchrun`。
+所有 shell 入口会优先使用本地 `envs/qwenpose/bin/python` 和 `envs/qwenpose/bin/torchrun`。
 
 ## 基座模型下载
 
-默认基座模型路径为：
+### LocatePose 基座模型
+
+默认路径：
+
+```text
+weights/LocateAnything-3B
+```
+
+官方来源：
+
+- Hugging Face 模型页：<https://huggingface.co/nvidia/LocateAnything-3B>
+- NVIDIA Eagle 项目仓库：<https://github.com/NVlabs/Eagle>
+
+下载示例：
+
+```bash
+huggingface-cli download nvidia/LocateAnything-3B \
+  --local-dir weights/LocateAnything-3B
+```
+
+### QwenPose 基座模型
+
+默认路径：
 
 ```text
 weights/Qwen3-VL-4B-Instruct
 ```
 
-官方模型地址：
+官方来源：
 
-- Hugging Face：<https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct>
+- Hugging Face 模型页：<https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct>
 - ModelScope：<https://modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct>
 
-使用 Hugging Face CLI 的下载示例：
+下载示例：
 
 ```bash
 huggingface-cli download Qwen/Qwen3-VL-4B-Instruct \
   --local-dir weights/Qwen3-VL-4B-Instruct
 ```
 
-训练代码通过标准 `transformers` 包加载 Qwen3-VL。模型目录中应包含常规 Hugging Face 文件，例如 `config.json`、processor 或 tokenizer 文件，以及模型权重分片。
+下载完成后，模型目录中应包含常规 Hugging Face 文件，例如 `config.json`、processor 或 tokenizer 文件，以及模型权重分片。
 
 ## 数据集准备
 
-默认数据根目录为：
+共享数据根目录为：
 
 ```text
 datasets/
 ```
 
-当前公开版本支持 `coco`、`aic`、`mpii`、`crowdpose`、`refhuman`。
+当前公开代码支持 `coco`、`aic`、`mpii`、`crowdpose`、`refhuman`。
+
+当前默认配方说明：
+
+- `LocatePose` 的 stage 1 默认只用 `coco`
+- `LocatePose` 的 stage 2 默认使用 `coco,mpii,crowdpose,refhuman`
+- `QwenPose` 的 stage 1 和 stage 2 默认都使用 `coco`
+- `AIC` 已在代码中支持，但不在当前公开默认训练配方中启用
 
 ### COCO
-
-所需结构：
 
 ```text
 datasets/coco/
@@ -161,7 +205,7 @@ datasets/coco/
 
 ### AIC
 
-代码当前兼容两种常见本地目录布局。
+代码兼容以下两种本地目录布局。
 
 布局 A：
 
@@ -184,12 +228,10 @@ datasets/aic/
 
 说明：
 
-- 公开代码会自动识别上述两种布局
-- 当前 AIC 本地树只包含训练集，因此在请求 `val` 时会自动回退到训练标注
+- 公开代码会自动识别以上两种布局
+- 如果本地请求验证 split，当前 loader 会回退到已有的训练标注
 
 ### MPII
-
-所需结构：
 
 ```text
 datasets/mpii/
@@ -204,11 +246,9 @@ datasets/mpii/
 
 - 训练默认使用 `mpii_train.json`
 - 验证默认使用 `mpii_val.json`
-- 如果需要合并训练集，也可以手动使用 `mpii_trainval.json`
+- `mpii_trainval.json` 可用于自定义训练配置
 
 ### CrowdPose
-
-所需结构：
 
 ```text
 datasets/crowdpose/
@@ -220,13 +260,10 @@ datasets/crowdpose/
 
 说明：
 
-- 图片目录固定读取 `annotations/images/`
-- 训练使用 `mmpose_crowdpose_train.json`
-- 验证使用 `mmpose_crowdpose_val.json`
+- 当前 loader 期望图像位于 `datasets/crowdpose/annotations/images/`
+- 标注文件名为 `mmpose_crowdpose_train.json` 和 `mmpose_crowdpose_val.json`
 
 ### RefHuman
-
-所需结构：
 
 ```text
 datasets/refhuman/
@@ -237,155 +274,247 @@ datasets/refhuman/
 
 说明：
 
-- RefHuman 提供的是带文本描述的 `REF_POSE` 样本
-- 当前公开默认配方不会自动启用 RefHuman，需要时请手动加入
-- `REFHUMAN_MAX_CAPTIONS_PER_INSTANCE` 用于控制每个实例最多保留多少条 caption
+- RefHuman 会以 referring-person pose 任务方式加载
+- JSON 中需要包含图像信息、bbox、keypoints 以及对应的人物文本描述
 
-示例：
+## DeepSpeed 预设
+
+仓库内包含三份共用 DeepSpeed 配置：
+
+- `scripts/zero2.json`：大多数训练任务的默认推荐
+- `scripts/zero3.json`：显存更紧张时可使用纯 ZeRO-3
+- `scripts/zero3_offload.json`：显存非常紧张时可使用 CPU offload，但速度会更慢
+
+训练脚本通过 `ZERO_STAGE` 选择这些预设：
 
 ```bash
-STAGE2_TRAIN_DATASETS=coco,refhuman \
-STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE=1 \
-scripts/train_qwenpose_two_stage.sh
+ZERO_STAGE=zero2 bash scripts/locatepose.sh
+ZERO_STAGE=zero3 bash scripts/train_qwenpose_two_stage.sh
+ZERO_STAGE=zero3_offload bash scripts/locatepose.sh
+ZERO_STAGE=none bash scripts/train_qwenpose_two_stage.sh
 ```
 
-## 默认训练配方
+对于 `locate_generate` 和 `qwen_generate` 这两种闭环 stage 2 训练路径，当前公开脚本推荐使用 `ZERO_STAGE=zero2` 或 `ZERO_STAGE=none`。
 
-当前公开主入口是：
+## LocatePose
+
+LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHead 上执行两阶段训练。
+
+### LocatePose 默认两阶段设置
+
+| 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
+|------|--------|----------------|------------|------------|------------|
+| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 LocateAnything | `gt` | `coco` | `30` |
+| stage 2 | `stage2_locate_box_closed_loop` | 解冻 Locate LoRA、vision LoRA、projector | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `12` |
+
+其他关键默认值：
+
+- `STAGE1_BATCH_SIZE=16`
+- `STAGE2_BATCH_SIZE=1`
+- `STAGE1_GRAD_ACCUM_STEPS=1`
+- `STAGE2_GRAD_ACCUM_STEPS=8`
+- `STAGE1_LR=2e-4`
+- `STAGE2_LR=5e-5`
+- `LOCATE_IMAGE_TOKEN_LIMIT=4096`
+- `LOCATE_GENERATION_MODE=hybrid`
+- `LOCATE_BOX_MAX_NEW_TOKENS=8192`
+- `STAGE2_W_LOCATE_BOX_LM=0.04`
+- `STAGE2_W_LOCATE_POINT_LM=0.01`
+- `STAGE2_DATASET_MIX_WEIGHTS=coco:2,mpii:1,crowdpose:2,refhuman:1`
+
+### 训练 LocatePose
+
+直接启动新训练：
 
 ```bash
-scripts/train_qwenpose_two_stage.sh
+bash scripts/locatepose.sh
 ```
 
-默认阶段设置：
-
-- Stage 1 输出目录：`stage1_freeze_qwen`
-- Stage 2 输出目录：`stage2_qwen_box_closed_loop`
-- 总输出根目录：`outputs/qwenpose_two_stage_qwen`
-- 当 `MERGE_FINAL_WEIGHTS=1` 时自动导出的发布权重：`weights/<run_name>-merged-<timestamp>`
-- Stage 1 数据集：`coco`
-- Stage 2 数据集：`coco`
-- Stage 1 batch size：每张 GPU `4`
-- Stage 2 batch size：每张 GPU `1`
-- Stage 1 epoch：`5`
-- Stage 2 epoch：`12`
-- Stage 1 条件框来源：`gt`
-- Stage 2 条件框来源：`qwen_generate`
-- 默认 ZeRO 方案：`zero2`
-
-DeepSpeed 预设选择：
-
-- `ZERO_STAGE=zero2`：使用 `scripts/zero2.json`，是标准多卡训练的默认推荐方案
-- `ZERO_STAGE=zero3`：使用 `scripts/zero3.json`，进一步节省显存，但运行开销更高
-- `ZERO_STAGE=zero3_offload`：使用 `scripts/zero3_offload.json`，显存占用最低，但通常也是最慢的方案
-- `ZERO_STAGE=none`：禁用 DeepSpeed，主要用于 CPU 或单进程调试
-
-Stage 2 闭环说明：
-
-- `STAGE2_BOX_SOURCE=qwen_generate` 会在训练中调用 `model.generate`，当前仅支持 `ZERO_STAGE=zero2` 或 `ZERO_STAGE=none`
-
-如果希望在 stage 1 中加入 AIC，可以显式传入：
+8 卡训练示例：
 
 ```bash
-STAGE1_TRAIN_DATASETS=coco,aic,mpii,crowdpose
-```
-
-## 快速开始
-
-### 1. 先做数据 dry run
-
-只检查数据解析和一个 batch 的构造，不真正进入训练：
-
-```bash
-PYTHON=python \
-ZERO_STAGE=none \
-DEVICE=cpu \
-DRY_RUN_DATA=1 \
-MAX_SAMPLES_PER_DATASET=2 \
-scripts/train_qwenpose_two_stage.sh
-```
-
-### 2. 启动两阶段训练
-
-一个最小多卡示例：
-
-```bash
-PYTHON=python \
-TORCHRUN=torchrun \
+RUN_NAME=locatepose_v1 \
+NPROC_PER_NODE=8 \
 ZERO_STAGE=zero2 \
-CUDA_VISIBLE_DEVICES=0,1 \
-NPROC_PER_NODE=2 \
-QWEN_MODEL_PATH=weights/Qwen3-VL-4B-Instruct \
-DATASET_ROOT=datasets \
-scripts/train_qwenpose_two_stage.sh
+bash scripts/locatepose.sh
 ```
 
-### 3. 断点续训
-
-对已有 run 目录继续训练：
+只做数据链路快速检查：
 
 ```bash
-scripts/train_qwenpose_two_stage.sh \
-  --resume outputs/qwenpose_two_stage_qwen/<run_name>
+DRY_RUN_DATA=1 ZERO_STAGE=none NPROC_PER_NODE=1 bash scripts/locatepose.sh
 ```
 
-脚本会按阶段自动解析续训路径：如果 stage 2 已经有闭环 checkpoint，就优先续训 stage 2；否则会尽量用 stage 1 初始化 stage 2。
-
-### 4. 执行验证
+从已有 run、stage 目录、checkpoint 目录或 checkpoint 文件继续：
 
 ```bash
-PYTHON=python \
-TRAIN_OUTPUT_DIR=outputs/qwenpose_two_stage_qwen/<run_name> \
-scripts/eval_qwenpose.sh
+bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 ```
 
-当传入完整两阶段 run 目录时，验证脚本会优先选择：
+### LocatePose 常用变量
+
+- `LOCATE_MODEL_PATH`：LocateAnything-3B 本地权重路径
+- `DATASET_ROOT`：数据根目录，默认 `datasets`
+- `OUTPUT_ROOT`：训练输出根目录，默认 `outputs/locatepose`
+- `ZERO_STAGE`：`zero2`、`zero3`、`zero3_offload` 或 `none`
+- `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表
+- `STAGE1_DATASET_MIX_WEIGHTS`、`STAGE2_DATASET_MIX_WEIGHTS`：多数据集采样权重
+- `LOCATE_IMAGE_TOKEN_LIMIT`：每张图的 raw MoonViT token 上限
+- `LOCATE_GENERATION_MODE`：LocateAnything 生成模式，可选 `fast`、`slow`、`hybrid`
+- `BOX_MATCH_IOU_THRESH`、`BOX_NMS_IOU_THRESH`：生成框匹配与 NMS 阈值
+- `MERGE_FINAL_WEIGHTS`：当前公开 LocatePose 脚本不会导出完整 merged LocateAnything 权重
+
+### 验证 LocatePose
+
+验证最近一次 LocatePose 训练：
+
+```bash
+bash scripts/eval_locatepose.sh
+```
+
+验证指定 checkpoint 或 stage 目录：
+
+```bash
+CHECKPOINT=outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+bash scripts/eval_locatepose.sh
+```
+
+在多数据集上验证：
+
+```bash
+DATASETS=coco,mpii,crowdpose,refhuman bash scripts/eval_locatepose.sh
+```
+
+查看 GT box 条件下的上限结果：
+
+```bash
+BOX_SOURCE=gt bash scripts/eval_locatepose.sh
+```
+
+验证结果默认输出到：
 
 ```text
-<run>/stage2_qwen_box_closed_loop
-<run>/stage1_freeze_qwen
+outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/
 ```
 
-验证默认走闭环路径，也就是 `BOX_SOURCE=qwen_generate`。如果想看 GT box 条件下的上限，可以这样运行：
+目录中包含 `summary.json`、`predictions.jsonl`、`predictions.json`、`report.md`，以及可选的可视化结果。
+
+## QwenPose
+
+QwenPose 以 `Qwen3-VL-4B-Instruct` 作为 backbone，在同一个共享 PoseHead 上执行两阶段训练。
+
+### QwenPose 默认两阶段设置
+
+| 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
+|------|--------|----------------|------------|------------|------------|
+| stage 1 | `stage1_freeze_qwen` | 冻结 Qwen | `gt` | `coco` | `30` |
+| stage 2 | `stage2_qwen_box_closed_loop` | 解冻 Qwen LoRA 和 vision LoRA | `qwen_generate` | `coco` | `12` |
+
+其他关键默认值：
+
+- `STAGE1_BATCH_SIZE=4`
+- `STAGE2_BATCH_SIZE=1`
+- `STAGE1_GRAD_ACCUM_STEPS=2`
+- `STAGE2_GRAD_ACCUM_STEPS=8`
+- `QWEN_FEATURE_SIZE=64`
+- `QWEN_FEATURE_REFINER_LAYERS=1`
+- `QWEN_BOX_MAX_NEW_TOKENS=4096`
+- `BOX_MATCH_IOU_THRESH=0.10`
+- `BOX_NMS_IOU_THRESH=0.70`
+
+### 训练 QwenPose
+
+直接启动新训练：
 
 ```bash
-BOX_SOURCE=gt \
-TRAIN_OUTPUT_DIR=outputs/qwenpose_two_stage_qwen/<run_name> \
-scripts/eval_qwenpose.sh
+bash scripts/train_qwenpose_two_stage.sh
 ```
 
-## 输出目录
+8 卡训练示例：
 
-一次典型训练的目录结构如下：
+```bash
+RUN_NAME=qwenpose_v1 \
+NPROC_PER_NODE=8 \
+ZERO_STAGE=zero2 \
+bash scripts/train_qwenpose_two_stage.sh
+```
+
+只做数据链路快速检查：
+
+```bash
+DRY_RUN_DATA=1 ZERO_STAGE=none NPROC_PER_NODE=1 bash scripts/train_qwenpose_two_stage.sh
+```
+
+从已有 run、stage 目录、checkpoint 目录或 checkpoint 文件继续：
+
+```bash
+bash scripts/train_qwenpose_two_stage.sh --resume outputs/qwenpose_two_stage_qwen/<run_name>
+```
+
+### QwenPose 常用变量
+
+- `QWEN_MODEL_PATH`：Qwen3-VL-4B-Instruct 本地权重路径
+- `DATASET_ROOT`：数据根目录，默认 `datasets`
+- `OUTPUT_ROOT`：训练输出根目录，默认 `outputs/qwenpose_two_stage_qwen`
+- `ZERO_STAGE`：`zero2`、`zero3`、`zero3_offload` 或 `none`
+- `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表
+- `QWEN_MIN_PIXELS`、`QWEN_MAX_PIXELS`：Qwen processor 的可选像素预算限制
+- `QWEN_BOX_MAX_NEW_TOKENS`：Qwen 生成 bbox JSON 的最大新 token 数
+- `BOX_MATCH_IOU_THRESH`、`BOX_NMS_IOU_THRESH`：生成框匹配与 NMS 阈值
+- `MERGE_FINAL_WEIGHTS`：启用后可在训练结束时导出 merged Qwen 权重
+
+### 验证 QwenPose
+
+验证最近一次 QwenPose 训练：
+
+```bash
+bash scripts/eval_qwenpose.sh
+```
+
+验证指定 stage 目录：
+
+```bash
+CHECKPOINT=outputs/qwenpose_two_stage_qwen/<run_name>/stage2_qwen_box_closed_loop \
+bash scripts/eval_qwenpose.sh
+```
+
+查看 GT box 条件下的上限结果：
+
+```bash
+BOX_SOURCE=gt bash scripts/eval_qwenpose.sh
+```
+
+`scripts/eval_qwenpose.sh` 默认会验证 `coco,mpii,crowdpose,refhuman`，如有需要可以通过 `EVAL_DATASETS` 覆盖。
+
+## 输出目录结构
+
+典型 LocatePose 训练目录：
+
+```text
+outputs/locatepose/<run_name>/
+├── logs/
+├── stage1_freeze_locate_gt_box/
+└── stage2_locate_box_closed_loop/
+```
+
+典型 QwenPose 训练目录：
 
 ```text
 outputs/qwenpose_two_stage_qwen/<run_name>/
 ├── logs/
 ├── stage1_freeze_qwen/
-├── stage2_init_weights/
-├── stage2_qwen_box_closed_loop/
-└── eval_pose_<timestamp>/
+└── stage2_qwen_box_closed_loop/
 ```
 
-验证输出包括：
-
-- `summary.json`
-- `predictions.jsonl`
-- `report.md`
-
-如果 `MERGE_FINAL_WEIGHTS=1`，训练脚本还会在 `weights/` 下自动导出合并后的可部署权重。
+每个 stage 目录下可能包含 `checkpoint-*`、`checkpoint_step_*.pt`、`qwenpose_checkpoint.pt`、可视化结果和阶段日志，具体取决于当前配置。
 
 ## 版本管理
 
-这个仓库现在使用显式版本号管理：
+这个仓库通过以下位置记录公开快照版本：
 
-- 当前版本：`VERSION`
-- 版本历史：`CHANGELOG.md`
-- Python 包版本：`qwenpose.__version__`
-- 推荐 git tag 格式：`vX.Y.Z`
+- `VERSION`：仓库版本号
+- `CHANGELOG.md`：按时间倒序记录版本变更
+- `qwenpose.__version__`：Python 包版本
+- Git tag，例如 `v1.0`
 
-后续每次发布新版本时，建议同步更新 `VERSION`、把新的版本记录追加到 `CHANGELOG.md` 顶部，并推送对应的 git tag，这样 GitHub 上最新版本会更清晰。
-
-## 正式入口
-
-公开仓库维护的正式训练入口是 `scripts/train_qwenpose_two_stage.sh`。
+每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

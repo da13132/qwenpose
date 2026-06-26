@@ -51,6 +51,7 @@ from qwenpose.eagle_lora import (
     EagleLoRAConfig,
     build_eagle_inputs,
     count_eagle_lora_parameters,
+    get_eagle_base_model,
     load_eagle_with_lora,
     eagle_hidden_size,
 )
@@ -149,24 +150,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen_vision_lora_alpha", type=int, default=32)
     parser.add_argument("--qwen_vision_lora_dropout", type=float, default=0.05)
     parser.add_argument("--freeze_qwen", action="store_true")
-    # Eagle/Embodied (LocateAnything-3B) backbone options
-    parser.add_argument("--eagle_model_path", type=str, default="weights/LocateAnything-3B")
-    parser.add_argument("--eagle_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
-    parser.add_argument("--eagle_attn_implementation", type=str, default="sdpa")
-    parser.add_argument("--eagle_gradient_checkpointing", action="store_true")
-    parser.add_argument("--eagle_min_pixels", type=int, default=None)
-    parser.add_argument("--eagle_max_pixels", type=int, default=None)
-    parser.add_argument("--eagle_feature_size", type=int, default=32)
-    parser.add_argument("--eagle_feature_refiner_layers", type=int, default=0)
-    parser.add_argument("--eagle_feature_refiner_bottleneck_dim", type=int, default=256)
-    parser.add_argument("--eagle_feature_refiner_init_scale", type=float, default=0.1)
-    parser.add_argument("--eagle_lora_r", type=int, default=32)
-    parser.add_argument("--eagle_lora_alpha", type=int, default=64)
-    parser.add_argument("--eagle_lora_dropout", type=float, default=0.05)
-    parser.add_argument("--eagle_vision_lora_r", type=int, default=16)
-    parser.add_argument("--eagle_vision_lora_alpha", type=int, default=32)
-    parser.add_argument("--eagle_vision_lora_dropout", type=float, default=0.05)
-    parser.add_argument("--freeze_eagle", action="store_true")
+    # LocatePose / LocateAnything-3B backbone options. The --eagle_* names are
+    # kept as legacy aliases; scripts should prefer the --locate_* names.
+    parser.add_argument("--locate_model_path", "--eagle_model_path", dest="eagle_model_path", type=str, default="weights/LocateAnything-3B")
+    parser.add_argument(
+        "--locate_dtype",
+        "--eagle_dtype",
+        dest="eagle_dtype",
+        choices=["bfloat16", "float16", "float32", "auto", "none"],
+        default="bfloat16",
+    )
+    parser.add_argument("--locate_attn_implementation", "--eagle_attn_implementation", dest="eagle_attn_implementation", type=str, default="flash_attention_2")
+    parser.add_argument("--locate_gradient_checkpointing", "--eagle_gradient_checkpointing", dest="eagle_gradient_checkpointing", action="store_true")
+    parser.add_argument("--locate_min_pixels", "--eagle_min_pixels", dest="eagle_min_pixels", type=int, default=None)
+    parser.add_argument("--locate_max_pixels", "--eagle_max_pixels", dest="eagle_max_pixels", type=int, default=None)
+    parser.add_argument(
+        "--locate_image_token_limit",
+        "--eagle_image_token_limit",
+        dest="eagle_image_token_limit",
+        type=int,
+        default=None,
+        help="LocateAnything raw MoonViT patch-token limit per image. Overrides --locate_max_pixels when set.",
+    )
+    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=32)
+    parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
+    parser.add_argument("--locate_feature_refiner_bottleneck_dim", "--eagle_feature_refiner_bottleneck_dim", dest="eagle_feature_refiner_bottleneck_dim", type=int, default=256)
+    parser.add_argument("--locate_feature_refiner_init_scale", "--eagle_feature_refiner_init_scale", dest="eagle_feature_refiner_init_scale", type=float, default=0.1)
+    parser.add_argument("--locate_lora_r", "--eagle_lora_r", dest="eagle_lora_r", type=int, default=32)
+    parser.add_argument("--locate_lora_alpha", "--eagle_lora_alpha", dest="eagle_lora_alpha", type=int, default=64)
+    parser.add_argument("--locate_lora_dropout", "--eagle_lora_dropout", dest="eagle_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--locate_vision_lora_r", "--eagle_vision_lora_r", dest="eagle_vision_lora_r", type=int, default=16)
+    parser.add_argument("--locate_vision_lora_alpha", "--eagle_vision_lora_alpha", dest="eagle_vision_lora_alpha", type=int, default=32)
+    parser.add_argument("--locate_vision_lora_dropout", "--eagle_vision_lora_dropout", dest="eagle_vision_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--freeze_locate", "--freeze_eagle", dest="freeze_eagle", action="store_true")
     parser.add_argument("--pose_decoder_layers", type=int, default=1)
     parser.add_argument("--refinement_steps", type=int, default=3)
     parser.add_argument("--decoder_heads", type=int, default=8)
@@ -192,6 +208,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen_vision_lr_scale", type=float, default=0.01)
     parser.add_argument("--locate_lr_scale", type=float, default=0.05)
     parser.add_argument("--locate_vision_scale", type=float, default=0.02)
+    parser.add_argument("--locate_projector_scale", type=float, default=0.05)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -232,11 +249,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box_jitter_shift", type=float, default=0.0)
     parser.add_argument(
         "--box_source",
-        choices=["gt", "qwen_generate"],
+        choices=["gt", "qwen_generate", "locate_generate"],
         default="gt",
-        help="Box conditions for PoseHead: GT/teacher-forced boxes or boxes generated by Qwen.",
+        help="Box conditions for PoseHead: GT boxes, boxes generated by Qwen, or boxes generated by LocateAnything.",
     )
     parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
+    parser.add_argument("--locate_box_max_new_tokens", type=int, default=8192)
+    parser.add_argument("--locate_generation_mode", choices=["fast", "slow", "hybrid"], default="hybrid")
     parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
     parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
     parser.add_argument("--w_locate_box_lm", type=float, default=0.0)
@@ -968,6 +987,213 @@ def prepare_qwen_generated_box_conditioning(
                 selected_condition_boxes.append(pred_boxes[:max_instances].clone())
             else:
                 selected_condition_boxes.append(gt_boxes_all[:0].clone())
+            selected["boxes"] = gt_boxes_all[:0].clone()
+            selected["keypoints"] = target["keypoints"][:0].clone()
+            selected["keypoint_valid"] = target["keypoint_valid"][:0].clone()
+            selected["ref_target"] = torch.tensor(-1, dtype=torch.long)
+        selected_targets.append(selected)
+
+    max_boxes = max([int(boxes.shape[0]) for boxes in selected_condition_boxes] + [1])
+    box_tensor = torch.zeros(len(selected_condition_boxes), max_boxes, 4, dtype=torch.float32, device=device)
+    box_mask = torch.zeros(len(selected_condition_boxes), max_boxes, dtype=torch.bool, device=device)
+    for sample_idx, boxes in enumerate(selected_condition_boxes):
+        n = int(boxes.shape[0])
+        if n == 0:
+            continue
+        box_tensor[sample_idx, :n] = boxes.to(device=device, dtype=torch.float32)
+        box_mask[sample_idx, :n] = True
+    return box_tensor, box_mask, selected_targets
+
+
+def _extract_ref_description_from_prompt(prompt: str) -> str:
+    quoted = re.findall(r'"([^"]+)"', str(prompt))
+    if quoted:
+        return quoted[0].strip()
+    marker = "description:"
+    lowered = str(prompt).lower()
+    idx = lowered.find(marker)
+    if idx >= 0:
+        fragment = str(prompt)[idx + len(marker) :].strip()
+        fragment = fragment.split(".", 1)[0].strip()
+        if fragment:
+            return fragment
+    return "person"
+
+
+def build_locate_generation_prompts(batch: dict) -> list[str]:
+    prompts: list[str] = []
+    ref_texts = batch.get("ref_texts") or [""] * len(batch.get("prompts", []))
+    for sample_idx, source_prompt in enumerate(batch.get("prompts", [])):
+        task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+        if task_id == 1:
+            ref_text = str(ref_texts[sample_idx]).strip() if sample_idx < len(ref_texts) else ""
+            if not ref_text:
+                ref_text = _extract_ref_description_from_prompt(str(source_prompt))
+            prompts.append(f'Locate a single person that matches the following description: "{ref_text}".')
+        else:
+            prompts.append("Locate all the instances that match the following description: person.")
+    return prompts
+
+
+def parse_locate_bbox_response(text: str, max_instances: int) -> torch.Tensor:
+    raw_boxes: list[list[float]] = []
+    # LocateAnything normally decodes boxes as
+    #   <box><010><020><900><950></box>
+    # but some tokenizer/version combinations may introduce spaces or bare
+    # comma-separated numbers inside the box block. Parse by block first, then
+    # accept exactly four coordinates; two-coordinate point blocks are ignored.
+    box_block_pattern = re.compile(r"<\s*box\s*>\s*(.*?)\s*<\s*/\s*box\s*>", re.DOTALL)
+    coord_token_pattern = re.compile(r"<\s*([0-9]{1,4})\s*>")
+    bare_number_pattern = re.compile(r"(?<![A-Za-z])[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+    for block_match in box_block_pattern.finditer(str(text)):
+        block = block_match.group(1)
+        token_values = coord_token_pattern.findall(block)
+        values = token_values if len(token_values) == 4 else bare_number_pattern.findall(block)
+        if len(values) != 4:
+            continue
+        raw_boxes.append([float(value) for value in values[:4]])
+        if len(raw_boxes) >= max(int(max_instances), 0):
+            break
+    boxes: list[list[float]] = []
+    for raw_box in raw_boxes:
+        normalized = _normalize_generated_box(raw_box, width=1000.0, height=1000.0)
+        if normalized is not None:
+            boxes.append(normalized)
+    if not boxes:
+        return torch.zeros(0, 4, dtype=torch.float32)
+    return torch.tensor(boxes, dtype=torch.float32).clamp_(0.0, 1.0)
+
+
+def _normalize_locate_generate_output(response: object) -> str:
+    if isinstance(response, tuple) and response:
+        response = response[0]
+    if isinstance(response, list):
+        return str(response[0]).strip() if response else ""
+    return str(response).strip()
+
+
+def generate_locate_bbox_responses(
+    training_model: torch.nn.Module,
+    processor,
+    batch: dict,
+    device: torch.device,
+    *,
+    max_new_tokens: int,
+    generation_mode: str,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    image_token_limit: int | None = None,
+) -> list[str]:
+    module = unwrap_training_model(training_model)
+    if module.backbone_name != "eagle" or module.backbone_model is None:
+        raise ValueError("--box_source=locate_generate currently requires --backbone eagle/locatepose.")
+    if processor is None:
+        raise ValueError("LocateAnything processor is required for --box_source=locate_generate.")
+    locate_model = get_eagle_base_model(module.backbone_model)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = getattr(locate_model, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("LocateAnything tokenizer is required for --box_source=locate_generate.")
+    prompts = build_locate_generation_prompts(batch)
+    was_training = bool(locate_model.training)
+    locate_model.eval()
+    responses: list[str] = []
+    try:
+        with torch.inference_mode():
+            for image_path, prompt in zip(batch["image_paths"], prompts):
+                inputs = build_eagle_inputs(
+                    processor,
+                    [image_path],
+                    [prompt],
+                    device,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                    image_token_limit=image_token_limit,
+                )
+                response = locate_model.generate(
+                    pixel_values=inputs["pixel_values"],
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    image_grid_hws=inputs.get("image_grid_hws"),
+                    tokenizer=tokenizer,
+                    max_new_tokens=max(1, int(max_new_tokens)),
+                    use_cache=True,
+                    generation_mode=str(generation_mode),
+                    do_sample=False,
+                    verbose=False,
+                )
+                responses.append(_normalize_locate_generate_output(response))
+    finally:
+        if was_training:
+            locate_model.train()
+    return responses
+
+
+def prepare_locate_generated_box_conditioning(
+    training_model: torch.nn.Module,
+    processor,
+    batch: dict,
+    device: torch.device,
+    max_instances: int,
+    *,
+    max_new_tokens: int,
+    generation_mode: str,
+    match_iou_thresh: float,
+    nms_iou_thresh: float,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    image_token_limit: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
+    responses = generate_locate_bbox_responses(
+        training_model,
+        processor,
+        batch,
+        device,
+        max_new_tokens=max_new_tokens,
+        generation_mode=generation_mode,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        image_token_limit=image_token_limit,
+    )
+    selected_targets: list[dict[str, torch.Tensor]] = []
+    selected_condition_boxes: list[torch.Tensor] = []
+    for sample_idx, target in enumerate(batch["targets"]):
+        task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+        gt_boxes_all = target["boxes"]
+        num_gt = int(gt_boxes_all.shape[0])
+        if task_id == 1:
+            ref_target = int(target["ref_target"].detach().cpu().item())
+            gt_indices = [ref_target] if 0 <= ref_target < num_gt else []
+        else:
+            gt_indices = list(range(min(num_gt, int(max_instances))))
+        gt_index_tensor = torch.as_tensor(gt_indices, dtype=torch.long)
+        gt_boxes = gt_boxes_all[gt_index_tensor].clone() if gt_indices else gt_boxes_all[:0].clone()
+
+        pred_boxes = parse_locate_bbox_response(
+            responses[sample_idx] if sample_idx < len(responses) else "",
+            max_instances=max_instances,
+        )
+        pred_boxes = nms_boxes_xyxy(pred_boxes, iou_thresh=nms_iou_thresh, max_boxes=max_instances)
+        matches = greedy_match_boxes(pred_boxes, gt_boxes, iou_thresh=match_iou_thresh)
+        pred_match_indices = [pred_idx for pred_idx, _, _ in matches]
+        gt_match_indices = [gt_idx for _, gt_idx, _ in matches]
+        pred_index_tensor = torch.as_tensor(pred_match_indices, dtype=torch.long)
+        matched_gt_index_tensor = torch.as_tensor(gt_match_indices, dtype=torch.long)
+
+        selected = dict(target)
+        if matches:
+            condition_boxes = pred_boxes[pred_index_tensor].clone()
+            matched_gt_boxes = gt_boxes[matched_gt_index_tensor].clone()
+            matched_keypoints = target["keypoints"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            matched_keypoint_valid = target["keypoint_valid"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            selected_condition_boxes.append(condition_boxes[:max_instances].clone())
+            selected["boxes"] = matched_gt_boxes
+            selected["keypoints"] = matched_keypoints
+            selected["keypoint_valid"] = matched_keypoint_valid
+            selected["ref_target"] = torch.tensor(0 if task_id == 1 else -1, dtype=torch.long)
+        else:
+            selected_condition_boxes.append(gt_boxes_all[:0].clone())
             selected["boxes"] = gt_boxes_all[:0].clone()
             selected["keypoints"] = target["keypoints"][:0].clone()
             selected["keypoint_valid"] = target["keypoint_valid"][:0].clone()
@@ -1756,6 +1982,12 @@ def save_checkpoint(
         }
         payload["backbone_feature_config"] = feature_config
         payload["qwen_feature_config"] = feature_config
+        extractor_state = {
+            key: value.detach().cpu()
+            for key, value in module.qwen_extractor.state_dict().items()
+            if not key.startswith(("qwen_model.", "eagle_model."))
+        }
+        payload["backbone_extractor"] = extractor_state
     if module.qwen_extractor is not None and module.qwen_extractor.feature_refiner.num_layers > 0:
         refiner = module.qwen_extractor.feature_refiner
         refiner_state = refiner.state_dict()
@@ -2000,7 +2232,9 @@ def load_training_checkpoint(
     backbone_state = payload.get("backbone_trainable", payload.get("qwen_trainable"))
     if module.qwen_model is not None and backbone_state is not None:
         module.qwen_model.load_state_dict(backbone_state, strict=False)
-    if module.qwen_extractor is not None and ("backbone_feature_refiner" in payload or "qwen_feature_refiner" in payload):
+    if module.qwen_extractor is not None and "backbone_extractor" in payload:
+        module.qwen_extractor.load_state_dict(payload["backbone_extractor"], strict=False)
+    elif module.qwen_extractor is not None and ("backbone_feature_refiner" in payload or "qwen_feature_refiner" in payload):
         module.qwen_extractor.feature_refiner.load_state_dict(payload["backbone_feature_refiner"] if "backbone_feature_refiner" in payload else payload["qwen_feature_refiner"], strict=True)
     optimizer_loaded = False
     if load_optimizer and optimizer is not None and "optimizer" in payload:
@@ -2038,6 +2272,10 @@ def is_vision_parameter(name: str) -> bool:
     return ".visual." in name or ".vision_model." in name or "qwen_model.visual." in name or "backbone_model.vision_model." in name
 
 
+def is_locate_projector_parameter(name: str) -> bool:
+    return ".mlp1." in name or name.startswith("backbone_model.mlp1.") or name.startswith("qwen_model.mlp1.")
+
+
 def build_optimizer_param_groups(
     model: torch.nn.Module,
     args: argparse.Namespace,
@@ -2046,35 +2284,43 @@ def build_optimizer_param_groups(
         "pose": [],
         "backbone_lora": [],
         "backbone_vision_lora": [],
+        "backbone_projector": [],
     }
     stats: dict[str, list[float]] = {
         "pose": [0, 0],
         "backbone_lora": [0, 0],
         "backbone_vision_lora": [0, 0],
+        "backbone_projector": [0, 0],
     }
+    backbone_name = getattr(args, "backbone", "qwen3vl")
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if name.startswith("backbone_model.") or name.startswith("qwen_model."):
-            group_name = "backbone_vision_lora" if is_vision_parameter(name) else "backbone_lora"
+            if backbone_name == "eagle" and is_locate_projector_parameter(name):
+                group_name = "backbone_projector"
+            else:
+                group_name = "backbone_vision_lora" if is_vision_parameter(name) else "backbone_lora"
         else:
             group_name = "pose"
         grouped[group_name].append(param)
         stats[group_name][0] += 1
         stats[group_name][1] += param.numel()
 
-    backbone_name = getattr(args, "backbone", "qwen3vl")
     if backbone_name == "eagle":
         lora_lr_scale = getattr(args, "locate_lr_scale", args.qwen_lora_lr_scale)
         vision_lr_scale = getattr(args, "locate_vision_scale", args.qwen_vision_lr_scale)
+        projector_lr_scale = getattr(args, "locate_projector_scale", lora_lr_scale)
     else:
         lora_lr_scale = args.qwen_lora_lr_scale
         vision_lr_scale = args.qwen_vision_lr_scale
+        projector_lr_scale = lora_lr_scale
 
     lrs = {
         "pose": args.lr,
         "backbone_lora": args.lr * lora_lr_scale,
         "backbone_vision_lora": args.lr * vision_lr_scale,
+        "backbone_projector": args.lr * projector_lr_scale,
     }
     param_groups = [
         {"params": params, "lr": lrs[name]}
@@ -2155,12 +2401,16 @@ def main() -> None:
         raise ValueError("--box_jitter_scale/--box_jitter_shift must be non-negative.")
     if args.qwen_box_max_new_tokens <= 0:
         raise ValueError("--qwen_box_max_new_tokens must be positive.")
+    if args.locate_box_max_new_tokens <= 0:
+        raise ValueError("--locate_box_max_new_tokens must be positive.")
     if not 0.0 <= args.box_match_iou_thresh <= 1.0:
         raise ValueError("--box_match_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
     if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
+    if args.box_source == "locate_generate" and args.backbone != "eagle":
+        raise ValueError("--box_source=locate_generate currently requires --backbone eagle/locatepose.")
     if args.qwen_min_pixels is not None and args.qwen_min_pixels <= 0:
         raise ValueError("--qwen_min_pixels must be positive when set.")
     if args.qwen_max_pixels is not None and args.qwen_max_pixels <= 0:
@@ -2175,6 +2425,8 @@ def main() -> None:
         raise ValueError("--eagle_min_pixels must be positive when set.")
     if args.eagle_max_pixels is not None and args.eagle_max_pixels <= 0:
         raise ValueError("--eagle_max_pixels must be positive when set.")
+    if args.eagle_image_token_limit is not None and args.eagle_image_token_limit <= 0:
+        raise ValueError("--locate_image_token_limit/--eagle_image_token_limit must be positive when set.")
     if (
         args.eagle_min_pixels is not None
         and args.eagle_max_pixels is not None
@@ -2334,6 +2586,11 @@ def main() -> None:
                 gradient_checkpointing=args.eagle_gradient_checkpointing,
             )
         )
+        eagle_base = get_eagle_base_model(backbone_model)
+        projector = getattr(eagle_base, "mlp1", None)
+        if projector is not None:
+            for param in projector.parameters():
+                param.requires_grad = True
         backbone_model.to(device)
         backbone_model.train()
         external_dim = eagle_hidden_size(backbone_model)
@@ -2475,6 +2732,13 @@ def main() -> None:
     if is_main_process():
         print(f"Backbone: {backbone_name}")
         print(f"Feature grid size: {feature_size}x{feature_size}")
+        if backbone_name == "eagle":
+            print(
+                "Locate image budget: "
+                f"min_pixels={args.eagle_min_pixels}, "
+                f"max_pixels={args.eagle_max_pixels}, "
+                f"image_token_limit={args.eagle_image_token_limit}"
+            )
         print(f"Freeze backbone/LoRA: {freeze_backbone}")
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
@@ -2484,6 +2748,14 @@ def main() -> None:
             print(
                 "Qwen generated-box loop: "
                 f"max_new_tokens={args.qwen_box_max_new_tokens}, "
+                f"match_iou_thresh={args.box_match_iou_thresh}, "
+                f"nms_iou_thresh={args.box_nms_iou_thresh}"
+            )
+        if args.box_source == "locate_generate":
+            print(
+                "LocateAnything generated-box loop: "
+                f"generation_mode={args.locate_generation_mode}, "
+                f"max_new_tokens={args.locate_box_max_new_tokens}, "
                 f"match_iou_thresh={args.box_match_iou_thresh}, "
                 f"nms_iou_thresh={args.box_nms_iou_thresh}"
             )
@@ -2741,6 +3013,21 @@ def main() -> None:
                         min_pixels=args.qwen_min_pixels,
                         max_pixels=args.qwen_max_pixels,
                     )
+                elif args.box_source == "locate_generate":
+                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning(
+                        active_model,
+                        backbone_processor,
+                        batch,
+                        device,
+                        max_instances=args.max_instances,
+                        max_new_tokens=args.locate_box_max_new_tokens,
+                        generation_mode=args.locate_generation_mode,
+                        match_iou_thresh=args.box_match_iou_thresh,
+                        nms_iou_thresh=args.box_nms_iou_thresh,
+                        min_pixels=args.eagle_min_pixels,
+                        max_pixels=args.eagle_max_pixels,
+                        image_token_limit=args.eagle_image_token_limit,
+                    )
                 else:
                     target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
                         batch["targets"],
@@ -2760,6 +3047,7 @@ def main() -> None:
                         device,
                         min_pixels=args.eagle_min_pixels,
                         max_pixels=args.eagle_max_pixels,
+                        image_token_limit=args.eagle_image_token_limit,
                     )
                     locate_aux_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
                     use_lm_loss = (
@@ -2780,17 +3068,18 @@ def main() -> None:
                             max_points=args.locate_lm_max_points,
                         )
                         locate_responses = [
-                            f"Boxes: {box_text}\nPoints: {point_text}"
+                            "".join(part for part in (box_text, point_text) if part and part != "None") or "None"
                             for box_text, point_text in zip(box_responses, point_responses)
                         ]
                         qwen_lm_inputs = build_eagle_lm_inputs(
                             backbone_processor,
                             batch["image_paths"],
-                            batch["prompts"],
+                            build_locate_generation_prompts(batch),
                             locate_responses,
                             device,
                             min_pixels=args.eagle_min_pixels,
                             max_pixels=args.eagle_max_pixels,
+                            image_token_limit=args.eagle_image_token_limit,
                         )
                     trace_qwen_inputs = qwen_lm_inputs if qwen_lm_inputs is not None else qwen_inputs
                 else:

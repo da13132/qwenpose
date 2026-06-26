@@ -1,22 +1,24 @@
 # QwenPose
 
-Release: `v0.3.1`
+Release: `v1.0`
 
 English | [中文说明](README_zh.md)
 
-QwenPose is a public training snapshot for box-conditioned human pose estimation built on top of Qwen3-VL. This repository publishes the Qwen3-VL two-stage closed-loop workflow used in this branch:
+This repository is a public training snapshot for box-conditioned human pose estimation. It contains two maintained workflows built on the same pose head, data pipeline, and evaluation code:
 
-- `stage1_freeze_qwen`: freeze the Qwen backbone and warm up the pose modules with GT boxes.
-- `stage2_qwen_box_closed_loop`: generate bbox JSON with Qwen, parse boxes, and train PoseHead on generated boxes matched to GT keypoints.
+- `LocatePose`: a LocateAnything-3B-based two-stage closed-loop recipe
+- `QwenPose`: a Qwen3-VL-4B-Instruct-based two-stage closed-loop recipe
 
-This public release is intentionally scoped to the Qwen3-VL path. The Eagle shell entrypoints are excluded from the published workflow.
+The public documentation below is ordered in the same way: shared setup first, `LocatePose` first, `QwenPose` second.
 
 ## Included Scope
 
-- `scripts/train_qwenpose_two_stage.sh`: main two-stage closed-loop training entrypoint
-- `scripts/eval_qwenpose.sh`: evaluation entrypoint
-- `scripts/zero2.json`, `scripts/zero3.json`, `scripts/zero3_offload.json`: DeepSpeed presets
-- `src/qwenpose/`: data loading, model definition, training, evaluation, checkpointing, and LoRA merge utilities
+- `scripts/locatepose.sh`: main two-stage LocatePose training entrypoint
+- `scripts/eval_locatepose.sh`: LocatePose evaluation entrypoint
+- `scripts/train_qwenpose_two_stage.sh`: main two-stage QwenPose training entrypoint
+- `scripts/eval_qwenpose.sh`: QwenPose evaluation entrypoint
+- `scripts/zero2.json`, `scripts/zero3.json`, `scripts/zero3_offload.json`: DeepSpeed presets used by both workflows
+- `src/qwenpose/`: datasets, pose model, training loop, evaluation, checkpointing, and backbone adapters
 
 ## Repository Layout
 
@@ -29,30 +31,42 @@ qwenpose/
 ├── requirements.txt
 ├── requirements-cu126.txt
 ├── scripts/
+│   ├── eval_locatepose.sh
 │   ├── eval_qwenpose.sh
+│   ├── locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
 │   └── zero3_offload.json
 └── src/
     └── qwenpose/
+        ├── data.py
+        ├── eagle_lora.py
+        ├── eval_pose.py
+        ├── losses.py
+        ├── merge_full_weights.py
+        ├── model.py
+        ├── qwen_lora.py
+        ├── schemas.py
+        └── train_pose.py
 ```
 
-The training scripts expect the following runtime directories beside the repository root:
+## Runtime Directory Convention
+
+The scripts expect the following directories next to the repository root. They can be real directories or symlinks.
 
 ```text
 qwenpose/
 ├── datasets/
 ├── outputs/
 └── weights/
+    ├── LocateAnything-3B/
     └── Qwen3-VL-4B-Instruct/
 ```
 
-These paths can be regular directories or symlinks.
+## Tested Environment
 
-## Reproducibility Snapshot
-
-This release was verified with the following software stack:
+This `v1.0` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -64,9 +78,11 @@ This release was verified with the following software stack:
 - DeepSpeed `0.17.1`
 - Accelerate `1.7.0`
 - PEFT `0.17.1`
+- Hugging Face Hub `0.36.2`
 - NumPy `2.2.6`
 - Pillow `12.2.0`
 - pycocotools `2.0.11`
+- safetensors `0.7.0`
 - SciPy `1.17.1`
 - sentencepiece `0.2.1`
 - tokenizers `0.22.2`
@@ -74,8 +90,8 @@ This release was verified with the following software stack:
 
 Pinned dependency files:
 
-- `requirements.txt`: runtime dependency pins for the public Qwen3-VL workflow
-- `requirements-cu126.txt`: exact tested installation target for Linux + Python 3.11 + CUDA 12.6
+- `requirements.txt`: runtime dependency pins for custom CUDA setups
+- `requirements-cu126.txt`: exact tested target for Linux + Python 3.11 + CUDA 12.6
 
 ## Installation
 
@@ -90,7 +106,7 @@ pip install -r requirements-cu126.txt
 
 ### Option B: custom CUDA stack
 
-If your machine uses a different CUDA build, install the matching PyTorch wheels first, then install the repository requirements. The command below is the verified CUDA 12.6 example; replace the index URL when targeting a different build:
+Install the matching PyTorch wheels for your system first, then install the repository requirements:
 
 ```bash
 python -m venv envs/qwenpose
@@ -101,49 +117,77 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
 pip install -r requirements.txt
 ```
 
-If `flash-attn` is unavailable on your platform, install the rest of the stack and run with:
+If `flash-attn` is unavailable on your platform, install the rest of the stack and switch the attention backend at runtime:
 
 ```bash
+LOCATE_ATTN_IMPLEMENTATION=sdpa
 QWEN_ATTN_IMPLEMENTATION=sdpa
 ```
 
-The shell entrypoints prefer `envs/qwenpose/bin/python` and `envs/qwenpose/bin/torchrun` when those paths exist locally. Otherwise they fall back to the active `python` or `torchrun` on `PATH`.
+All shell entrypoints prefer `envs/qwenpose/bin/python` and `envs/qwenpose/bin/torchrun` when those paths exist locally.
 
-## Download The Base Model
+## Base Model Download
 
-The default base model path is:
+### LocatePose base model
+
+Default path:
+
+```text
+weights/LocateAnything-3B
+```
+
+Official sources:
+
+- Hugging Face model card: <https://huggingface.co/nvidia/LocateAnything-3B>
+- NVIDIA Eagle repository: <https://github.com/NVlabs/Eagle>
+
+Example download:
+
+```bash
+huggingface-cli download nvidia/LocateAnything-3B \
+  --local-dir weights/LocateAnything-3B
+```
+
+### QwenPose base model
+
+Default path:
 
 ```text
 weights/Qwen3-VL-4B-Instruct
 ```
 
-Official model sources:
+Official sources:
 
-- Hugging Face: <https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct>
+- Hugging Face model card: <https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct>
 - ModelScope: <https://modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct>
 
-Example with the Hugging Face CLI:
+Example download:
 
 ```bash
 huggingface-cli download Qwen/Qwen3-VL-4B-Instruct \
   --local-dir weights/Qwen3-VL-4B-Instruct
 ```
 
-The training code loads Qwen3-VL through the standard `transformers` package. After download, the local model directory should contain the usual Hugging Face files such as `config.json`, tokenizer or processor files, and the model weight shards.
+After download, each model directory should contain the standard Hugging Face files such as `config.json`, tokenizer or processor files, and model weight shards.
 
 ## Dataset Preparation
 
-Set the dataset root to:
+Set the shared dataset root to:
 
 ```text
 datasets/
 ```
 
-The repository currently supports `coco`, `aic`, `mpii`, `crowdpose`, and `refhuman`.
+The public code supports `coco`, `aic`, `mpii`, `crowdpose`, and `refhuman`.
+
+Important defaults:
+
+- `LocatePose` stage 1 uses `coco` by default
+- `LocatePose` stage 2 uses `coco,mpii,crowdpose,refhuman` by default
+- `QwenPose` stage 1 and stage 2 use `coco` by default
+- `AIC` is supported by the loader, but it is not enabled in the default public training recipes
 
 ### COCO
-
-Required structure:
 
 ```text
 datasets/coco/
@@ -156,12 +200,12 @@ datasets/coco/
 
 Notes:
 
-- Training uses `person_keypoints_train2017.json` and `train2017/`
-- Evaluation uses `person_keypoints_val2017.json` and `val2017/`
+- Training uses `person_keypoints_train2017.json` with `train2017/`
+- Evaluation uses `person_keypoints_val2017.json` with `val2017/`
 
 ### AIC
 
-The loader supports two common local layouts.
+The loader accepts either of the following layouts.
 
 Layout A:
 
@@ -184,12 +228,10 @@ datasets/aic/
 
 Notes:
 
-- The public code accepts either layout automatically.
-- The current local tree only provides the training split. When `split=val` is requested, AIC falls back to the train annotations.
+- The public loader auto-detects either layout
+- If a validation split is requested locally, the loader falls back to the available training annotations
 
 ### MPII
-
-Required structure:
 
 ```text
 datasets/mpii/
@@ -202,13 +244,11 @@ datasets/mpii/
 
 Notes:
 
-- `mpii_train.json` is used for training
-- `mpii_val.json` is used for evaluation
-- `mpii_trainval.json` can be used manually if you want a combined training split
+- Training uses `mpii_train.json`
+- Evaluation uses `mpii_val.json`
+- `mpii_trainval.json` is optional and can be used for custom experiments
 
 ### CrowdPose
-
-Required structure:
 
 ```text
 datasets/crowdpose/
@@ -220,13 +260,10 @@ datasets/crowdpose/
 
 Notes:
 
-- The image directory is expected at `annotations/images/`
-- Training uses `mmpose_crowdpose_train.json`
-- Evaluation uses `mmpose_crowdpose_val.json`
+- The current loader expects images under `datasets/crowdpose/annotations/images/`
+- The split files are `mmpose_crowdpose_train.json` and `mmpose_crowdpose_val.json`
 
 ### RefHuman
-
-Required structure:
 
 ```text
 datasets/refhuman/
@@ -237,155 +274,247 @@ datasets/refhuman/
 
 Notes:
 
-- RefHuman contributes `REF_POSE` samples with text descriptions
-- The public default recipe does not enable RefHuman automatically; add it explicitly when needed
-- `REFHUMAN_MAX_CAPTIONS_PER_INSTANCE` controls how many captions are kept for each person instance
+- RefHuman samples are loaded as referring-person pose tasks
+- The JSON rows must contain the image metadata, boxes, keypoints, and the text description used as the referring expression
 
-Example:
+## DeepSpeed Presets
+
+The repository includes three shared DeepSpeed configs:
+
+- `scripts/zero2.json`: default recommendation for most training runs
+- `scripts/zero3.json`: use when GPU memory is tighter and pure ZeRO-3 is preferred
+- `scripts/zero3_offload.json`: use when GPU memory is very limited and CPU offload is acceptable
+
+Training scripts expose the preset through `ZERO_STAGE`:
 
 ```bash
-STAGE2_TRAIN_DATASETS=coco,refhuman \
-STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE=1 \
-scripts/train_qwenpose_two_stage.sh
+ZERO_STAGE=zero2 bash scripts/locatepose.sh
+ZERO_STAGE=zero3 bash scripts/train_qwenpose_two_stage.sh
+ZERO_STAGE=zero3_offload bash scripts/locatepose.sh
+ZERO_STAGE=none bash scripts/train_qwenpose_two_stage.sh
 ```
 
-## Default Training Recipe
+For both `locate_generate` and `qwen_generate` closed-loop training, the public stage-2 recipe currently supports `ZERO_STAGE=zero2` or `ZERO_STAGE=none`.
 
-The main published entrypoint is:
+## LocatePose
+
+LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the shared pose head in a two-stage schedule.
+
+### Default LocatePose schedule
+
+| Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
+|-------|-----------|----------------|------------|------------------|----------------|
+| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `coco` | `30` |
+| stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA, vision LoRA, projector | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `12` |
+
+Additional default knobs:
+
+- `STAGE1_BATCH_SIZE=16`
+- `STAGE2_BATCH_SIZE=1`
+- `STAGE1_GRAD_ACCUM_STEPS=1`
+- `STAGE2_GRAD_ACCUM_STEPS=8`
+- `STAGE1_LR=2e-4`
+- `STAGE2_LR=5e-5`
+- `LOCATE_IMAGE_TOKEN_LIMIT=4096`
+- `LOCATE_GENERATION_MODE=hybrid`
+- `LOCATE_BOX_MAX_NEW_TOKENS=8192`
+- `STAGE2_W_LOCATE_BOX_LM=0.04`
+- `STAGE2_W_LOCATE_POINT_LM=0.01`
+- `STAGE2_DATASET_MIX_WEIGHTS=coco:2,mpii:1,crowdpose:2,refhuman:1`
+
+### Train LocatePose
+
+Start a new run:
 
 ```bash
-scripts/train_qwenpose_two_stage.sh
+bash scripts/locatepose.sh
 ```
 
-Default stage configuration:
-
-- Stage 1 output: `stage1_freeze_qwen`
-- Stage 2 output: `stage2_qwen_box_closed_loop`
-- Output root: `outputs/qwenpose_two_stage_qwen`
-- Optional merged release weights when `MERGE_FINAL_WEIGHTS=1`: `weights/<run_name>-merged-<timestamp>`
-- Stage 1 datasets: `coco`
-- Stage 2 datasets: `coco`
-- Stage 1 batch size: `4` per GPU
-- Stage 2 batch size: `1` per GPU
-- Stage 1 epochs: `5`
-- Stage 2 epochs: `12`
-- Stage 1 box source: `gt`
-- Stage 2 box source: `qwen_generate`
-- ZeRO preset: `zero2`
-
-DeepSpeed preset selection:
-
-- `ZERO_STAGE=zero2`: uses `scripts/zero2.json`, recommended default for standard multi-GPU training
-- `ZERO_STAGE=zero3`: uses `scripts/zero3.json`, lowers GPU memory usage further at the cost of more runtime overhead
-- `ZERO_STAGE=zero3_offload`: uses `scripts/zero3_offload.json`, saves the most GPU memory but is usually the slowest option
-- `ZERO_STAGE=none`: disables DeepSpeed and is mainly intended for CPU or single-process debugging
-
-Stage-2 closed-loop note:
-
-- `STAGE2_BOX_SOURCE=qwen_generate` calls `model.generate` during training and currently supports `ZERO_STAGE=zero2` or `ZERO_STAGE=none`
-
-If you want AIC in stage 1, pass it explicitly, for example:
+Example with explicit run name and 8 GPUs:
 
 ```bash
-STAGE1_TRAIN_DATASETS=coco,aic,mpii,crowdpose
-```
-
-## Quick Start
-
-### 1. Dry-run the data pipeline
-
-This verifies dataset parsing and one batch build without starting real training:
-
-```bash
-PYTHON=python \
-ZERO_STAGE=none \
-DEVICE=cpu \
-DRY_RUN_DATA=1 \
-MAX_SAMPLES_PER_DATASET=2 \
-scripts/train_qwenpose_two_stage.sh
-```
-
-### 2. Launch two-stage training
-
-Minimal multi-GPU example:
-
-```bash
-PYTHON=python \
-TORCHRUN=torchrun \
+RUN_NAME=locatepose_v1 \
+NPROC_PER_NODE=8 \
 ZERO_STAGE=zero2 \
-CUDA_VISIBLE_DEVICES=0,1 \
-NPROC_PER_NODE=2 \
-QWEN_MODEL_PATH=weights/Qwen3-VL-4B-Instruct \
-DATASET_ROOT=datasets \
-scripts/train_qwenpose_two_stage.sh
+bash scripts/locatepose.sh
 ```
 
-### 3. Resume an existing run
-
-Resume from a previous run directory:
+Quick data-path smoke test:
 
 ```bash
-scripts/train_qwenpose_two_stage.sh \
-  --resume outputs/qwenpose_two_stage_qwen/<run_name>
+DRY_RUN_DATA=1 ZERO_STAGE=none NPROC_PER_NODE=1 bash scripts/locatepose.sh
 ```
 
-The script resolves resume paths stage-aware. If stage 2 already has closed-loop checkpoints, `--resume` resumes stage 2. Otherwise it initializes stage 2 from stage 1 when needed.
-
-### 4. Evaluate a run
+Resume from an existing run, stage directory, checkpoint directory, or checkpoint file:
 
 ```bash
-PYTHON=python \
-TRAIN_OUTPUT_DIR=outputs/qwenpose_two_stage_qwen/<run_name> \
-scripts/eval_qwenpose.sh
+bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 ```
 
-When given a full two-stage run directory, the evaluation script prefers:
+### Common LocatePose variables
+
+- `LOCATE_MODEL_PATH`: local LocateAnything-3B weights
+- `DATASET_ROOT`: dataset root, default `datasets`
+- `OUTPUT_ROOT`: training root, default `outputs/locatepose`
+- `ZERO_STAGE`: one of `zero2`, `zero3`, `zero3_offload`, or `none`
+- `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
+- `STAGE1_DATASET_MIX_WEIGHTS`, `STAGE2_DATASET_MIX_WEIGHTS`: dataset mixing weights
+- `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
+- `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
+- `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
+- `MERGE_FINAL_WEIGHTS`: currently does not produce a full merged LocateAnything checkpoint in this public script
+
+### Evaluate LocatePose
+
+Evaluate the latest LocatePose run:
+
+```bash
+bash scripts/eval_locatepose.sh
+```
+
+Evaluate a specific checkpoint or stage directory:
+
+```bash
+CHECKPOINT=outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+bash scripts/eval_locatepose.sh
+```
+
+Evaluate on multiple datasets:
+
+```bash
+DATASETS=coco,mpii,crowdpose,refhuman bash scripts/eval_locatepose.sh
+```
+
+Evaluate the GT-box upper bound instead of the closed-loop generated-box path:
+
+```bash
+BOX_SOURCE=gt bash scripts/eval_locatepose.sh
+```
+
+Outputs are written to:
 
 ```text
-<run>/stage2_qwen_box_closed_loop
-<run>/stage1_freeze_qwen
+outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/
 ```
 
-The evaluation default is the closed-loop path with `BOX_SOURCE=qwen_generate`. To inspect the GT-box-conditioned upper bound instead, run:
+The evaluation directory contains `summary.json`, `predictions.jsonl`, `predictions.json`, `report.md`, and optional visualizations.
+
+## QwenPose
+
+QwenPose uses `Qwen3-VL-4B-Instruct` as the backbone and trains the same shared pose head with a two-stage schedule.
+
+### Default QwenPose schedule
+
+| Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
+|-------|-----------|----------------|------------|------------------|----------------|
+| stage 1 | `stage1_freeze_qwen` | freeze Qwen | `gt` | `coco` | `30` |
+| stage 2 | `stage2_qwen_box_closed_loop` | unfreeze Qwen LoRA and vision LoRA | `qwen_generate` | `coco` | `12` |
+
+Additional default knobs:
+
+- `STAGE1_BATCH_SIZE=4`
+- `STAGE2_BATCH_SIZE=1`
+- `STAGE1_GRAD_ACCUM_STEPS=2`
+- `STAGE2_GRAD_ACCUM_STEPS=8`
+- `QWEN_FEATURE_SIZE=64`
+- `QWEN_FEATURE_REFINER_LAYERS=1`
+- `QWEN_BOX_MAX_NEW_TOKENS=4096`
+- `BOX_MATCH_IOU_THRESH=0.10`
+- `BOX_NMS_IOU_THRESH=0.70`
+
+### Train QwenPose
+
+Start a new run:
 
 ```bash
-BOX_SOURCE=gt \
-TRAIN_OUTPUT_DIR=outputs/qwenpose_two_stage_qwen/<run_name> \
-scripts/eval_qwenpose.sh
+bash scripts/train_qwenpose_two_stage.sh
 ```
+
+Example with explicit run name and 8 GPUs:
+
+```bash
+RUN_NAME=qwenpose_v1 \
+NPROC_PER_NODE=8 \
+ZERO_STAGE=zero2 \
+bash scripts/train_qwenpose_two_stage.sh
+```
+
+Quick data-path smoke test:
+
+```bash
+DRY_RUN_DATA=1 ZERO_STAGE=none NPROC_PER_NODE=1 bash scripts/train_qwenpose_two_stage.sh
+```
+
+Resume from an existing run, stage directory, checkpoint directory, or checkpoint file:
+
+```bash
+bash scripts/train_qwenpose_two_stage.sh --resume outputs/qwenpose_two_stage_qwen/<run_name>
+```
+
+### Common QwenPose variables
+
+- `QWEN_MODEL_PATH`: local Qwen3-VL-4B-Instruct weights
+- `DATASET_ROOT`: dataset root, default `datasets`
+- `OUTPUT_ROOT`: training root, default `outputs/qwenpose_two_stage_qwen`
+- `ZERO_STAGE`: one of `zero2`, `zero3`, `zero3_offload`, or `none`
+- `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
+- `QWEN_MIN_PIXELS`, `QWEN_MAX_PIXELS`: optional processor pixel budget overrides
+- `QWEN_BOX_MAX_NEW_TOKENS`: maximum new tokens for generated bbox JSON
+- `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
+- `MERGE_FINAL_WEIGHTS`: export a merged Qwen checkpoint after training when enabled
+
+### Evaluate QwenPose
+
+Evaluate the latest QwenPose run:
+
+```bash
+bash scripts/eval_qwenpose.sh
+```
+
+Evaluate a specific stage directory:
+
+```bash
+CHECKPOINT=outputs/qwenpose_two_stage_qwen/<run_name>/stage2_qwen_box_closed_loop \
+bash scripts/eval_qwenpose.sh
+```
+
+Evaluate the GT-box upper bound:
+
+```bash
+BOX_SOURCE=gt bash scripts/eval_qwenpose.sh
+```
+
+By default, `scripts/eval_qwenpose.sh` evaluates `coco,mpii,crowdpose,refhuman`. Override `EVAL_DATASETS` when needed.
 
 ## Output Structure
 
-A typical run directory looks like:
+Typical LocatePose run:
+
+```text
+outputs/locatepose/<run_name>/
+├── logs/
+├── stage1_freeze_locate_gt_box/
+└── stage2_locate_box_closed_loop/
+```
+
+Typical QwenPose run:
 
 ```text
 outputs/qwenpose_two_stage_qwen/<run_name>/
 ├── logs/
 ├── stage1_freeze_qwen/
-├── stage2_init_weights/
-├── stage2_qwen_box_closed_loop/
-└── eval_pose_<timestamp>/
+└── stage2_qwen_box_closed_loop/
 ```
 
-Evaluation outputs include:
-
-- `summary.json`
-- `predictions.jsonl`
-- `report.md`
-
-If `MERGE_FINAL_WEIGHTS=1`, the training script also exports merged deployable weights under `weights/`.
+Each stage directory may contain `checkpoint-*`, `checkpoint_step_*.pt`, `qwenpose_checkpoint.pt`, visualizations, and stage-local logs depending on the chosen settings.
 
 ## Versioning
 
-This repository now uses explicit release versioning:
+This repository tracks public snapshots with:
 
-- Current version: `VERSION`
-- Release history: `CHANGELOG.md`
-- Python package version: `qwenpose.__version__`
-- Recommended git tag format: `vX.Y.Z`
+- `VERSION`: repository version string
+- `CHANGELOG.md`: newest release first
+- `qwenpose.__version__`: Python package version
+- Git tags such as `v1.0`
 
-New releases should update `VERSION`, prepend a new entry to `CHANGELOG.md`, and push a matching git tag so the latest version is easy to identify on GitHub.
-
-## Official Entrypoint
-
-The maintained public training entrypoint is `scripts/train_qwenpose_two_stage.sh`.
+When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

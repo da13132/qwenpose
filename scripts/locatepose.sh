@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Long training runs must not continue reading a script file that may be edited
+# while the run is still active. Execute an immutable /tmp snapshot so the stage1
+# -> stage2 tail cannot see a half-updated script and fail with an EOF quote
+# parser error after hours of training.
+if [[ -z "${LOCATEPOSE_SCRIPT_SNAPSHOT:-}" ]]; then
+  original_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${original_script_dir}/.." && pwd)}"
+  export LOCATEPOSE_SCRIPT_PATH_REL="${LOCATEPOSE_SCRIPT_PATH_REL:-scripts/$(basename "${BASH_SOURCE[0]}")}"
+  snapshot_script="${TMPDIR:-/tmp}/locatepose.$$.sh"
+  cp -- "${BASH_SOURCE[0]}" "${snapshot_script}"
+  export LOCATEPOSE_SCRIPT_SNAPSHOT=1
+  exec bash "${snapshot_script}" "$@"
+fi
+
 ###############################################################################
 # LocatePose 两阶段训练脚本
 #
@@ -29,7 +43,7 @@ DEFAULT_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # PROJECT_ROOT：项目根目录；如果从其他目录启动脚本，也会 cd 到这里。
 PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
 # SCRIPT_PATH_REL：用于 help 信息展示的脚本相对路径。
-SCRIPT_PATH_REL="scripts/$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_PATH_REL="${LOCATEPOSE_SCRIPT_PATH_REL:-scripts/$(basename "${BASH_SOURCE[0]}")}"
 
 print_usage() {
   cat <<EOF
@@ -373,8 +387,6 @@ DATASET_ROOT="${DATASET_ROOT:-datasets}"
 SPLIT="${SPLIT:-train}"
 # MIXING_STRATEGY：多数据集混合方式。interleave 会按数据集交错采样。
 MIXING_STRATEGY="${MIXING_STRATEGY:-interleave}"
-# DATASET_MIX_WEIGHTS：全局数据集采样权重；stage 可单独覆盖。
-DATASET_MIX_WEIGHTS="${DATASET_MIX_WEIGHTS:-auto}"
 # MAX_INSTANCES：每张图最多保留/训练的人体实例数。
 MAX_INSTANCES="${MAX_INSTANCES:-80}"
 # MAX_SAMPLES_PER_DATASET：每个数据集最多样本数；空值表示不截断。
@@ -549,10 +561,6 @@ STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_we
 STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco}"
 # STAGE2_TRAIN_DATASETS：stage2 训练数据集。
 STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
-# STAGE1_DATASET_MIX_WEIGHTS：stage1 数据集采样权重。
-STAGE1_DATASET_MIX_WEIGHTS="${STAGE1_DATASET_MIX_WEIGHTS:-${DATASET_MIX_WEIGHTS}}"
-# STAGE2_DATASET_MIX_WEIGHTS：stage2 数据集采样权重。
-STAGE2_DATASET_MIX_WEIGHTS="${STAGE2_DATASET_MIX_WEIGHTS:-coco:2,mpii:1,crowdpose:2,refhuman:1}"
 # STAGE1_EPOCHS：stage1 epoch 数。
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-30}"
 # STAGE2_EPOCHS：stage2 epoch 数。
@@ -865,25 +873,24 @@ run_stage() {
   local stage_label="$1"
   local output_dir="$2"
   local datasets="$3"
-  local dataset_weights="$4"
-  local epochs="$5"
-  local batch_size="$6"
-  local grad_accum_steps="$7"
-  local lr="$8"
-  local max_steps="$9"
-  local freeze_locate="${10}"
-  local box_source="${11}"
-  local jitter_scale="${12}"
-  local jitter_shift="${13}"
-  local w_box_lm="${14}"
-  local w_point_lm="${15}"
-  local resume_arg="${16}"
+  local epochs="$4"
+  local batch_size="$5"
+  local grad_accum_steps="$6"
+  local lr="$7"
+  local max_steps="$8"
+  local freeze_locate="$9"
+  local box_source="${10}"
+  local jitter_scale="${11}"
+  local jitter_shift="${12}"
+  local w_box_lm="${13}"
+  local w_point_lm="${14}"
+  local resume_arg="${15}"
 
   local effective_batch=$((NPROC_PER_NODE * batch_size * grad_accum_steps))
   mkdir -p "${output_dir}" "${output_dir}/logs"
   local args=()
   common_args args
-  args+=(--datasets "${datasets}" --dataset_mix_weights "${dataset_weights}" --output_dir "${output_dir}")
+  args+=(--datasets "${datasets}" --output_dir "${output_dir}")
   args+=(--epochs "${epochs}" --batch_size "${batch_size}" --grad_accum_steps "${grad_accum_steps}" --lr "${lr}" --max_steps "${max_steps}")
   args+=(--box_source "${box_source}" --box_jitter_scale "${jitter_scale}" --box_jitter_shift "${jitter_shift}")
   args+=(--w_locate_box_lm "${w_box_lm}" --w_locate_point_lm "${w_point_lm}" --locate_lm_loss_every "${LOCATE_LM_LOSS_EVERY}")
@@ -894,7 +901,6 @@ run_stage() {
   echo "================ LocatePose ${stage_label} 配置 ================"
   echo "OUTPUT_DIR=${output_dir}"
   echo "DATASETS=${datasets}"
-  echo "DATASET_MIX_WEIGHTS=${dataset_weights}"
   echo "ZERO_STAGE=${ZERO_STAGE}"
   echo "DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG}"
   echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
@@ -956,7 +962,6 @@ if [[ "${RUN_STAGE1}" == "1" ]]; then
     "Stage 1 / freeze Locate GT-box warmup" \
     "${STAGE1_OUTPUT_DIR}" \
     "${STAGE1_TRAIN_DATASETS}" \
-    "${STAGE1_DATASET_MIX_WEIGHTS}" \
     "${STAGE1_EPOCHS}" \
     "${STAGE1_BATCH_SIZE}" \
     "${STAGE1_GRAD_ACCUM_STEPS}" \
@@ -997,7 +1002,6 @@ if [[ "${RUN_STAGE2}" == "1" ]]; then
     "Stage 2 / closed-loop Locate-box training" \
     "${STAGE2_OUTPUT_DIR}" \
     "${STAGE2_TRAIN_DATASETS}" \
-    "${STAGE2_DATASET_MIX_WEIGHTS}" \
     "${STAGE2_EPOCHS}" \
     "${STAGE2_BATCH_SIZE}" \
     "${STAGE2_GRAD_ACCUM_STEPS}" \

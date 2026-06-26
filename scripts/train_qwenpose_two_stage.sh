@@ -451,8 +451,6 @@ DATASET_ROOT="${DATASET_ROOT:-datasets}"
 SPLIT="${SPLIT:-train}"
 # MIXING_STRATEGY：多数据集混合方式，例如 interleave 表示交替采样。
 MIXING_STRATEGY="${MIXING_STRATEGY:-interleave}"
-# DATASET_MIX_WEIGHTS：多数据集采样权重；auto 表示由下游代码自动推断。
-DATASET_MIX_WEIGHTS="${DATASET_MIX_WEIGHTS:-auto}"
 # MAX_INSTANCES：单张图最多保留多少个人体实例，防止极端图像拖慢训练。
 MAX_INSTANCES="${MAX_INSTANCES:-80}"
 # MAX_SAMPLES_PER_DATASET：可选的每个数据集样本上限；为空表示不截断。
@@ -599,10 +597,6 @@ STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-${STAGE1_TRAIN_DATASETS}}"
 STAGE1_MIXING_STRATEGY="${STAGE1_MIXING_STRATEGY:-${MIXING_STRATEGY}}"
 # STAGE2_MIXING_STRATEGY：第二阶段多数据集混合策略。
 STAGE2_MIXING_STRATEGY="${STAGE2_MIXING_STRATEGY:-${MIXING_STRATEGY}}"
-# STAGE1_DATASET_MIX_WEIGHTS：第一阶段多数据集权重。
-STAGE1_DATASET_MIX_WEIGHTS="${STAGE1_DATASET_MIX_WEIGHTS:-${DATASET_MIX_WEIGHTS}}"
-# STAGE2_DATASET_MIX_WEIGHTS：第二阶段多数据集权重。
-STAGE2_DATASET_MIX_WEIGHTS="${STAGE2_DATASET_MIX_WEIGHTS:-${DATASET_MIX_WEIGHTS}}"
 # STAGE1_MAX_SAMPLES_PER_DATASET：第一阶段每个数据集的样本截断上限。
 STAGE1_MAX_SAMPLES_PER_DATASET="${STAGE1_MAX_SAMPLES_PER_DATASET:-${MAX_SAMPLES_PER_DATASET}}"
 # STAGE2_MAX_SAMPLES_PER_DATASET：第二阶段每个数据集的样本截断上限。
@@ -617,7 +611,7 @@ STAGE1_EPOCHS="${STAGE1_EPOCHS:-30}"
 # STAGE2_EPOCHS：第二阶段训练轮数。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-12}"
 # STAGE1_BATCH_SIZE：第一阶段每卡 batch size；默认比第二阶段更大，因为 Qwen 冻结且 box 来源更简单。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-${BATCH_SIZE:-4}}"
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-${BATCH_SIZE:-16}}"
 # STAGE2_BATCH_SIZE：第二阶段每卡 batch size；默认更小，因为闭环 generate 更吃显存/算力。
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-${BATCH_SIZE:-1}}"
 # STAGE1_GRAD_ACCUM_STEPS：第一阶段梯度累积步数。
@@ -955,32 +949,31 @@ run_stage() {
   # $10 lm_loss_every              LM loss 计算频率
   # $11 refhuman_max_captions      RefHuman 每实例 caption 上限
   # $12 mixing_strategy            多数据集混合策略
-  # $13 dataset_mix_weights        多数据集混合权重
-  # $14 max_samples_per_dataset    每数据集样本上限
-  # $15 lr                         当前阶段基础学习率
-  # $16 qwen_lora_lr_scale         文本侧 LoRA 学习率倍率
-  # $17 qwen_vision_lr_scale       视觉侧 LoRA 学习率倍率
-  # $18 warmup_steps               预热步数
-  # $19 min_lr_ratio               最小学习率比例
-  # $20 num_workers                DataLoader worker 数
-  # $21 prefetch_factor            DataLoader 预取系数
-  # $22 save_every                 checkpoint 保存间隔
-  # $23 save_total_limit           checkpoint 保留上限
-  # $24 visualize_every            可视化频率
-  # $25 seed                       随机种子
-  # $26 resume_arg                 恢复入口
-  # $27 disable_batch_trace        是否关闭 batch trace
-  # $28 box_source                 条件框来源
-  # $29 box_jitter_scale           框尺度扰动
-  # $30 box_jitter_shift           框平移扰动
-  # $31 qwen_box_max_new_tokens    Qwen 生成 bbox 的 token 上限
-  # $32 box_match_iou_thresh       框匹配 IoU 阈值
-  # $33 box_nms_iou_thresh         框 NMS IoU 阈值
+  # $13 max_samples_per_dataset    每数据集样本上限
+  # $14 lr                         当前阶段基础学习率
+  # $15 qwen_lora_lr_scale         文本侧 LoRA 学习率倍率
+  # $16 qwen_vision_lr_scale       视觉侧 LoRA 学习率倍率
+  # $17 warmup_steps               预热步数
+  # $18 min_lr_ratio               最小学习率比例
+  # $19 num_workers                DataLoader worker 数
+  # $20 prefetch_factor            DataLoader 预取系数
+  # $21 save_every                 checkpoint 保存间隔
+  # $22 save_total_limit           checkpoint 保留上限
+  # $23 visualize_every            可视化频率
+  # $24 seed                       随机种子
+  # $25 resume_arg                 恢复入口
+  # $26 disable_batch_trace        是否关闭 batch trace
+  # $27 box_source                 条件框来源
+  # $28 box_jitter_scale           框尺度扰动
+  # $29 box_jitter_shift           框平移扰动
+  # $30 qwen_box_max_new_tokens    Qwen 生成 bbox 的 token 上限
+  # $31 box_match_iou_thresh       框匹配 IoU 阈值
+  # $32 box_nms_iou_thresh         框 NMS IoU 阈值
   local stage_label="$1" output_dir="$2" datasets="$3" batch_size="$4" grad_accum_steps="$5" epochs="$6" max_steps="$7" freeze_qwen="$8" w_lm="$9"
-  local lm_loss_every="${10}" refhuman_max_captions="${11}" mixing_strategy="${12}" dataset_mix_weights="${13}" max_samples_per_dataset="${14}"
-  local lr="${15}" qwen_lora_lr_scale="${16}" qwen_vision_lr_scale="${17}" warmup_steps="${18}" min_lr_ratio="${19}" num_workers="${20}" prefetch_factor="${21}"
-  local save_every="${22}" save_total_limit="${23}" visualize_every="${24}" seed="${25}" resume_arg="${26}" disable_batch_trace="${27}"
-  local box_source="${28}" box_jitter_scale="${29}" box_jitter_shift="${30}" qwen_box_max_new_tokens="${31}" box_match_iou_thresh="${32}" box_nms_iou_thresh="${33}"
+  local lm_loss_every="${10}" refhuman_max_captions="${11}" mixing_strategy="${12}" max_samples_per_dataset="${13}"
+  local lr="${14}" qwen_lora_lr_scale="${15}" qwen_vision_lr_scale="${16}" warmup_steps="${17}" min_lr_ratio="${18}" num_workers="${19}" prefetch_factor="${20}"
+  local save_every="${21}" save_total_limit="${22}" visualize_every="${23}" seed="${24}" resume_arg="${25}" disable_batch_trace="${26}"
+  local box_source="${27}" box_jitter_scale="${28}" box_jitter_shift="${29}" qwen_box_max_new_tokens="${30}" box_match_iou_thresh="${31}" box_nms_iou_thresh="${32}"
   # effective_batch：实际总 batch = 进程数 * 每卡 batch * 梯度累积。
   local effective_batch=$((NPROC_PER_NODE * batch_size * grad_accum_steps))
   local args=(
@@ -989,7 +982,6 @@ run_stage() {
     --datasets "${datasets}"                            # 当前阶段使用的数据集列表。
     --split "${SPLIT}"                                  # 读取的数据切分。
     --mixing_strategy "${mixing_strategy}"              # 多数据集采样/混合策略。
-    --dataset_mix_weights "${dataset_mix_weights}"      # 多数据集采样权重。
     --max_instances "${MAX_INSTANCES}"                  # 单图最多保留的人体实例数。
     --refhuman_max_captions_per_instance "${refhuman_max_captions}"  # RefHuman 每实例最多使用多少条 caption。
     --record_cache_dir "${RECORD_CACHE_DIR}"            # 样本记录缓存目录。
@@ -1131,7 +1123,7 @@ if [[ "${RUN_STAGE1}" == "1" ]]; then
   # - 主要把 PoseHead / 条件框到关键点的链路先 warm up 稳定。
   run_stage \
     "Stage 1 / GT-box pose warmup" \
-    "${STAGE1_OUTPUT_DIR}" "${STAGE1_TRAIN_DATASETS}" "${STAGE1_BATCH_SIZE}" "${STAGE1_GRAD_ACCUM_STEPS}" "${STAGE1_EPOCHS}" "${STAGE1_MAX_STEPS}" "${STAGE1_FREEZE_QWEN}" "${STAGE1_W_LM}" "${STAGE1_LM_LOSS_EVERY}" "${STAGE1_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE}" "${STAGE1_MIXING_STRATEGY}" "${STAGE1_DATASET_MIX_WEIGHTS}" "${STAGE1_MAX_SAMPLES_PER_DATASET}" "${STAGE1_LR}" "${STAGE1_QWEN_LORA_LR_SCALE}" "${STAGE1_QWEN_VISION_LR_SCALE}" "${STAGE1_WARMUP_STEPS}" "${STAGE1_MIN_LR_RATIO}" "${STAGE1_NUM_WORKERS}" "${STAGE1_PREFETCH_FACTOR}" "${STAGE1_SAVE_EVERY}" "${STAGE1_SAVE_TOTAL_LIMIT}" "${STAGE1_VISUALIZE_EVERY}" "${STAGE1_SEED}" "${STAGE1_RESUME_FROM_CHECKPOINT}" "${STAGE1_DISABLE_BATCH_TRACE}" "${STAGE1_BOX_SOURCE}" "${STAGE1_BOX_JITTER_SCALE}" "${STAGE1_BOX_JITTER_SHIFT}" "${STAGE1_QWEN_BOX_MAX_NEW_TOKENS}" "${STAGE1_BOX_MATCH_IOU_THRESH}" "${STAGE1_BOX_NMS_IOU_THRESH}"
+    "${STAGE1_OUTPUT_DIR}" "${STAGE1_TRAIN_DATASETS}" "${STAGE1_BATCH_SIZE}" "${STAGE1_GRAD_ACCUM_STEPS}" "${STAGE1_EPOCHS}" "${STAGE1_MAX_STEPS}" "${STAGE1_FREEZE_QWEN}" "${STAGE1_W_LM}" "${STAGE1_LM_LOSS_EVERY}" "${STAGE1_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE}" "${STAGE1_MIXING_STRATEGY}" "${STAGE1_MAX_SAMPLES_PER_DATASET}" "${STAGE1_LR}" "${STAGE1_QWEN_LORA_LR_SCALE}" "${STAGE1_QWEN_VISION_LR_SCALE}" "${STAGE1_WARMUP_STEPS}" "${STAGE1_MIN_LR_RATIO}" "${STAGE1_NUM_WORKERS}" "${STAGE1_PREFETCH_FACTOR}" "${STAGE1_SAVE_EVERY}" "${STAGE1_SAVE_TOTAL_LIMIT}" "${STAGE1_VISUALIZE_EVERY}" "${STAGE1_SEED}" "${STAGE1_RESUME_FROM_CHECKPOINT}" "${STAGE1_DISABLE_BATCH_TRACE}" "${STAGE1_BOX_SOURCE}" "${STAGE1_BOX_JITTER_SCALE}" "${STAGE1_BOX_JITTER_SHIFT}" "${STAGE1_QWEN_BOX_MAX_NEW_TOKENS}" "${STAGE1_BOX_MATCH_IOU_THRESH}" "${STAGE1_BOX_NMS_IOU_THRESH}"
 else
   # RUN_STAGE1=0 时跳过第一阶段，常见于只补跑 stage2 的场景。
   echo "Skipping stage 1 because RUN_STAGE1=0"
@@ -1172,7 +1164,7 @@ if [[ "${RUN_STAGE2}" == "1" ]]; then
   # - 让语言模型与姿态分支在闭环条件下联合训练。
   run_stage \
     "Stage 2 / Closed-loop Qwen-box training" \
-    "${STAGE2_OUTPUT_DIR}" "${STAGE2_TRAIN_DATASETS}" "${STAGE2_BATCH_SIZE}" "${STAGE2_GRAD_ACCUM_STEPS}" "${STAGE2_EPOCHS}" "${STAGE2_MAX_STEPS}" "${STAGE2_FREEZE_QWEN}" "${STAGE2_W_LM}" "${STAGE2_LM_LOSS_EVERY}" "${STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE}" "${STAGE2_MIXING_STRATEGY}" "${STAGE2_DATASET_MIX_WEIGHTS}" "${STAGE2_MAX_SAMPLES_PER_DATASET}" "${STAGE2_LR}" "${STAGE2_QWEN_LORA_LR_SCALE}" "${STAGE2_QWEN_VISION_LR_SCALE}" "${STAGE2_WARMUP_STEPS}" "${STAGE2_MIN_LR_RATIO}" "${STAGE2_NUM_WORKERS}" "${STAGE2_PREFETCH_FACTOR}" "${STAGE2_SAVE_EVERY}" "${STAGE2_SAVE_TOTAL_LIMIT}" "${STAGE2_VISUALIZE_EVERY}" "${STAGE2_SEED}" "${stage2_resume_arg}" "${STAGE2_DISABLE_BATCH_TRACE}" "${STAGE2_BOX_SOURCE}" "${STAGE2_BOX_JITTER_SCALE}" "${STAGE2_BOX_JITTER_SHIFT}" "${STAGE2_QWEN_BOX_MAX_NEW_TOKENS}" "${STAGE2_BOX_MATCH_IOU_THRESH}" "${STAGE2_BOX_NMS_IOU_THRESH}"
+    "${STAGE2_OUTPUT_DIR}" "${STAGE2_TRAIN_DATASETS}" "${STAGE2_BATCH_SIZE}" "${STAGE2_GRAD_ACCUM_STEPS}" "${STAGE2_EPOCHS}" "${STAGE2_MAX_STEPS}" "${STAGE2_FREEZE_QWEN}" "${STAGE2_W_LM}" "${STAGE2_LM_LOSS_EVERY}" "${STAGE2_REFHUMAN_MAX_CAPTIONS_PER_INSTANCE}" "${STAGE2_MIXING_STRATEGY}" "${STAGE2_MAX_SAMPLES_PER_DATASET}" "${STAGE2_LR}" "${STAGE2_QWEN_LORA_LR_SCALE}" "${STAGE2_QWEN_VISION_LR_SCALE}" "${STAGE2_WARMUP_STEPS}" "${STAGE2_MIN_LR_RATIO}" "${STAGE2_NUM_WORKERS}" "${STAGE2_PREFETCH_FACTOR}" "${STAGE2_SAVE_EVERY}" "${STAGE2_SAVE_TOTAL_LIMIT}" "${STAGE2_VISUALIZE_EVERY}" "${STAGE2_SEED}" "${stage2_resume_arg}" "${STAGE2_DISABLE_BATCH_TRACE}" "${STAGE2_BOX_SOURCE}" "${STAGE2_BOX_JITTER_SCALE}" "${STAGE2_BOX_JITTER_SHIFT}" "${STAGE2_QWEN_BOX_MAX_NEW_TOKENS}" "${STAGE2_BOX_MATCH_IOU_THRESH}" "${STAGE2_BOX_NMS_IOU_THRESH}"
 
   if [[ "${DRY_RUN_DATA}" != "1" && "${MERGE_FINAL_WEIGHTS}" == "1" ]]; then
     # 可选导出：把最终 stage2 权重合并成一份完整模型目录，便于独立部署/推理。

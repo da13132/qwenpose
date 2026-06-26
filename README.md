@@ -320,7 +320,6 @@ Additional default knobs:
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
 - `STAGE2_W_LOCATE_BOX_LM=0.04`
 - `STAGE2_W_LOCATE_POINT_LM=0.01`
-- `STAGE2_DATASET_MIX_WEIGHTS=coco:2,mpii:1,crowdpose:2,refhuman:1`
 
 ### Train LocatePose
 
@@ -358,7 +357,6 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `OUTPUT_ROOT`: training root, default `outputs/locatepose`
 - `ZERO_STAGE`: one of `zero2`, `zero3`, `zero3_offload`, or `none`
 - `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
-- `STAGE1_DATASET_MIX_WEIGHTS`, `STAGE2_DATASET_MIX_WEIGHTS`: dataset mixing weights
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
 - `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
 - `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
@@ -412,7 +410,7 @@ QwenPose uses `Qwen3-VL-4B-Instruct` as the backbone and trains the same shared 
 
 Additional default knobs:
 
-- `STAGE1_BATCH_SIZE=4`
+- `STAGE1_BATCH_SIZE=16`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=2`
 - `STAGE2_GRAD_ACCUM_STEPS=8`

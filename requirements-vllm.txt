@@ -1,0 +1,12 @@
+# Optional add-on dependencies for integrated LocatePose vLLM inference/eval.
+# Tested with the v1.1 public snapshot on Linux + Python 3.11 + CUDA 12.6.
+#
+# Install this after the base environment:
+#   pip install -r requirements.txt
+#   pip install -r requirements-vllm.txt
+#
+# Or, if you already installed the exact CUDA 12.6 stack:
+#   pip install -r requirements-cu126.txt
+#   pip install -r requirements-vllm.txt
+
+vllm==0.11.0

@@ -34,3 +34,6 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+
+# Local backup artifacts
+src/qwenpose/model_20260630-152945_roi-16x16_backup.py

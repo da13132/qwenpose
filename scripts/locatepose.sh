@@ -22,10 +22,10 @@ fi
 #
 # Stage 1 / GT-box pose warmup：
 #   冻结 LocateAnything，只训练 PoseHead / 特征 refiner 等 pose 相关模块；
-#   PoseHead 输入 GT box，当前默认训练 30 epoch。
+#   PoseHead 输入 GT box，当前默认训练 80 epoch。
 #
 # Stage 2 / closed-loop Locate-box training：
-#   解冻 LocateAnything LoRA / vision LoRA / projector 等可训练适配参数；
+#   解冻 LocateAnything LoRA / vision LoRA 等可训练适配参数；
 #   先让 LocateAnything generate 人体框，再把生成框喂给 PoseHead；
 #   GT box 只用于匹配和监督，不再作为 PoseHead 输入。
 #
@@ -357,9 +357,9 @@ esac
 # DEEPSPEED_CONFIG：DeepSpeed JSON 配置路径；ZERO_STAGE=none 时为空。
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${DEFAULT_DEEPSPEED_CONFIG}}"
 # CUDA_VISIBLE_DEVICES：可见 GPU 列表。
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 # NPROC_PER_NODE：每个节点启动的训练进程数，一般等于可见 GPU 数。
-export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 # MASTER_ADDR：torch.distributed 主节点地址。
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 # MASTER_PORT：torch.distributed 端口；默认随机选一个高位端口。
@@ -468,12 +468,8 @@ DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
 
 # LR：全局基础学习率；stage 可用 STAGE*_LR 单独覆盖。
 LR="${LR:-2e-4}"
-# LOCATE_LR_SCALE：LocateAnything LoRA 参数学习率相对 LR 的倍率。
-LOCATE_LR_SCALE="${LOCATE_LR_SCALE:-0.05}"
 # LOCATE_VISION_SCALE：LocateAnything vision LoRA 参数学习率相对 LR 的倍率。
 LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.02}"
-# LOCATE_PROJECTOR_SCALE：LocateAnything projector 参数学习率相对 LR 的倍率。
-LOCATE_PROJECTOR_SCALE="${LOCATE_PROJECTOR_SCALE:-0.05}"
 # WEIGHT_DECAY：AdamW weight decay。
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 # GRAD_CLIP：梯度裁剪范数。
@@ -512,9 +508,9 @@ DISABLE_BATCH_TRACE="${DISABLE_BATCH_TRACE:-0}"
 ###############################################################################
 
 # W_OKS：OKS loss 权重。
-W_OKS="${W_OKS:-0.2}"
+W_OKS="${W_OKS:-0.5}"
 # W_COORD：归一化坐标回归 loss 权重。
-W_COORD="${W_COORD:-5.0}"
+W_COORD="${W_COORD:-3.0}"
 # W_VIS：关键点可见性 BCE loss 权重。
 W_VIS="${W_VIS:-0.05}"
 # W_HARD_JOINT：hard-joint mining loss 权重，默认关闭。
@@ -557,16 +553,16 @@ STAGE1_OUTPUT_DIR="${STAGE1_OUTPUT_DIR:-${OUTPUT_DIR}/stage1_freeze_locate_gt_bo
 STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_DIR}/stage2_locate_box_closed_loop}"
 # STAGE2_INIT_WEIGHTS_DIR：stage2 weight-only 初始化 checkpoint 临时目录。
 STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_weights}"
-# STAGE1_TRAIN_DATASETS：stage1 训练数据集。
-STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco}"
+# STAGE1_TRAIN_DATASETS：stage1 训练数据集。 #coco,mpii,crowdpose,refhuman,aic
+STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-crowdpose}"
 # STAGE2_TRAIN_DATASETS：stage2 训练数据集。
 STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 # STAGE1_EPOCHS：stage1 epoch 数。
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-30}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-80}"
 # STAGE2_EPOCHS：stage2 epoch 数。
-STAGE2_EPOCHS="${STAGE2_EPOCHS:-12}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 # STAGE1_BATCH_SIZE：stage1 每卡 micro batch size；Locate vision 走 flash_attention_2 full-batch forward。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-16}"
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-8}"
 # STAGE2_BATCH_SIZE：stage2 每卡 micro batch size；locate_generate 逐图生成，默认 1。
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-1}"
 # STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。
@@ -590,9 +586,9 @@ STAGE1_BOX_SOURCE="${STAGE1_BOX_SOURCE:-gt}"
 # STAGE2_BOX_SOURCE：stage2 条件框来源，默认 LocateAnything 生成框。
 STAGE2_BOX_SOURCE="${STAGE2_BOX_SOURCE:-locate_generate}"
 # STAGE1_BOX_JITTER_SCALE：stage1 条件框缩放扰动。
-STAGE1_BOX_JITTER_SCALE="${STAGE1_BOX_JITTER_SCALE:-0.0}"
+STAGE1_BOX_JITTER_SCALE="${STAGE1_BOX_JITTER_SCALE:-0.1}"
 # STAGE1_BOX_JITTER_SHIFT：stage1 条件框中心平移扰动。
-STAGE1_BOX_JITTER_SHIFT="${STAGE1_BOX_JITTER_SHIFT:-0.0}"
+STAGE1_BOX_JITTER_SHIFT="${STAGE1_BOX_JITTER_SHIFT:-0.1}"
 # STAGE2_BOX_JITTER_SCALE：stage2 生成框不再额外 jitter。
 STAGE2_BOX_JITTER_SCALE="${STAGE2_BOX_JITTER_SCALE:-0.0}"
 # STAGE2_BOX_JITTER_SHIFT：stage2 生成框不再额外 jitter。
@@ -698,6 +694,7 @@ if [[ -n "${DEEPSPEED_CONFIG}" && ! -f "${DEEPSPEED_CONFIG}" ]]; then
 fi
 if [[ -n "${LOCATE_MIN_PIXELS}" ]]; then require_positive_int LOCATE_MIN_PIXELS "${LOCATE_MIN_PIXELS}"; fi
 if [[ -n "${LOCATE_MAX_PIXELS}" ]]; then require_positive_int LOCATE_MAX_PIXELS "${LOCATE_MAX_PIXELS}"; fi
+if [[ -n "${LOCATE_IMAGE_TOKEN_LIMIT}" ]]; then require_positive_int LOCATE_IMAGE_TOKEN_LIMIT "${LOCATE_IMAGE_TOKEN_LIMIT}"; fi
 if [[ -n "${LOCATE_MIN_PIXELS}" && -n "${LOCATE_MAX_PIXELS}" ]] && (( LOCATE_MAX_PIXELS < LOCATE_MIN_PIXELS )); then
   echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS} must be >= LOCATE_MIN_PIXELS=${LOCATE_MIN_PIXELS}." >&2
   exit 1
@@ -846,7 +843,7 @@ common_args() {
   a+=(--locate_vision_lora_r "${LOCATE_VISION_LORA_R}" --locate_vision_lora_alpha "${LOCATE_VISION_LORA_ALPHA}" --locate_vision_lora_dropout "${LOCATE_VISION_LORA_DROPOUT}")
   a+=(--hidden_dim "${HIDDEN_DIM}" --pose_decoder_layers "${POSE_DECODER_LAYERS}" --refinement_steps "${REFINEMENT_STEPS}" --decoder_heads "${DECODER_HEADS}")
   a+=(--box_condition_scale "${BOX_CONDITION_SCALE}" --pose_roi_size "${POSE_ROI_SIZE}")
-  a+=(--locate_lr_scale "${LOCATE_LR_SCALE}" --locate_vision_scale "${LOCATE_VISION_SCALE}" --locate_projector_scale "${LOCATE_PROJECTOR_SCALE}")
+  a+=(--locate_vision_scale "${LOCATE_VISION_SCALE}")
   a+=(--locate_generation_mode "${LOCATE_GENERATION_MODE}" --locate_box_max_new_tokens "${LOCATE_BOX_MAX_NEW_TOKENS}")
   a+=(--box_match_iou_thresh "${BOX_MATCH_IOU_THRESH}" --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}")
   a+=(--weight_decay "${WEIGHT_DECAY}" --grad_clip "${GRAD_CLIP}" --warmup_steps "${WARMUP_STEPS}" --min_lr_ratio "${MIN_LR_RATIO}")
@@ -924,9 +921,7 @@ run_stage() {
   echo "BOX_MATCH_IOU_THRESH=${BOX_MATCH_IOU_THRESH}"
   echo "BOX_NMS_IOU_THRESH=${BOX_NMS_IOU_THRESH}"
   echo "LR=${lr}"
-  echo "LOCATE_LR_SCALE=${LOCATE_LR_SCALE}"
   echo "LOCATE_VISION_SCALE=${LOCATE_VISION_SCALE}"
-  echo "LOCATE_PROJECTOR_SCALE=${LOCATE_PROJECTOR_SCALE}"
   echo "RESUME_ARG=${resume_arg}"
   echo "===================================================="
   run_train_pose args
@@ -951,6 +946,7 @@ echo "LOCATE_MODEL_PATH=${LOCATE_MODEL_PATH}"
 echo "LOCATE_ATTN_IMPLEMENTATION=${LOCATE_ATTN_IMPLEMENTATION}"
 echo "LOCATE_MIN_PIXELS=${LOCATE_MIN_PIXELS}"
 echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS}"
+echo "LOCATE_IMAGE_TOKEN_LIMIT=${LOCATE_IMAGE_TOKEN_LIMIT}"
 echo "TRAIN_LOG_FILE=${TRAIN_LOG_FILE}"
 echo "=========================================================="
 

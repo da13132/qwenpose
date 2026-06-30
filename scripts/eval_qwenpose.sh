@@ -237,6 +237,13 @@ BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
 # POSE_ROI_SIZE：每个扩大后 bbox 从 Qwen grid 上采样出的局部特征边长，必须匹配训练。
 POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
 
+###############################################################################
+# Transformers / Qwen3-VL 闭环推理参数
+#
+# QwenPose 这里不接 vLLM。qwen_generate 会调用 transformers Qwen3-VL
+# generate 得到框，再用同一个 PyTorch 模型图跑 PoseHead。
+###############################################################################
+
 # BOX_SOURCE：验证时 PoseHead 条件框来源。默认 qwen_generate，走最终闭环路径；gt 用于看 GT box 上限。
 BOX_SOURCE="${BOX_SOURCE:-qwen_generate}"
 # QWEN_BOX_MAX_NEW_TOKENS：Qwen 生成 bbox JSON 最大新 token 数。
@@ -248,6 +255,14 @@ BOX_NMS_IOU_THRESH="${BOX_NMS_IOU_THRESH:-0.70}"
 
 # DECODER_HEADS：Pose decoder 注意力头数，必须和训练 checkpoint 一致。
 DECODER_HEADS="${DECODER_HEADS:-8}"
+
+###############################################################################
+# vLLM 参数区
+#
+# 当前 QwenPose 验证脚本没有 vLLM 推理参数。需要 vLLM 只生成框时应使用
+# LocatePose 专用的 scripts/infer_locatepose.sh；需要真正 PoseHead 特征复用时
+# 继续使用本脚本/transformers 路径。
+###############################################################################
 
 # QWEN_LORA_R：LLM LoRA rank，加载 LoRA 结构时需和训练一致。
 QWEN_LORA_R="${QWEN_LORA_R:-32}"

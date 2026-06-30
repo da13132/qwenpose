@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v1.1 - 2026-06-30
+
+- Refreshed the published LocatePose training defaults in `scripts/locatepose.sh`, including the current `crowdpose` stage-1 dataset, the `80 + 5` epoch two-stage schedule, updated stage-1 box jitter, aligned pose loss weights, and the current four-GPU launch defaults.
+- Added the public LocatePose inference and scoring utilities centered on `scripts/infer_locatepose.sh`, `qwenpose.infer_locatepose`, `qwenpose.metrics`, and `qwenpose.score_pose_predictions`, so single-image, folder, RefHuman-caption, and exported-prediction workflows are documented and versioned.
+- Published the integrated LocatePose vLLM evaluation/inference path through the custom LocateAnything backend wrapper and synchronized the README guidance with the new `LOCATE_GENERATION_BACKEND`, `SINGLE_PASS_PROMPT`, and fallback behavior.
+- Bumped the repository snapshot version to `v1.1` through `VERSION`, `qwenpose.__version__`, dependency headers, and the Git tag convention used for public releases.
+
 ## v1.0 - 2026-06-26
 
 - Promoted the LocatePose workflow to a first-class public entrypoint with `scripts/locatepose.sh` and `scripts/eval_locatepose.sh`, placing the LocateAnything-based recipe alongside the maintained Qwen3-VL recipe in the published snapshot.

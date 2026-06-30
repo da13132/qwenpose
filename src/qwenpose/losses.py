@@ -51,8 +51,8 @@ def normalized_coord_loss(
 @dataclass
 class LossWeights:
     # Main pose supervision.
-    oks: float = 0.2
-    coord: float = 5.0
+    oks: float = 0.5
+    coord: float = 3.0
     vis: float = 0.05
     # Stage2 LM bbox supervision. Stage1 should keep this at 0.
     lm: float = 0.05

@@ -10,6 +10,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -206,9 +207,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--qwen_lora_lr_scale", type=float, default=1.0)
     parser.add_argument("--qwen_vision_lr_scale", type=float, default=0.01)
-    parser.add_argument("--locate_lr_scale", type=float, default=0.05)
     parser.add_argument("--locate_vision_scale", type=float, default=0.02)
-    parser.add_argument("--locate_projector_scale", type=float, default=0.05)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -239,14 +238,14 @@ def parse_args() -> argparse.Namespace:
     # main pose losses, Stage2 may add bbox LM supervision, and hard_joint is
     # retained only as an off-by-default ablation knob.
     # ---------------------------------------------------------------------
-    parser.add_argument("--w_oks", type=float, default=0.2)
-    parser.add_argument("--w_coord", type=float, default=5.0)
+    parser.add_argument("--w_oks", type=float, default=0.5)
+    parser.add_argument("--w_coord", type=float, default=3.0)
     parser.add_argument("--w_vis", type=float, default=0.05)
     parser.add_argument("--w_lm", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
-    parser.add_argument("--box_jitter_scale", type=float, default=0.05)
-    parser.add_argument("--box_jitter_shift", type=float, default=0.0)
+    parser.add_argument("--box_jitter_scale", type=float, default=0.1)
+    parser.add_argument("--box_jitter_shift", type=float, default=0.1)
     parser.add_argument(
         "--box_source",
         choices=["gt", "qwen_generate", "locate_generate"],
@@ -1156,6 +1155,25 @@ def prepare_locate_generated_box_conditioning(
         max_pixels=max_pixels,
         image_token_limit=image_token_limit,
     )
+    return prepare_locate_generated_box_conditioning_from_responses(
+        responses,
+        batch,
+        device,
+        max_instances=max_instances,
+        match_iou_thresh=match_iou_thresh,
+        nms_iou_thresh=nms_iou_thresh,
+    )
+
+
+def prepare_locate_generated_box_conditioning_from_responses(
+    responses: list[str],
+    batch: dict,
+    device: torch.device,
+    max_instances: int,
+    *,
+    match_iou_thresh: float,
+    nms_iou_thresh: float,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
     selected_targets: list[dict[str, torch.Tensor]] = []
     selected_condition_boxes: list[torch.Tensor] = []
     for sample_idx, target in enumerate(batch["targets"]):
@@ -1210,6 +1228,70 @@ def prepare_locate_generated_box_conditioning(
         box_tensor[sample_idx, :n] = boxes.to(device=device, dtype=torch.float32)
         box_mask[sample_idx, :n] = True
     return box_tensor, box_mask, selected_targets
+
+
+def generate_locate_bbox_responses_with_features(
+    training_model: torch.nn.Module,
+    processor,
+    batch: dict,
+    device: torch.device,
+    *,
+    max_new_tokens: int,
+    generation_mode: str,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    image_token_limit: int | None = None,
+    single_pass_prompt: str = "locate",
+) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+    module = unwrap_training_model(training_model)
+    if module.backbone_name != "eagle" or module.backbone_model is None or module.backbone_extractor is None:
+        raise ValueError("cached LocateAnything generation requires --backbone eagle/locatepose.")
+    if processor is None:
+        raise ValueError("LocateAnything processor is required for cached LocateAnything generation.")
+    locate_model = get_eagle_base_model(module.backbone_model)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = getattr(locate_model, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("LocateAnything tokenizer is required for cached LocateAnything generation.")
+
+    if str(single_pass_prompt).strip().lower() == "pose":
+        prompts = [str(prompt) for prompt in batch.get("prompts", [])]
+    else:
+        prompts = build_locate_generation_prompts(batch)
+
+    was_training = bool(locate_model.training)
+    locate_model.eval()
+    responses: list[str] = []
+    feature_maps: list[torch.Tensor] = []
+    text_embeds: list[torch.Tensor] = []
+    try:
+        for image_path, prompt in zip(batch["image_paths"], prompts):
+            inputs = build_eagle_inputs(
+                processor,
+                [image_path],
+                [prompt],
+                device,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+                image_token_limit=image_token_limit,
+            )
+            response, feature_map, text_embed = module.backbone_extractor.generate_response_with_cached_features(
+                inputs,
+                tokenizer,
+                max_new_tokens=max_new_tokens,
+                generation_mode=generation_mode,
+                do_sample=False,
+                temperature=0,
+            )
+            responses.append(response)
+            feature_maps.append(feature_map)
+            text_embeds.append(text_embed)
+    finally:
+        if was_training:
+            locate_model.train()
+
+    return responses, torch.cat(feature_maps, dim=0), torch.cat(text_embeds, dim=0)
 
 
 class QwenPoseTrainingModel(torch.nn.Module):
@@ -1335,6 +1417,410 @@ class QwenPoseTrainingModel(torch.nn.Module):
         if lm_loss is not None:
             outputs["lm_loss"] = lm_loss
         return outputs
+
+
+@dataclass
+class LocatePoseUnifiedConfig:
+    max_instances: int = 80
+    qwen_box_max_new_tokens: int = 4096
+    locate_box_max_new_tokens: int = 8192
+    locate_generation_mode: str = "hybrid"
+    box_match_iou_thresh: float = 0.10
+    box_nms_iou_thresh: float = 0.70
+    qwen_min_pixels: int | None = None
+    qwen_max_pixels: int | None = None
+    eagle_min_pixels: int | None = None
+    eagle_max_pixels: int | None = None
+    eagle_image_token_limit: int | None = None
+    single_pass_prompt: str = "locate"
+    use_single_pass_features: bool = False
+    keep_unmatched_predictions: bool = False
+    box_jitter_scale: float = 0.0
+    box_jitter_shift: float = 0.0
+
+    @classmethod
+    def from_args(
+        cls,
+        args: argparse.Namespace,
+        *,
+        use_single_pass_features: bool | None = None,
+        keep_unmatched_predictions: bool | None = None,
+    ) -> "LocatePoseUnifiedConfig":
+        return cls(
+            max_instances=int(getattr(args, "max_instances", 80)),
+            qwen_box_max_new_tokens=int(getattr(args, "qwen_box_max_new_tokens", 4096)),
+            locate_box_max_new_tokens=int(getattr(args, "locate_box_max_new_tokens", 8192)),
+            locate_generation_mode=str(getattr(args, "locate_generation_mode", "hybrid")),
+            box_match_iou_thresh=float(getattr(args, "box_match_iou_thresh", 0.10)),
+            box_nms_iou_thresh=float(getattr(args, "box_nms_iou_thresh", 0.70)),
+            qwen_min_pixels=getattr(args, "qwen_min_pixels", None),
+            qwen_max_pixels=getattr(args, "qwen_max_pixels", None),
+            eagle_min_pixels=getattr(args, "eagle_min_pixels", None),
+            eagle_max_pixels=getattr(args, "eagle_max_pixels", None),
+            eagle_image_token_limit=getattr(args, "eagle_image_token_limit", None),
+            single_pass_prompt=str(getattr(args, "single_pass_prompt", "locate")),
+            use_single_pass_features=(
+                bool(getattr(args, "use_single_pass_features", False))
+                if use_single_pass_features is None
+                else bool(use_single_pass_features)
+            ),
+            keep_unmatched_predictions=(
+                bool(getattr(args, "keep_unmatched_predictions", False))
+                if keep_unmatched_predictions is None
+                else bool(keep_unmatched_predictions)
+            ),
+            box_jitter_scale=float(getattr(args, "box_jitter_scale", 0.0)),
+            box_jitter_shift=float(getattr(args, "box_jitter_shift", 0.0)),
+        )
+
+
+@dataclass
+class LocatePoseUnifiedResult:
+    outputs: dict[str, torch.Tensor]
+    target_boxes: torch.Tensor
+    target_box_mask: torch.Tensor
+    pose_targets: list[dict[str, torch.Tensor]] | None = None
+    gt_targets: list[dict[str, torch.Tensor]] | None = None
+    locate_responses: list[str] | None = None
+    locate_boxes_abs: list[list[list[float]]] | None = None
+    external_feature_map: torch.Tensor | None = None
+    external_text_embed: torch.Tensor | None = None
+    qwen_inputs: dict[str, torch.Tensor] | None = None
+    used_single_pass_features: bool = False
+
+
+class LocatePoseUnifiedRuntime:
+    """End-to-end LocatePose runner: box generation, feature reuse, PoseHead."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        processor: Any | None,
+        device: torch.device,
+        *,
+        backbone_name: str | None = None,
+    ) -> None:
+        self.model = model
+        self.processor = processor
+        self.device = device
+        self.backbone_name = str(backbone_name or getattr(unwrap_training_model(model), "backbone_name", "qwen3vl"))
+        if self.backbone_name == "locatepose":
+            self.backbone_name = "eagle"
+
+    @property
+    def module(self) -> QwenPoseTrainingModel:
+        return unwrap_training_model(self.model)
+
+    def build_backbone_inputs(self, batch: dict, config: LocatePoseUnifiedConfig) -> dict[str, torch.Tensor] | None:
+        if self.processor is None:
+            return None
+        if self.backbone_name == "eagle":
+            return build_eagle_inputs(
+                self.processor,
+                batch["image_paths"],
+                batch["prompts"],
+                self.device,
+                min_pixels=config.eagle_min_pixels,
+                max_pixels=config.eagle_max_pixels,
+                image_token_limit=config.eagle_image_token_limit,
+            )
+        return build_qwen_inputs(
+            self.processor,
+            batch["image_paths"],
+            batch["prompts"],
+            self.device,
+            min_pixels=config.qwen_min_pixels,
+            max_pixels=config.qwen_max_pixels,
+        )
+
+    def generate_locate_responses(
+        self,
+        batch: dict,
+        config: LocatePoseUnifiedConfig,
+    ) -> tuple[list[str], torch.Tensor | None, torch.Tensor | None]:
+        if config.use_single_pass_features:
+            responses, feature_map, text_embed = generate_locate_bbox_responses_with_features(
+                self.model,
+                self.processor,
+                batch,
+                self.device,
+                max_new_tokens=config.locate_box_max_new_tokens,
+                generation_mode=config.locate_generation_mode,
+                min_pixels=config.eagle_min_pixels,
+                max_pixels=config.eagle_max_pixels,
+                image_token_limit=config.eagle_image_token_limit,
+                single_pass_prompt=config.single_pass_prompt,
+            )
+            return responses, feature_map, text_embed
+        responses = generate_locate_bbox_responses(
+            self.model,
+            self.processor,
+            batch,
+            self.device,
+            max_new_tokens=config.locate_box_max_new_tokens,
+            generation_mode=config.locate_generation_mode,
+            min_pixels=config.eagle_min_pixels,
+            max_pixels=config.eagle_max_pixels,
+            image_token_limit=config.eagle_image_token_limit,
+        )
+        return responses, None, None
+
+    def condition_inference_from_locate_responses(
+        self,
+        responses: list[str],
+        batch: dict,
+        config: LocatePoseUnifiedConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[list[list[float]]]]:
+        selected_boxes: list[torch.Tensor] = []
+        locate_boxes_abs: list[list[list[float]]] = []
+        for sample_idx, response in enumerate(responses):
+            task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+            boxes = parse_locate_bbox_response(response, max_instances=config.max_instances)
+            boxes = nms_boxes_xyxy(
+                boxes,
+                iou_thresh=config.box_nms_iou_thresh,
+                max_boxes=config.max_instances,
+            )
+            if task_id == 1 and boxes.shape[0] > 1:
+                boxes = boxes[:1]
+            selected_boxes.append(boxes)
+
+            target = batch["targets"][sample_idx]
+            width = float(target["width"])
+            height = float(target["height"])
+            locate_boxes_abs.append(
+                [
+                    [
+                        float(box[0]) * width,
+                        float(box[1]) * height,
+                        float(box[2]) * width,
+                        float(box[3]) * height,
+                    ]
+                    for box in boxes.detach().cpu().tolist()
+                ]
+            )
+
+        max_boxes = max([int(boxes.shape[0]) for boxes in selected_boxes] + [1])
+        box_tensor = torch.zeros(len(selected_boxes), max_boxes, 4, dtype=torch.float32, device=self.device)
+        box_mask = torch.zeros(len(selected_boxes), max_boxes, dtype=torch.bool, device=self.device)
+        for sample_idx, boxes in enumerate(selected_boxes):
+            n = int(boxes.shape[0])
+            if n <= 0:
+                continue
+            box_tensor[sample_idx, :n] = boxes.to(device=self.device, dtype=torch.float32)
+            box_mask[sample_idx, :n] = True
+        return box_tensor, box_mask, locate_boxes_abs
+
+    def forward_pose(
+        self,
+        batch: dict,
+        target_boxes: torch.Tensor,
+        target_box_mask: torch.Tensor,
+        config: LocatePoseUnifiedConfig,
+        *,
+        external_feature_map: torch.Tensor | None = None,
+        external_text_embed: torch.Tensor | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
+        if external_feature_map is not None and external_text_embed is not None:
+            outputs = self.module.pose_model(
+                schema_ids=batch["schema_ids"],
+                task_ids=batch["task_ids"],
+                external_feature_map=external_feature_map,
+                external_text_embed=external_text_embed,
+                target_boxes=target_boxes,
+                target_box_mask=target_box_mask,
+                images=batch.get("images"),
+            )
+            return outputs, None
+        backbone_inputs = self.build_backbone_inputs(batch, config)
+        outputs = self.model(
+            schema_ids=batch["schema_ids"],
+            task_ids=batch["task_ids"],
+            qwen_inputs=backbone_inputs,
+            target_boxes=target_boxes,
+            target_box_mask=target_box_mask,
+            images=batch.get("images"),
+        )
+        return outputs, backbone_inputs
+
+    def infer_batch(
+        self,
+        batch: dict,
+        config: LocatePoseUnifiedConfig,
+        *,
+        precomputed_locate_responses: list[str] | None = None,
+    ) -> LocatePoseUnifiedResult:
+        external_feature_map = None
+        external_text_embed = None
+        if precomputed_locate_responses is None:
+            responses, external_feature_map, external_text_embed = self.generate_locate_responses(batch, config)
+        else:
+            responses = precomputed_locate_responses
+        target_boxes, target_box_mask, locate_boxes_abs = self.condition_inference_from_locate_responses(
+            responses,
+            batch,
+            config,
+        )
+        outputs, qwen_inputs = self.forward_pose(
+            batch,
+            target_boxes,
+            target_box_mask,
+            config,
+            external_feature_map=external_feature_map,
+            external_text_embed=external_text_embed,
+        )
+        return LocatePoseUnifiedResult(
+            outputs=outputs,
+            target_boxes=target_boxes,
+            target_box_mask=target_box_mask,
+            locate_responses=responses,
+            locate_boxes_abs=locate_boxes_abs,
+            external_feature_map=external_feature_map,
+            external_text_embed=external_text_embed,
+            qwen_inputs=qwen_inputs,
+            used_single_pass_features=external_feature_map is not None and external_text_embed is not None,
+        )
+
+    def prepare_training_conditioning(
+        self,
+        batch: dict,
+        config: LocatePoseUnifiedConfig,
+        *,
+        box_source: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
+        if box_source == "qwen_generate":
+            return prepare_qwen_generated_box_conditioning(
+                self.model,
+                self.processor,
+                batch,
+                self.device,
+                max_instances=config.max_instances,
+                max_new_tokens=config.qwen_box_max_new_tokens,
+                match_iou_thresh=config.box_match_iou_thresh,
+                nms_iou_thresh=config.box_nms_iou_thresh,
+                min_pixels=config.qwen_min_pixels,
+                max_pixels=config.qwen_max_pixels,
+            )
+        if box_source == "locate_generate":
+            return prepare_locate_generated_box_conditioning(
+                self.model,
+                self.processor,
+                batch,
+                self.device,
+                max_instances=config.max_instances,
+                max_new_tokens=config.locate_box_max_new_tokens,
+                generation_mode=config.locate_generation_mode,
+                match_iou_thresh=config.box_match_iou_thresh,
+                nms_iou_thresh=config.box_nms_iou_thresh,
+                min_pixels=config.eagle_min_pixels,
+                max_pixels=config.eagle_max_pixels,
+                image_token_limit=config.eagle_image_token_limit,
+            )
+        return prepare_box_conditioning(
+            batch["targets"],
+            batch["task_ids"],
+            self.device,
+            max_instances=config.max_instances,
+            box_jitter_scale=config.box_jitter_scale,
+            box_jitter_shift=config.box_jitter_shift,
+        )
+
+    def eval_batch(
+        self,
+        batch: dict,
+        config: LocatePoseUnifiedConfig,
+        *,
+        box_source: str,
+        precomputed_locate_responses: list[str] | None = None,
+    ) -> LocatePoseUnifiedResult:
+        _, _, gt_targets_for_eval = prepare_box_conditioning(
+            batch["targets"],
+            batch["task_ids"],
+            self.device,
+            max_instances=config.max_instances,
+        )
+        external_feature_map = None
+        external_text_embed = None
+        responses: list[str] | None = None
+        if box_source == "qwen_generate":
+            target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
+                self.model,
+                self.processor,
+                batch,
+                self.device,
+                max_instances=config.max_instances,
+                max_new_tokens=config.qwen_box_max_new_tokens,
+                match_iou_thresh=config.box_match_iou_thresh,
+                nms_iou_thresh=config.box_nms_iou_thresh,
+                min_pixels=config.qwen_min_pixels,
+                max_pixels=config.qwen_max_pixels,
+                keep_unmatched_predictions=config.keep_unmatched_predictions,
+            )
+        elif box_source == "locate_generate":
+            if precomputed_locate_responses is not None:
+                responses = precomputed_locate_responses
+                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                    responses,
+                    batch,
+                    self.device,
+                    max_instances=config.max_instances,
+                    match_iou_thresh=config.box_match_iou_thresh,
+                    nms_iou_thresh=config.box_nms_iou_thresh,
+                )
+            elif config.use_single_pass_features:
+                responses, external_feature_map, external_text_embed = self.generate_locate_responses(batch, config)
+                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                    responses,
+                    batch,
+                    self.device,
+                    max_instances=config.max_instances,
+                    match_iou_thresh=config.box_match_iou_thresh,
+                    nms_iou_thresh=config.box_nms_iou_thresh,
+                )
+            else:
+                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning(
+                    self.model,
+                    self.processor,
+                    batch,
+                    self.device,
+                    max_instances=config.max_instances,
+                    max_new_tokens=config.locate_box_max_new_tokens,
+                    generation_mode=config.locate_generation_mode,
+                    match_iou_thresh=config.box_match_iou_thresh,
+                    nms_iou_thresh=config.box_nms_iou_thresh,
+                    min_pixels=config.eagle_min_pixels,
+                    max_pixels=config.eagle_max_pixels,
+                    image_token_limit=config.eagle_image_token_limit,
+                )
+        else:
+            target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
+                batch["targets"],
+                batch["task_ids"],
+                self.device,
+                max_instances=config.max_instances,
+                box_jitter_scale=config.box_jitter_scale,
+                box_jitter_shift=config.box_jitter_shift,
+            )
+        outputs, qwen_inputs = self.forward_pose(
+            batch,
+            target_boxes,
+            target_box_mask,
+            config,
+            external_feature_map=external_feature_map,
+            external_text_embed=external_text_embed,
+        )
+        return LocatePoseUnifiedResult(
+            outputs=outputs,
+            target_boxes=target_boxes,
+            target_box_mask=target_box_mask,
+            pose_targets=pose_targets,
+            gt_targets=gt_targets_for_eval,
+            locate_responses=responses,
+            external_feature_map=external_feature_map,
+            external_text_embed=external_text_embed,
+            qwen_inputs=qwen_inputs,
+            used_single_pass_features=external_feature_map is not None and external_text_embed is not None,
+        )
 
 
 def is_main_process() -> bool:
@@ -2272,10 +2758,6 @@ def is_vision_parameter(name: str) -> bool:
     return ".visual." in name or ".vision_model." in name or "qwen_model.visual." in name or "backbone_model.vision_model." in name
 
 
-def is_locate_projector_parameter(name: str) -> bool:
-    return ".mlp1." in name or name.startswith("backbone_model.mlp1.") or name.startswith("qwen_model.mlp1.")
-
-
 def build_optimizer_param_groups(
     model: torch.nn.Module,
     args: argparse.Namespace,
@@ -2284,23 +2766,18 @@ def build_optimizer_param_groups(
         "pose": [],
         "backbone_lora": [],
         "backbone_vision_lora": [],
-        "backbone_projector": [],
     }
     stats: dict[str, list[float]] = {
         "pose": [0, 0],
         "backbone_lora": [0, 0],
         "backbone_vision_lora": [0, 0],
-        "backbone_projector": [0, 0],
     }
     backbone_name = getattr(args, "backbone", "qwen3vl")
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if name.startswith("backbone_model.") or name.startswith("qwen_model."):
-            if backbone_name == "eagle" and is_locate_projector_parameter(name):
-                group_name = "backbone_projector"
-            else:
-                group_name = "backbone_vision_lora" if is_vision_parameter(name) else "backbone_lora"
+            group_name = "backbone_vision_lora" if is_vision_parameter(name) else "backbone_lora"
         else:
             group_name = "pose"
         grouped[group_name].append(param)
@@ -2308,19 +2785,16 @@ def build_optimizer_param_groups(
         stats[group_name][1] += param.numel()
 
     if backbone_name == "eagle":
-        lora_lr_scale = getattr(args, "locate_lr_scale", args.qwen_lora_lr_scale)
+        lora_lr_scale = 1.0
         vision_lr_scale = getattr(args, "locate_vision_scale", args.qwen_vision_lr_scale)
-        projector_lr_scale = getattr(args, "locate_projector_scale", lora_lr_scale)
     else:
         lora_lr_scale = args.qwen_lora_lr_scale
         vision_lr_scale = args.qwen_vision_lr_scale
-        projector_lr_scale = lora_lr_scale
 
     lrs = {
         "pose": args.lr,
         "backbone_lora": args.lr * lora_lr_scale,
         "backbone_vision_lora": args.lr * vision_lr_scale,
-        "backbone_projector": args.lr * projector_lr_scale,
     }
     param_groups = [
         {"params": params, "lr": lrs[name]}
@@ -2794,6 +3268,16 @@ def main() -> None:
             config=ds_config,
         )
         include_optimizer_in_checkpoint = False
+    unified_config = LocatePoseUnifiedConfig.from_args(
+        args,
+        use_single_pass_features=False,
+    )
+    unified_runtime = LocatePoseUnifiedRuntime(
+        active_model,
+        backbone_processor,
+        device,
+        backbone_name=backbone_name,
+    )
     total_epochs = max(int(args.epochs), 1)
     max_steps = int(args.max_steps)
     steps_per_epoch = math.ceil(len(loader) / max(int(args.grad_accum_steps), 1))
@@ -3000,43 +3484,11 @@ def main() -> None:
                 sync_cuda_for_timing(args.sync_timing, device)
                 prep_started = time.perf_counter()
                 batch = move_batch_to_device(batch, device)
-                if args.box_source == "qwen_generate":
-                    target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
-                        active_model,
-                        backbone_processor,
-                        batch,
-                        device,
-                        max_instances=args.max_instances,
-                        max_new_tokens=args.qwen_box_max_new_tokens,
-                        match_iou_thresh=args.box_match_iou_thresh,
-                        nms_iou_thresh=args.box_nms_iou_thresh,
-                        min_pixels=args.qwen_min_pixels,
-                        max_pixels=args.qwen_max_pixels,
-                    )
-                elif args.box_source == "locate_generate":
-                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning(
-                        active_model,
-                        backbone_processor,
-                        batch,
-                        device,
-                        max_instances=args.max_instances,
-                        max_new_tokens=args.locate_box_max_new_tokens,
-                        generation_mode=args.locate_generation_mode,
-                        match_iou_thresh=args.box_match_iou_thresh,
-                        nms_iou_thresh=args.box_nms_iou_thresh,
-                        min_pixels=args.eagle_min_pixels,
-                        max_pixels=args.eagle_max_pixels,
-                        image_token_limit=args.eagle_image_token_limit,
-                    )
-                else:
-                    target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
-                        batch["targets"],
-                        batch["task_ids"],
-                        device,
-                        max_instances=args.max_instances,
-                        box_jitter_scale=args.box_jitter_scale,
-                        box_jitter_shift=args.box_jitter_shift,
-                    )
+                target_boxes, target_box_mask, pose_targets = unified_runtime.prepare_training_conditioning(
+                    batch,
+                    unified_config,
+                    box_source=args.box_source,
+                )
                 if backbone_processor is None:
                     qwen_inputs = None
                 elif backbone_name == "eagle":

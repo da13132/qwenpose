@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 try:
     from tqdm.auto import tqdm
@@ -20,26 +20,26 @@ from qwenpose.losses import LossWeights, compute_pose_losses
 from qwenpose.model import QwenPoseConfig, QwenPoseModel
 from qwenpose.qwen_lora import (
     QwenLoRAConfig,
-    build_qwen_inputs,
     load_qwen_model,
     load_qwen_with_lora,
     qwen_hidden_size,
 )
 from qwenpose.eagle_lora import (
     EagleLoRAConfig,
-    build_eagle_inputs,
     load_eagle_with_lora,
     eagle_hidden_size,
 )
 from qwenpose.schemas import SCHEMA_INDICES, SCHEMA_KEYPOINTS, UNION_KEYPOINTS
+from qwenpose.metrics import compute_pose_metrics_from_targets
 from qwenpose.train_pose import (
     CHECKPOINT_PAYLOAD_NAME,
+    LocatePoseUnifiedConfig,
+    LocatePoseUnifiedRuntime,
     QwenPoseTrainingModel,
     checkpoint_step,
     move_batch_to_device,
     prepare_box_conditioning,
-    prepare_locate_generated_box_conditioning,
-    prepare_qwen_generated_box_conditioning,
+    prepare_locate_generated_box_conditioning_from_responses,
     save_pose_visualization,
 )
 
@@ -291,6 +291,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
     parser.add_argument("--locate_box_max_new_tokens", type=int, default=8192)
     parser.add_argument("--locate_generation_mode", choices=["fast", "slow", "hybrid"], default="hybrid")
+    parser.add_argument("--locate_generation_backend", choices=["transformers", "vllm", "auto"], default="transformers")
+    parser.add_argument("--single_pass_prompt", choices=["locate", "pose"], default="locate")
+    parser.add_argument("--disable_single_pass_features", action="store_true")
+    parser.add_argument("--disable_vllm_fallback", action="store_true")
+    parser.add_argument("--gpu", type=str, default="")
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85)
+    parser.add_argument("--vllm_cpu_offload_gb", type=float, default=0.0)
+    parser.add_argument("--vllm_enforce_eager", action="store_true")
+    parser.add_argument("--vllm_max_model_len", type=int, default=0)
+    parser.add_argument("--vllm_batch_size", type=int, default=0)
+    parser.add_argument("--vllm_max_num_seqs", type=int, default=0)
+    parser.add_argument("--vllm_max_num_batched_tokens", type=int, default=0)
+    parser.add_argument("--vllm_model_impl", choices=["auto", "transformers", "vllm"], default="auto")
+    parser.add_argument("--vllm_lora_adapter", type=str, default="auto")
+    parser.add_argument("--vllm_max_lora_rank", type=int, default=64)
+    parser.add_argument("--vllm_trust_remote_code", action="store_true", default=True)
+    parser.add_argument("--no_vllm_trust_remote_code", dest="vllm_trust_remote_code", action="store_false")
     parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
     parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
     parser.add_argument("--disable_refinement", action="store_true")
@@ -301,8 +319,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize_max_samples", type=int, default=100)
     parser.add_argument("--visualize_max_instances", type=int, default=8)
 
-    parser.add_argument("--w_oks", type=float, default=0.2)
-    parser.add_argument("--w_coord", type=float, default=5.0)
+    parser.add_argument("--w_oks", type=float, default=0.5)
+    parser.add_argument("--w_coord", type=float, default=3.0)
     parser.add_argument("--w_vis", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
@@ -521,6 +539,32 @@ def tensor_to_prediction_rows(outputs: dict[str, torch.Tensor], batch: dict, arg
     return rows
 
 
+def target_to_metric_target(target: dict) -> dict:
+    """Detach target tensors before keeping them for end-of-run metrics."""
+    copied = dict(target)
+    for key in ("boxes", "keypoints", "keypoint_valid", "ref_target"):
+        value = copied.get(key)
+        if isinstance(value, torch.Tensor):
+            copied[key] = value.detach().cpu()
+    return copied
+
+
+def dataset_records_in_order(dataset) -> list:
+    if hasattr(dataset, "records"):
+        return list(dataset.records)
+    if isinstance(dataset, ConcatDataset):
+        records = []
+        for child in dataset.datasets:
+            records.extend(dataset_records_in_order(child))
+        return records
+    if hasattr(dataset, "datasets"):
+        records = []
+        for child in dataset.datasets:
+            records.extend(dataset_records_in_order(child))
+        return records
+    raise TypeError(f"Cannot extract PoseRecord list from dataset type {type(dataset).__name__}")
+
+
 def main() -> None:
     args = parse_args()
     if args.backbone == "locatepose":
@@ -549,6 +593,18 @@ def main() -> None:
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
     if args.box_source == "locate_generate" and args.backbone != "eagle":
         raise ValueError("--box_source=locate_generate currently requires --backbone eagle/locatepose.")
+    if args.vllm_tensor_parallel_size <= 0:
+        raise ValueError("--vllm_tensor_parallel_size must be positive.")
+    if not 0.0 < args.vllm_gpu_memory_utilization <= 1.0:
+        raise ValueError("--vllm_gpu_memory_utilization must be in (0, 1].")
+    if args.vllm_batch_size <= 0:
+        args.vllm_batch_size = int(args.batch_size)
+    if args.vllm_max_num_seqs <= 0:
+        args.vllm_max_num_seqs = int(args.vllm_batch_size)
+    if args.vllm_max_num_batched_tokens <= 0:
+        args.vllm_max_num_batched_tokens = int(args.vllm_max_model_len) if int(args.vllm_max_model_len) > 0 else 2048
+    if args.vllm_max_lora_rank <= 0:
+        raise ValueError("--vllm_max_lora_rank must be positive.")
     if args.qwen_min_pixels is not None and args.qwen_min_pixels <= 0:
         raise ValueError("--qwen_min_pixels must be positive when set.")
     if args.qwen_max_pixels is not None and args.qwen_max_pixels <= 0:
@@ -589,6 +645,30 @@ def main() -> None:
         disable_record_cache=args.disable_record_cache,
         show_progress=not args.disable_progress,
     )
+    records_in_order = dataset_records_in_order(dataset)
+    backend = str(args.locate_generation_backend or "transformers").lower()
+    use_vllm_integrated = args.box_source == "locate_generate" and backend == "vllm"
+    vllm_generator = None
+    if use_vllm_integrated:
+        print(
+            "[Locate generation] backend=vllm integrated: LocateAnything+PoseHead in the custom vLLM model.",
+            flush=True,
+        )
+        from qwenpose.infer_locatepose import VLLMLocateBBoxGenerator, apply_gpu_selection
+
+        apply_gpu_selection(args)
+        try:
+            vllm_generator = VLLMLocateBBoxGenerator(args, checkpoint_path)
+        except Exception as exc:
+            if args.disable_vllm_fallback:
+                raise
+            print(
+                "[Locate generation] integrated vLLM failed during initialization; falling back to transformers. "
+                f"Reason: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            use_vllm_integrated = False
+            backend = "transformers"
     loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": False,
@@ -601,7 +681,34 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
     loader = DataLoader(dataset, **loader_kwargs)
-    model, backbone_processor = load_eval_model(args, checkpoint, device)
+    model = None
+    backbone_processor = None
+    if not use_vllm_integrated:
+        model, backbone_processor = load_eval_model(args, checkpoint, device)
+    use_single_pass_features = (
+        args.box_source == "locate_generate"
+        and not use_vllm_integrated
+        and backend in {"transformers", "auto"}
+        and not args.disable_single_pass_features
+    )
+    if use_single_pass_features:
+        print(
+            f"[Locate generation] transformers single-pass features enabled; prompt={args.single_pass_prompt}",
+            flush=True,
+        )
+    unified_config = LocatePoseUnifiedConfig.from_args(
+        args,
+        use_single_pass_features=use_single_pass_features,
+        keep_unmatched_predictions=True,
+    )
+    unified_runtime = None
+    if not use_vllm_integrated:
+        unified_runtime = LocatePoseUnifiedRuntime(
+            model,
+            backbone_processor,
+            device,
+            backbone_name=args.backbone,
+        )
     weights = LossWeights(
         oks=args.w_oks,
         coord=args.w_coord,
@@ -625,202 +732,151 @@ def main() -> None:
     # Per-dataset tracking
     dataset_gt: dict[str, list[dict]] = defaultdict(list)
     dataset_preds: dict[str, list[dict]] = defaultdict(list)
+    actual_single_pass_features_used = False
+    actual_vllm_integrated_features_used = False
+    response_offset = 0
 
-    with predictions_path.open("w", encoding="utf-8") as f:
-        with torch.inference_mode():
-            progress_bar = None
-            if not args.disable_progress and tqdm is not None:
-                progress_bar = tqdm(
-                    total=len(loader),
-                    desc=f"eval {args.split}",
-                    unit="batch",
-                    dynamic_ncols=True,
-                    mininterval=1.0,
-                )
-            last_iter_end = time.perf_counter()
-            for batch in loader:
-                batch_ready = time.perf_counter()
-                data_time = batch_ready - last_iter_end
-                prep_started = time.perf_counter()
-                batch = move_batch_to_device(batch, device)
-                _, _, gt_targets_for_eval = prepare_box_conditioning(
-                    batch["targets"],
-                    batch["task_ids"],
-                    device,
-                    max_instances=args.max_instances,
-                )
-                if args.box_source == "qwen_generate":
-                    target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
-                        model,
-                        backbone_processor,
-                        batch,
-                        device,
-                        max_instances=args.max_instances,
-                        max_new_tokens=args.qwen_box_max_new_tokens,
-                        match_iou_thresh=args.box_match_iou_thresh,
-                        nms_iou_thresh=args.box_nms_iou_thresh,
-                        min_pixels=args.qwen_min_pixels,
-                        max_pixels=args.qwen_max_pixels,
-                        keep_unmatched_predictions=True,
+    try:
+        with predictions_path.open("w", encoding="utf-8") as f:
+            with torch.inference_mode():
+                progress_bar = None
+                if not args.disable_progress and tqdm is not None:
+                    progress_bar = tqdm(
+                        total=len(loader),
+                        desc=f"eval {args.split}",
+                        unit="batch",
+                        dynamic_ncols=True,
+                        mininterval=1.0,
                     )
-                elif args.box_source == "locate_generate":
-                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning(
-                        model,
-                        backbone_processor,
-                        batch,
-                        device,
-                        max_instances=args.max_instances,
-                        max_new_tokens=args.locate_box_max_new_tokens,
-                        generation_mode=args.locate_generation_mode,
-                        match_iou_thresh=args.box_match_iou_thresh,
-                        nms_iou_thresh=args.box_nms_iou_thresh,
-                        min_pixels=args.eagle_min_pixels,
-                        max_pixels=args.eagle_max_pixels,
-                        image_token_limit=args.eagle_image_token_limit,
-                    )
-                else:
-                    target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
-                        batch["targets"],
-                        batch["task_ids"],
-                        device,
-                        max_instances=args.max_instances,
-                    )
-                backbone_name = getattr(args, "backbone", "qwen3vl")
-                if backbone_processor is None:
-                    qwen_inputs = None
-                elif backbone_name == "eagle":
-                    qwen_inputs = build_eagle_inputs(
-                        backbone_processor,
-                        batch["image_paths"],
-                        batch["prompts"],
-                        device,
-                        min_pixels=args.eagle_min_pixels,
-                        max_pixels=args.eagle_max_pixels,
-                        image_token_limit=args.eagle_image_token_limit,
-                    )
-                else:
-                    qwen_inputs = build_qwen_inputs(
-                        backbone_processor,
-                        batch["image_paths"],
-                        batch["prompts"],
-                        device,
-                        min_pixels=args.qwen_min_pixels,
-                        max_pixels=args.qwen_max_pixels,
-                    )
-                prep_time = time.perf_counter() - prep_started
-                forward_started = time.perf_counter()
-                outputs = model(
-                    schema_ids=batch["schema_ids"],
-                    task_ids=batch["task_ids"],
-                    qwen_inputs=qwen_inputs,
-                    target_boxes=target_boxes,
-                    target_box_mask=target_box_mask,
-                    images=batch.get("images"),
-                )
-                _, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
-                forward_time = time.perf_counter() - forward_started
-                for key, value in loss_dict.items():
-                    totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
-
-                rows = tensor_to_prediction_rows(outputs, {**batch, "targets": gt_targets_for_eval}, args)
-                for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    # Collect full task GT for AP. In qwen_generate mode pose_targets only contains
-                    # matched predictions, so using it here would hide missed people and inflate AP.
-                    ds_name = row.get("dataset", "unknown")
-                    target_for_gt = {
-                        "image_id": row["image_id"],
-                        "width": 0,
-                        "height": 0,
-                        "boxes": torch.zeros(0, 4),
-                        "keypoints": torch.zeros(0, len(UNION_KEYPOINTS), 3),
-                        "keypoint_valid": torch.zeros(0, len(UNION_KEYPOINTS), dtype=torch.bool),
-                    }
-                    for gt_target in gt_targets_for_eval:
-                        if str(gt_target["image_id"]) == str(row["image_id"]):
-                            target_for_gt = gt_target
-                            break
-                    all_gt_targets.append(target_for_gt)
-                    dataset_gt[ds_name].append(target_for_gt)
-                    all_predictions_rows.append(row)
-                    dataset_preds[ds_name].append(row)
-
-                if args.visualize_max_samples > 0 and visualized_samples < args.visualize_max_samples:
-                    eval_batch = {**batch, "targets": pose_targets}
-                    batch_size = len(batch["schema_ids"])
-                    for local_idx in range(batch_size):
-                        if visualized_samples >= args.visualize_max_samples:
-                            break
-                        vis_path = visualization_dir / f"eval_{samples + local_idx:06d}.jpg"
-                        save_pose_visualization(
-                            outputs,
-                            eval_batch,
-                            vis_path,
-                            sample_idx=local_idx,
-                            max_instances=args.visualize_max_instances,
-                        )
-                        visualized_samples += 1
-                batches += 1
-                samples += len(batch["schema_ids"])
                 last_iter_end = time.perf_counter()
-                if progress_bar is not None:
-                    progress_bar.set_postfix(
-                        {
-                            "loss": f"{float(loss_dict['loss_total'].detach().cpu()):.3f}",
-                            "samples": samples,
-                            "data": f"{data_time:.2f}s",
-                            "prep": f"{prep_time:.2f}s",
-                            "fwd": f"{forward_time:.2f}s",
-                        },
-                        refresh=False,
-                    )
-                    progress_bar.update(1)
-            if progress_bar is not None:
-                progress_bar.close()
+                for batch in loader:
+                    batch_ready = time.perf_counter()
+                    data_time = batch_ready - last_iter_end
+                    prep_started = time.perf_counter()
+                    batch = move_batch_to_device(batch, device)
+                    prep_time = time.perf_counter() - prep_started
+                    forward_started = time.perf_counter()
+                    if use_vllm_integrated:
+                        if vllm_generator is None:
+                            raise RuntimeError("Integrated vLLM generator is not initialized.")
+                        from qwenpose.infer_locatepose import validate_vllm_locate_responses
 
-    # ── Compute COCO keypoint AP metrics ──────────────────────────────────
+                        batch_count = len(batch["image_paths"])
+                        records_for_batch = records_in_order[response_offset : response_offset + batch_count]
+                        response_offset += batch_count
+                        responses, feature_map, text_embed = vllm_generator.generate_with_features(records_for_batch)
+                        validate_vllm_locate_responses(records_for_batch, responses)
+                        _, _, gt_targets_for_eval = prepare_box_conditioning(
+                            batch["targets"],
+                            batch["task_ids"],
+                            device,
+                            max_instances=unified_config.max_instances,
+                        )
+                        target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                            responses,
+                            batch,
+                            device,
+                            max_instances=unified_config.max_instances,
+                            match_iou_thresh=unified_config.box_match_iou_thresh,
+                            nms_iou_thresh=unified_config.box_nms_iou_thresh,
+                        )
+                        outputs = vllm_generator.run_pose(
+                            batch,
+                            target_boxes,
+                            target_box_mask,
+                            feature_map,
+                            text_embed,
+                        )
+                        actual_vllm_integrated_features_used = True
+                    else:
+                        if unified_runtime is None:
+                            raise RuntimeError("LocatePose runtime is not initialized.")
+                        unified_result = unified_runtime.eval_batch(
+                            batch,
+                            unified_config,
+                            box_source=args.box_source,
+                        )
+                        outputs = unified_result.outputs
+                        pose_targets = unified_result.pose_targets or batch["targets"]
+                        gt_targets_for_eval = unified_result.gt_targets or pose_targets
+                        actual_single_pass_features_used = (
+                            actual_single_pass_features_used or unified_result.used_single_pass_features
+                        )
+                    _, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
+                    forward_time = time.perf_counter() - forward_started
+                    for key, value in loss_dict.items():
+                        totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
+
+                    rows = tensor_to_prediction_rows(outputs, {**batch, "targets": gt_targets_for_eval}, args)
+                    for local_idx, row in enumerate(rows):
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        ds_name = row.get("dataset", "unknown")
+                        target_for_gt = gt_targets_for_eval[local_idx] if local_idx < len(gt_targets_for_eval) else {
+                            "dataset": ds_name,
+                            "image_id": row["image_id"],
+                            "schema": row.get("schema", ""),
+                            "width": row.get("width", 0),
+                            "height": row.get("height", 0),
+                            "boxes": torch.zeros(0, 4),
+                            "keypoints": torch.zeros(0, len(UNION_KEYPOINTS), 3),
+                            "keypoint_valid": torch.zeros(0, len(UNION_KEYPOINTS), dtype=torch.bool),
+                        }
+                        target_for_gt = target_to_metric_target(target_for_gt)
+                        all_gt_targets.append(target_for_gt)
+                        dataset_gt[ds_name].append(target_for_gt)
+                        all_predictions_rows.append(row)
+                        dataset_preds[ds_name].append(row)
+
+                    if args.visualize_max_samples > 0 and visualized_samples < args.visualize_max_samples:
+                        eval_batch = {**batch, "targets": pose_targets}
+                        batch_size = len(batch["schema_ids"])
+                        for local_idx in range(batch_size):
+                            if visualized_samples >= args.visualize_max_samples:
+                                break
+                            vis_path = visualization_dir / f"eval_{samples + local_idx:06d}.jpg"
+                            save_pose_visualization(
+                                outputs,
+                                eval_batch,
+                                vis_path,
+                                sample_idx=local_idx,
+                                max_instances=args.visualize_max_instances,
+                            )
+                            visualized_samples += 1
+                    batches += 1
+                    samples += len(batch["schema_ids"])
+                    last_iter_end = time.perf_counter()
+                    if progress_bar is not None:
+                        progress_bar.set_postfix(
+                            {
+                                "loss": f"{float(loss_dict['loss_total'].detach().cpu()):.3f}",
+                                "samples": samples,
+                                "data": f"{data_time:.2f}s",
+                                "prep": f"{prep_time:.2f}s",
+                                "fwd": f"{forward_time:.2f}s",
+                            },
+                            refresh=False,
+                        )
+                        progress_bar.update(1)
+                if progress_bar is not None:
+                    progress_bar.close()
+    finally:
+        if vllm_generator is not None:
+            vllm_generator.close()
+
+    # ── Compute dataset-specific pose metrics ─────────────────────────────
     print("\n" + "=" * 60)
-    print("Computing COCO keypoint AP metrics...")
+    print("Computing dataset-specific pose metrics...")
     print("=" * 60)
 
-    ap_metrics_all: dict[str, float] = {}
-    ap_metrics_per_dataset: dict[str, dict[str, float]] = {}
-
-    # Overall AP
-    if all_gt_targets and all_predictions_rows:
-        coco_gt_dict, id_map = build_coco_gt_annotations(all_gt_targets)
-        coco_results = predictions_to_coco_results(all_predictions_rows, id_map)
-        if coco_results:
-            print(f"\n[Overall] {len(coco_gt_dict['annotations'])} GT annotations, {len(coco_results)} predictions")
-            ap_metrics_all = compute_coco_keypoint_ap(coco_gt_dict, coco_results)
-            print(f"\nOverall AP metrics:")
-            for k, v in ap_metrics_all.items():
-                print(f"  {k}: {v:.4f}")
-        else:
-            print("[Overall] No valid predictions to evaluate.")
-    else:
-        print("[Overall] No GT or predictions collected.")
-
-    # Per-dataset AP
-    for ds_name in sorted(dataset_gt.keys()):
-        gt_list = dataset_gt[ds_name]
-        pred_list = dataset_preds[ds_name]
-        if gt_list and pred_list:
-            coco_gt_dict, id_map = build_coco_gt_annotations(gt_list)
-            coco_results = predictions_to_coco_results(pred_list, id_map)
-            if coco_results:
-                print(f"\n[{ds_name}] {len(coco_gt_dict['annotations'])} GT annotations, {len(coco_results)} predictions")
-                ds_metrics = compute_coco_keypoint_ap(coco_gt_dict, coco_results)
-                ap_metrics_per_dataset[ds_name] = ds_metrics
-                print(f"\n{ds_name} AP metrics:")
-                for k, v in ds_metrics.items():
-                    print(f"  {k}: {v:.4f}")
-            else:
-                print(f"[{ds_name}] No valid predictions.")
-                ap_metrics_per_dataset[ds_name] = {}
-        else:
-            print(f"[{ds_name}] No GT or predictions.")
-            ap_metrics_per_dataset[ds_name] = {}
+    pose_metrics = compute_pose_metrics_from_targets(
+        all_predictions_rows,
+        all_gt_targets,
+        dataset_root=args.dataset_root,
+        split=args.split,
+    )
+    ap_metrics_all = pose_metrics.get("overall_ap", {})
+    ap_metrics_per_dataset = pose_metrics.get("per_dataset", {})
+    print(json.dumps(pose_metrics, ensure_ascii=False, indent=2))
 
     # ── Export predictions JSON ────────────────────────────────────────────
     predictions_json_path = args.output_dir / "predictions.json"
@@ -834,11 +890,16 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "backbone": args.backbone,
         "box_source": args.box_source,
+        "locate_generation_backend": args.locate_generation_backend,
+        "vllm_integrated_features_used": actual_vllm_integrated_features_used,
+        "single_pass_features_used": actual_single_pass_features_used,
+        "single_pass_prompt": args.single_pass_prompt,
         "datasets": dataset_names,
         "split": args.split,
         "samples": samples,
         "batches": batches,
         "avg_losses": {key: value / max(batches, 1) for key, value in totals.items()},
+        "pose_metrics": pose_metrics,
         "ap_metrics": ap_metrics_all,
         "ap_metrics_per_dataset": ap_metrics_per_dataset,
         "predictions_jsonl": str(predictions_path),
@@ -855,6 +916,10 @@ def main() -> None:
         f"- checkpoint: `{checkpoint_path}`",
         f"- backbone: `{args.backbone}`",
         f"- box_source: `{args.box_source}`",
+        f"- locate_generation_backend: `{args.locate_generation_backend}`",
+        f"- vllm_integrated_features_used: `{actual_vllm_integrated_features_used}`",
+        f"- single_pass_features_used: `{actual_single_pass_features_used}`",
+        f"- single_pass_prompt: `{args.single_pass_prompt}`",
         f"- datasets: `{','.join(dataset_names)}`",
         f"- split: `{args.split}`",
         f"- samples: `{samples}`",
@@ -866,22 +931,28 @@ def main() -> None:
     for key, value in summary["avg_losses"].items():
         report.append(f"- `{key}`: {value:.6f}")
 
-    report.extend(["", "## COCO Keypoint AP (Overall)", ""])
+    report.extend(["", "## Pose Metrics (Overall AP Datasets)", ""])
     if ap_metrics_all:
         report.append("| Metric | Value |")
         report.append("|--------|-------|")
         for k, v in ap_metrics_all.items():
-            report.append(f"| {k} | {v:.4f} |")
+            if isinstance(v, (int, float)):
+                report.append(f"| {k} | {float(v):.4f} |")
     else:
         report.append("No metrics available.")
 
     for ds_name, ds_metrics in sorted(ap_metrics_per_dataset.items()):
-        report.extend(["", f"## COCO Keypoint AP ({ds_name})", ""])
+        report.extend(["", f"## Pose Metrics ({ds_name})", ""])
         if ds_metrics:
             report.append("| Metric | Value |")
             report.append("|--------|-------|")
             for k, v in ds_metrics.items():
-                report.append(f"| {k} | {v:.4f} |")
+                if isinstance(v, (int, float)):
+                    report.append(f"| {k} | {float(v):.4f} |")
+            if isinstance(ds_metrics.get("per_joint"), dict):
+                report.extend(["", "| Joint | PCKh |", "|-------|------|"])
+                for joint, value in ds_metrics["per_joint"].items():
+                    report.append(f"| {joint} | {float(value):.4f} |")
         else:
             report.append("No metrics available.")
 

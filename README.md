@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v1.0`
+Release: `v1.1`
 
 English | [中文说明](README_zh.md)
 
@@ -15,10 +15,12 @@ The public documentation below is ordered in the same way: shared setup first, `
 
 - `scripts/locatepose.sh`: main two-stage LocatePose training entrypoint
 - `scripts/eval_locatepose.sh`: LocatePose evaluation entrypoint
+- `scripts/infer_locatepose.sh`: LocatePose image, folder, and RefHuman inference entrypoint
 - `scripts/train_qwenpose_two_stage.sh`: main two-stage QwenPose training entrypoint
 - `scripts/eval_qwenpose.sh`: QwenPose evaluation entrypoint
 - `scripts/zero2.json`, `scripts/zero3.json`, `scripts/zero3_offload.json`: DeepSpeed presets used by both workflows
-- `src/qwenpose/`: datasets, pose model, training loop, evaluation, checkpointing, and backbone adapters
+- `requirements-vllm.txt`: optional add-on dependency pin for integrated LocatePose vLLM inference/evaluation
+- `src/qwenpose/`: datasets, pose model, training loop, evaluation, inference, scoring, checkpointing, and backbone adapters
 
 ## Repository Layout
 
@@ -30,9 +32,11 @@ qwenpose/
 ├── VERSION
 ├── requirements.txt
 ├── requirements-cu126.txt
+├── requirements-vllm.txt
 ├── scripts/
 │   ├── eval_locatepose.sh
 │   ├── eval_qwenpose.sh
+│   ├── infer_locatepose.sh
 │   ├── locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
@@ -43,12 +47,17 @@ qwenpose/
         ├── data.py
         ├── eagle_lora.py
         ├── eval_pose.py
+        ├── infer_locatepose.py
         ├── losses.py
         ├── merge_full_weights.py
+        ├── metrics.py
         ├── model.py
         ├── qwen_lora.py
+        ├── score_pose_predictions.py
         ├── schemas.py
-        └── train_pose.py
+        ├── train_pose.py
+        ├── vllm_locateanything.py
+        └── vllm_locateanything_model.py
 ```
 
 ## Runtime Directory Convention
@@ -66,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v1.0` snapshot was validated with:
+This `v1.1` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -74,6 +83,7 @@ This `v1.0` snapshot was validated with:
 - TorchVision `0.23.0`
 - TorchAudio `2.8.0`
 - Transformers `4.57.6`
+- vLLM `0.11.0` for the integrated LocatePose inference/evaluation path
 - FlashAttention `2.8.3`
 - DeepSpeed `0.17.1`
 - Accelerate `1.7.0`
@@ -92,6 +102,7 @@ Pinned dependency files:
 
 - `requirements.txt`: runtime dependency pins for custom CUDA setups
 - `requirements-cu126.txt`: exact tested target for Linux + Python 3.11 + CUDA 12.6
+- `requirements-vllm.txt`: optional add-on pin for integrated LocatePose `vllm` inference/evaluation
 
 ## Installation
 
@@ -117,6 +128,14 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
 pip install -r requirements.txt
 ```
 
+### Option C: optional vLLM add-on for integrated LocatePose eval/inference
+
+Install this after either option A or option B when you want the default integrated LocatePose `vllm` path:
+
+```bash
+pip install -r requirements-vllm.txt
+```
+
 If `flash-attn` is unavailable on your platform, install the rest of the stack and switch the attention backend at runtime:
 
 ```bash
@@ -125,6 +144,12 @@ QWEN_ATTN_IMPLEMENTATION=sdpa
 ```
 
 All shell entrypoints prefer `envs/qwenpose/bin/python` and `envs/qwenpose/bin/torchrun` when those paths exist locally.
+
+If you do not install `vllm`, keep LocatePose evaluation and inference on the pure Transformers path:
+
+```bash
+LOCATE_GENERATION_BACKEND=transformers
+```
 
 ## Base Model Download
 
@@ -182,7 +207,7 @@ The public code supports `coco`, `aic`, `mpii`, `crowdpose`, and `refhuman`.
 
 Important defaults:
 
-- `LocatePose` stage 1 uses `coco` by default
+- `LocatePose` stage 1 uses `crowdpose` by default
 - `LocatePose` stage 2 uses `coco,mpii,crowdpose,refhuman` by default
 - `QwenPose` stage 1 and stage 2 use `coco` by default
 - `AIC` is supported by the loader, but it is not enabled in the default public training recipes
@@ -304,17 +329,23 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `coco` | `30` |
-| stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA, vision LoRA, projector | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `12` |
+| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `crowdpose` | `80` |
+| stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA and vision LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
 Additional default knobs:
 
-- `STAGE1_BATCH_SIZE=16`
+- `CUDA_VISIBLE_DEVICES=0,1,2,3`
+- `NPROC_PER_NODE=4`
+- `STAGE1_BATCH_SIZE=8`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=8`
 - `STAGE1_LR=2e-4`
 - `STAGE2_LR=5e-5`
+- `STAGE1_BOX_JITTER_SCALE=0.1`
+- `STAGE1_BOX_JITTER_SHIFT=0.1`
+- `W_OKS=0.5`
+- `W_COORD=3.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
@@ -329,11 +360,12 @@ Start a new run:
 bash scripts/locatepose.sh
 ```
 
-Example with explicit run name and 8 GPUs:
+Example with explicit run name and 4 GPUs:
 
 ```bash
-RUN_NAME=locatepose_v1 \
-NPROC_PER_NODE=8 \
+RUN_NAME=locatepose_v1_1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -357,8 +389,11 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `OUTPUT_ROOT`: training root, default `outputs/locatepose`
 - `ZERO_STAGE`: one of `zero2`, `zero3`, `zero3_offload`, or `none`
 - `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
+- `STAGE1_BOX_JITTER_SCALE`, `STAGE1_BOX_JITTER_SHIFT`: stage-1 GT-box perturbation knobs
+- `LOCATE_ATTN_IMPLEMENTATION`: LocateAnything attention backend used during training, default `flash_attention_2`
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
 - `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
+- `LOCATE_VISION_SCALE`: learning-rate multiplier for Locate vision LoRA parameters
 - `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
 - `MERGE_FINAL_WEIGHTS`: currently does not produce a full merged LocateAnything checkpoint in this public script
 
@@ -369,6 +404,8 @@ Evaluate the latest LocatePose run:
 ```bash
 bash scripts/eval_locatepose.sh
 ```
+
+By default, `scripts/eval_locatepose.sh` uses `LOCATE_GENERATION_BACKEND=vllm`, which runs LocateAnything box generation and PoseHead feature reuse inside the integrated custom vLLM path.
 
 Evaluate a specific checkpoint or stage directory:
 
@@ -389,6 +426,12 @@ Evaluate the GT-box upper bound instead of the closed-loop generated-box path:
 BOX_SOURCE=gt bash scripts/eval_locatepose.sh
 ```
 
+Run the same evaluation without `vllm`:
+
+```bash
+LOCATE_GENERATION_BACKEND=transformers bash scripts/eval_locatepose.sh
+```
+
 Outputs are written to:
 
 ```text
@@ -396,6 +439,50 @@ outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/
 ```
 
 The evaluation directory contains `summary.json`, `predictions.jsonl`, `predictions.json`, `report.md`, and optional visualizations.
+
+### Infer LocatePose
+
+Run image or folder inference from a trained LocatePose checkpoint:
+
+```bash
+bash scripts/infer_locatepose.sh \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --input demo/images \
+  --format coco
+```
+
+Run the same inference without `vllm`:
+
+```bash
+LOCATE_GENERATION_BACKEND=transformers \
+bash scripts/infer_locatepose.sh \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --input demo/images \
+  --format crowdpose
+```
+
+RefHuman caption-conditioned inference example:
+
+```bash
+bash scripts/infer_locatepose.sh \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --input datasets/refhuman \
+  --format refhuman \
+  --split val
+```
+
+The inference directory writes `summary.json`, `predictions.jsonl`, `predictions.json`, optional format-specific exports, `manifest.json`, and visualizations.
+
+### Score Exported Predictions
+
+Rescore a saved LocatePose or QwenPose prediction file against the dataset annotations:
+
+```bash
+PYTHONPATH=src python -m qwenpose.score_pose_predictions \
+  --predictions outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/predictions.jsonl \
+  --dataset_root datasets \
+  --split val
+```
 
 ## QwenPose
 
@@ -513,6 +600,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v1.0`
+- Git tags such as `v1.1`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

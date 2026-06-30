@@ -16,6 +16,7 @@ Key interface details from modeling_locateanything.py:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 from pathlib import Path
 import types
 
@@ -467,6 +468,33 @@ class EagleFeatureExtractor(nn.Module):
             lm.train()
         return lm_outputs.hidden_states[-1]
 
+    def run_language_prefill(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        projected_visual_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, object]:
+        base = get_eagle_base_model(self.eagle_model)
+        image_token_id = int(base.image_token_index)
+        lm = base.language_model
+        self._ensure_safe_image_processing(lm)
+        was_training = lm.training
+        lm.eval()
+        lm_outputs = lm(
+            input_ids=input_ids,
+            visual_features=projected_visual_tokens,
+            image_token_index=image_token_id,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        if was_training:
+            lm.train()
+        past_key_values = lm_outputs.past_key_values
+        if hasattr(past_key_values, "to_legacy_cache"):
+            past_key_values = past_key_values.to_legacy_cache()
+        return lm_outputs.hidden_states[-1], past_key_values
+
     def build_feature_maps(
         self,
         input_ids: torch.Tensor,
@@ -550,6 +578,196 @@ class EagleFeatureExtractor(nn.Module):
         fused_delta = self.dual_feature_fuse(torch.cat([raw_maps, lm_maps], dim=1))
         gate = torch.sigmoid(self.dual_feature_gate).to(device=fused_delta.device, dtype=fused_delta.dtype)
         return lm_maps + gate * fused_delta
+
+    @staticmethod
+    def _cache_seq_len(past_key_values: object) -> int:
+        if hasattr(past_key_values, "get_seq_length"):
+            return int(past_key_values.get_seq_length())
+        return int(past_key_values[0][0].size(2))  # type: ignore[index]
+
+    @staticmethod
+    def _truncate_legacy_cache(past_key_values: object, length: int) -> object:
+        if hasattr(past_key_values, "to_legacy_cache"):
+            past_key_values = past_key_values.to_legacy_cache()
+        return tuple(
+            (kv[0][:, :, :length, :], kv[1][:, :, :length, :])
+            for kv in past_key_values  # type: ignore[union-attr]
+        )
+
+    def generate_response_with_cached_features(
+        self,
+        eagle_inputs: dict[str, torch.Tensor],
+        tokenizer,
+        *,
+        max_new_tokens: int,
+        generation_mode: str = "hybrid",
+        n_future_tokens: int = 6,
+        **generate_kwargs,
+    ) -> tuple[str, torch.Tensor, torch.Tensor]:
+        """Generate LocateAnything text while reusing the prompt prefill features.
+
+        This mirrors LocateAnythingForConditionalGeneration.generate(), but the
+        prompt prefill is run once with output_hidden_states=True. The same hidden
+        states become the PoseHead visual/text features, and the returned KV cache
+        is used to continue box generation without a second LocateAnything pass.
+        """
+        base = get_eagle_base_model(self.eagle_model)
+        token_ids = getattr(base, "token_ids", None)
+        generate_globals = getattr(base.generate, "__globals__", {})
+        sample_tokens = generate_globals.get("sample_tokens")
+        handle_pattern = generate_globals.get("handle_pattern")
+        get_token_ids = generate_globals.get("get_token_ids_from_config")
+        module_name = getattr(type(base), "__module__", "")
+        if sample_tokens is None or handle_pattern is None or get_token_ids is None:
+            try:
+                modeling_module = importlib.import_module(module_name)
+                sample_tokens = sample_tokens or getattr(modeling_module, "sample_tokens", None)
+                handle_pattern = handle_pattern or getattr(modeling_module, "handle_pattern", None)
+                get_token_ids = get_token_ids or getattr(modeling_module, "get_token_ids_from_config", None)
+            except Exception:
+                pass
+        if (sample_tokens is None or handle_pattern is None or get_token_ids is None) and "." in module_name:
+            try:
+                generate_utils_module = importlib.import_module(module_name.rsplit(".", 1)[0] + ".generate_utils")
+                sample_tokens = sample_tokens or getattr(generate_utils_module, "sample_tokens", None)
+                handle_pattern = handle_pattern or getattr(generate_utils_module, "handle_pattern", None)
+                get_token_ids = get_token_ids or getattr(generate_utils_module, "get_token_ids_from_config", None)
+            except Exception:
+                pass
+        if token_ids is None:
+            if get_token_ids is None:
+                raise RuntimeError("LocateAnything token_ids are unavailable for cached generation.")
+            token_ids = get_token_ids(base.config)
+        if sample_tokens is None or handle_pattern is None:
+            raise RuntimeError("LocateAnything generation helpers are unavailable for cached generation.")
+
+        _, input_ids, attention_mask, pixel_values, image_grid_hws = self._prepare_locate_inputs(eagle_inputs)
+        batch_size, seq_len = input_ids.shape
+        if batch_size != 1:
+            raise ValueError("cached LocateAnything generation currently expects batch size 1.")
+        if tokenizer is None:
+            raise ValueError("LocateAnything tokenizer is required for cached generation.")
+        generation_mode = str(generation_mode or "hybrid")
+        if generation_mode not in {"fast", "slow", "hybrid"}:
+            raise ValueError(f"Unsupported generation_mode={generation_mode!r}.")
+
+        with torch.inference_mode():
+            _, projected_vit_list, projected_vit = self.run_vision_tokens(pixel_values, image_grid_hws)
+            hidden, past_key_values = self.run_language_prefill(input_ids, attention_mask, projected_vit)
+            raw_maps, lm_maps, text_embed = self.build_feature_maps(
+                input_ids,
+                attention_mask,
+                image_grid_hws,
+                projected_vit_list,
+                hidden,
+            )
+            feature_map = self.feature_refiner(self.fuse_feature_maps(raw_maps, lm_maps))
+
+            generated = input_ids.clone()
+            tokenizer_max_length = int(getattr(tokenizer, "model_max_length", seq_len + int(max_new_tokens)))
+            total_gen_length = min(tokenizer_max_length, seq_len + max(1, int(max_new_tokens)))
+            use_mtp = generation_mode in {"fast", "hybrid"}
+            default_mask_token_id = int(token_ids["default_mask_token_id"])
+            n_future_tokens = max(int(n_future_tokens), 1)
+            pre_mask_tokens = torch.full(
+                (batch_size, max(n_future_tokens - 1, 0)),
+                default_mask_token_id,
+                dtype=generated.dtype,
+                device=generated.device,
+            )
+            max_possible_len = total_gen_length + n_future_tokens + 1
+            full_position_ids = torch.arange(0, max_possible_len, device=generated.device).unsqueeze(0)
+            lm = base.language_model
+            im_end_token_id = int(token_ids["im_end_token_id"])
+            box_end_token_id = int(token_ids["box_end_token_id"])
+            coord_start_token_id = int(token_ids["coord_start_token_id"])
+            coord_end_token_id = int(token_ids["coord_end_token_id"])
+            none_token_id = int(token_ids["none_token_id"])
+
+            while generated.size(1) < total_gen_length:
+                if use_mtp:
+                    generated_with_mask = torch.cat(
+                        (generated, generated[:, -1].unsqueeze(1), pre_mask_tokens),
+                        dim=1,
+                    )
+                    start_idx = self._cache_seq_len(past_key_values)
+                    position_ids = full_position_ids[:, start_idx : generated_with_mask.size(1)].clone()
+                    position_ids[0, -n_future_tokens:] -= 1
+                    prepare_inputs = lm.prepare_inputs_for_generation(
+                        generated_with_mask,
+                        past_key_values,
+                        None,
+                        inputs_embeds=None,
+                        use_cache=True,
+                        position_ids=position_ids,
+                    )
+                else:
+                    start_idx = self._cache_seq_len(past_key_values)
+                    position_ids = full_position_ids[:, start_idx : generated.size(1)]
+                    prepare_inputs = lm.prepare_inputs_for_generation(
+                        generated,
+                        past_key_values,
+                        None,
+                        inputs_embeds=None,
+                        use_cache=True,
+                        position_ids=position_ids,
+                    )
+
+                outputs = lm(**prepare_inputs)
+                next_cache = outputs.past_key_values
+                if hasattr(next_cache, "to_legacy_cache"):
+                    next_cache = next_cache.to_legacy_cache()
+                past_key_values = self._truncate_legacy_cache(next_cache, int(generated.shape[1]))
+
+                if use_mtp:
+                    next_token_logits = outputs.logits[:, -n_future_tokens:, :]
+                    _, _, x0, box_avg = sample_tokens(
+                        next_token_logits,
+                        generated,
+                        token_ids,
+                        keep_k=5,
+                        generation_mode=generation_mode,
+                        **generate_kwargs,
+                    )
+                    is_box_empty = box_avg is None or (box_avg[0] == 0).all()
+                    new_tokens = x0[0] if is_box_empty else box_avg[0]
+                    out_pattern = handle_pattern(new_tokens, token_ids, generation_mode)
+                    out_type = out_pattern["type"]
+                    out_token = torch.tensor(out_pattern["tokens"], dtype=x0.dtype, device=x0.device)
+                else:
+                    next_token_logits = outputs.logits[:, -1:, :]
+                    _, _, x0, _ = sample_tokens(
+                        next_token_logits,
+                        generated,
+                        token_ids,
+                        generation_mode=generation_mode,
+                        **generate_kwargs,
+                    )
+                    out_token = x0[0]
+                    out_type = "continue_ar"
+                    token_val = int(out_token[0].item())
+                    if generation_mode == "hybrid":
+                        if token_val == box_end_token_id:
+                            out_type = "box_end_ar"
+                        elif coord_start_token_id <= token_val <= coord_end_token_id or token_val == none_token_id:
+                            out_type = "coord_ar"
+                        else:
+                            out_type = "im_end"
+                    elif token_val == im_end_token_id:
+                        out_type = "im_end"
+
+                generated = torch.cat([generated, out_token.unsqueeze(0)], dim=1)
+                if out_type == "im_end":
+                    break
+                if generation_mode == "hybrid":
+                    if out_type == "error_box":
+                        use_mtp = False
+                    elif out_type == "box_end_ar":
+                        use_mtp = True
+
+            generated_ids = generated[:, seq_len:]
+            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        return str(response).strip(), feature_map, text_embed
 
     def _extract_eagle_feature_maps(
         self,

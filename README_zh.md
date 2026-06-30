@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v1.0`
+版本：`v1.1`
 
 [English](README.md) | 中文
 
@@ -15,10 +15,12 @@
 
 - `scripts/locatepose.sh`：LocatePose 两阶段训练主入口
 - `scripts/eval_locatepose.sh`：LocatePose 验证入口
+- `scripts/infer_locatepose.sh`：LocatePose 单图、文件夹与 RefHuman 推理入口
 - `scripts/train_qwenpose_two_stage.sh`：QwenPose 两阶段训练主入口
 - `scripts/eval_qwenpose.sh`：QwenPose 验证入口
 - `scripts/zero2.json`、`scripts/zero3.json`、`scripts/zero3_offload.json`：两条主线共用的 DeepSpeed 预设
-- `src/qwenpose/`：数据集加载、模型、训练、验证、checkpoint、backbone 适配等核心实现
+- `requirements-vllm.txt`：LocatePose 集成式 vLLM 推理/验证的可选依赖版本
+- `src/qwenpose/`：数据集加载、模型、训练、验证、推理、打分、checkpoint、backbone 适配等核心实现
 
 ## 仓库结构
 
@@ -30,9 +32,11 @@ qwenpose/
 ├── VERSION
 ├── requirements.txt
 ├── requirements-cu126.txt
+├── requirements-vllm.txt
 ├── scripts/
 │   ├── eval_locatepose.sh
 │   ├── eval_qwenpose.sh
+│   ├── infer_locatepose.sh
 │   ├── locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
@@ -43,12 +47,17 @@ qwenpose/
         ├── data.py
         ├── eagle_lora.py
         ├── eval_pose.py
+        ├── infer_locatepose.py
         ├── losses.py
         ├── merge_full_weights.py
+        ├── metrics.py
         ├── model.py
         ├── qwen_lora.py
+        ├── score_pose_predictions.py
         ├── schemas.py
-        └── train_pose.py
+        ├── train_pose.py
+        ├── vllm_locateanything.py
+        └── vllm_locateanything_model.py
 ```
 
 ## 运行时目录约定
@@ -66,7 +75,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v1.0` 快照在以下环境中完成验证：
+这个 `v1.1` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -74,6 +83,7 @@ qwenpose/
 - TorchVision `0.23.0`
 - TorchAudio `2.8.0`
 - Transformers `4.57.6`
+- vLLM `0.11.0`，用于 LocatePose 集成式推理/验证路径
 - FlashAttention `2.8.3`
 - DeepSpeed `0.17.1`
 - Accelerate `1.7.0`
@@ -92,6 +102,7 @@ qwenpose/
 
 - `requirements.txt`：适合自定义 CUDA 环境时使用的运行时依赖版本
 - `requirements-cu126.txt`：Linux + Python 3.11 + CUDA 12.6 的精确验证版本
+- `requirements-vllm.txt`：LocatePose 集成式 `vllm` 推理/验证的可选依赖版本
 
 ## 环境安装
 
@@ -117,6 +128,14 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
 pip install -r requirements.txt
 ```
 
+### 方案 C：为 LocatePose 集成式 vLLM 验证/推理补装可选依赖
+
+如果你希望直接使用 `LocatePose` 默认的集成式 `vllm` 路径，请在方案 A 或方案 B 之后执行：
+
+```bash
+pip install -r requirements-vllm.txt
+```
+
 如果当前平台无法使用 `flash-attn`，可以先安装其余依赖，再在运行时切换 attention 后端：
 
 ```bash
@@ -125,6 +144,12 @@ QWEN_ATTN_IMPLEMENTATION=sdpa
 ```
 
 所有 shell 入口会优先使用本地 `envs/qwenpose/bin/python` 和 `envs/qwenpose/bin/torchrun`。
+
+如果没有安装 `vllm`，请把 LocatePose 验证和推理切回纯 Transformers 路径：
+
+```bash
+LOCATE_GENERATION_BACKEND=transformers
+```
 
 ## 基座模型下载
 
@@ -182,7 +207,7 @@ datasets/
 
 当前默认配方说明：
 
-- `LocatePose` 的 stage 1 默认只用 `coco`
+- `LocatePose` 的 stage 1 默认只用 `crowdpose`
 - `LocatePose` 的 stage 2 默认使用 `coco,mpii,crowdpose,refhuman`
 - `QwenPose` 的 stage 1 和 stage 2 默认都使用 `coco`
 - `AIC` 已在代码中支持，但不在当前公开默认训练配方中启用
@@ -304,17 +329,23 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 
 | 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
 |------|--------|----------------|------------|------------|------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 LocateAnything | `gt` | `coco` | `30` |
-| stage 2 | `stage2_locate_box_closed_loop` | 解冻 Locate LoRA、vision LoRA、projector | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `12` |
+| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 LocateAnything | `gt` | `crowdpose` | `80` |
+| stage 2 | `stage2_locate_box_closed_loop` | 解冻 Locate LoRA 和 vision LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
 其他关键默认值：
 
-- `STAGE1_BATCH_SIZE=16`
+- `CUDA_VISIBLE_DEVICES=0,1,2,3`
+- `NPROC_PER_NODE=4`
+- `STAGE1_BATCH_SIZE=8`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=8`
 - `STAGE1_LR=2e-4`
 - `STAGE2_LR=5e-5`
+- `STAGE1_BOX_JITTER_SCALE=0.1`
+- `STAGE1_BOX_JITTER_SHIFT=0.1`
+- `W_OKS=0.5`
+- `W_COORD=3.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
@@ -329,11 +360,12 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 bash scripts/locatepose.sh
 ```
 
-8 卡训练示例：
+4 卡训练示例：
 
 ```bash
-RUN_NAME=locatepose_v1 \
-NPROC_PER_NODE=8 \
+RUN_NAME=locatepose_v1_1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -357,8 +389,11 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `OUTPUT_ROOT`：训练输出根目录，默认 `outputs/locatepose`
 - `ZERO_STAGE`：`zero2`、`zero3`、`zero3_offload` 或 `none`
 - `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表
+- `STAGE1_BOX_JITTER_SCALE`、`STAGE1_BOX_JITTER_SHIFT`：stage 1 GT box 扰动强度
+- `LOCATE_ATTN_IMPLEMENTATION`：训练时 LocateAnything 的 attention 后端，默认 `flash_attention_2`
 - `LOCATE_IMAGE_TOKEN_LIMIT`：每张图的 raw MoonViT token 上限
 - `LOCATE_GENERATION_MODE`：LocateAnything 生成模式，可选 `fast`、`slow`、`hybrid`
+- `LOCATE_VISION_SCALE`：Locate vision LoRA 参数的学习率倍率
 - `BOX_MATCH_IOU_THRESH`、`BOX_NMS_IOU_THRESH`：生成框匹配与 NMS 阈值
 - `MERGE_FINAL_WEIGHTS`：当前公开 LocatePose 脚本不会导出完整 merged LocateAnything 权重
 
@@ -369,6 +404,8 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 ```bash
 bash scripts/eval_locatepose.sh
 ```
+
+`scripts/eval_locatepose.sh` 默认使用 `LOCATE_GENERATION_BACKEND=vllm`，即通过集成式 custom vLLM 路径完成 LocateAnything 生成框和 PoseHead 特征复用。
 
 验证指定 checkpoint 或 stage 目录：
 
@@ -389,6 +426,12 @@ DATASETS=coco,mpii,crowdpose,refhuman bash scripts/eval_locatepose.sh
 BOX_SOURCE=gt bash scripts/eval_locatepose.sh
 ```
 
+如果不安装 `vllm`，可以这样切回纯 Transformers 路径：
+
+```bash
+LOCATE_GENERATION_BACKEND=transformers bash scripts/eval_locatepose.sh
+```
+
 验证结果默认输出到：
 
 ```text
@@ -396,6 +439,50 @@ outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/
 ```
 
 目录中包含 `summary.json`、`predictions.jsonl`、`predictions.json`、`report.md`，以及可选的可视化结果。
+
+### 推理 LocatePose
+
+从训练好的 LocatePose checkpoint 对单图或文件夹做推理：
+
+```bash
+bash scripts/infer_locatepose.sh \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --input demo/images \
+  --format coco
+```
+
+如果不使用 `vllm`：
+
+```bash
+LOCATE_GENERATION_BACKEND=transformers \
+bash scripts/infer_locatepose.sh \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --input demo/images \
+  --format crowdpose
+```
+
+RefHuman 文本条件推理示例：
+
+```bash
+bash scripts/infer_locatepose.sh \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --input datasets/refhuman \
+  --format refhuman \
+  --split val
+```
+
+推理目录默认会写出 `summary.json`、`predictions.jsonl`、`predictions.json`、可选格式化导出、`manifest.json` 和可视化结果。
+
+### 给导出预测重新打分
+
+对已经导出的 LocatePose 或 QwenPose 预测文件重新计算指标：
+
+```bash
+PYTHONPATH=src python -m qwenpose.score_pose_predictions \
+  --predictions outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/predictions.jsonl \
+  --dataset_root datasets \
+  --split val
+```
 
 ## QwenPose
 
@@ -513,6 +600,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v1.0`
+- Git tag，例如 `v1.1`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

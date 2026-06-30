@@ -76,6 +76,85 @@ class SpatialFeatureInjector(nn.Module):
         return x + self.scale.to(dtype=x.dtype) * F.gelu(self.depthwise(self.norm(x)))
 
 
+class JointDeformableKeypointAttention(nn.Module):
+    """Joint-centric sparse feature sampling after the person-level ROI decoder."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_scales: int = 2,
+        num_points: int = 4,
+        offset_scale: float = 0.35,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_scales = max(int(num_scales), 1)
+        self.num_points = max(int(num_points), 1)
+        self.offset_scale = float(offset_scale)
+        sample_count = self.num_scales * self.num_points
+        self.offset_head = nn.Linear(hidden_dim, sample_count * 2)
+        self.weight_head = nn.Linear(hidden_dim, sample_count)
+        self.context_proj = MLP(hidden_dim * 3, hidden_dim, hidden_dim, depth=2)
+        self.scale = nn.Parameter(torch.tensor(-2.0))
+        nn.init.zeros_(self.offset_head.weight)
+        nn.init.zeros_(self.offset_head.bias)
+        nn.init.zeros_(self.weight_head.weight)
+        nn.init.zeros_(self.weight_head.bias)
+        self._zero_init_last_linear(self.context_proj)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        reference_xy: torch.Tensor,
+        box_wh: torch.Tensor,
+        feature_maps: list[torch.Tensor],
+    ) -> torch.Tensor:
+        if tokens.numel() == 0 or not feature_maps:
+            return tokens
+        maps = list(feature_maps[: self.num_scales])
+        while len(maps) < self.num_scales:
+            maps.append(maps[-1])
+        b, q, k, c = tokens.shape
+        sample_count = self.num_scales * self.num_points
+        token_input = tokens.to(dtype=self.offset_head.weight.dtype)
+        offsets = torch.tanh(self.offset_head(token_input).float()).to(dtype=tokens.dtype)
+        offsets = offsets.view(b, q, k, self.num_scales, self.num_points, 2)
+        weights = self.weight_head(token_input).float().softmax(dim=-1).to(dtype=tokens.dtype)
+        weights = weights.view(b, q, k, self.num_scales, self.num_points)
+        radius = box_wh.to(dtype=tokens.dtype).view(b, q, 1, 1, 1, 2) * self.offset_scale
+        points = reference_xy.to(dtype=tokens.dtype).view(b, q, k, 1, 1, 2) + offsets * radius
+        points = points.clamp(0.0, 1.0)
+
+        sampled_scales = []
+        for scale_idx, feature_map in enumerate(maps):
+            sampled = self._sample_points(feature_map, points[:, :, :, scale_idx])
+            sampled_scales.append(sampled)
+        sampled_all = torch.stack(sampled_scales, dim=3).reshape(b, q, k, sample_count, c)
+        sampled = (sampled_all * weights.reshape(b, q, k, sample_count, 1)).sum(dim=3)
+        point_pe = point_fourier_pe(reference_xy.to(dtype=tokens.dtype), c)
+        update = self.context_proj(torch.cat([tokens, sampled, point_pe], dim=-1))
+        return tokens + self.scale.sigmoid().to(dtype=update.dtype) * update
+
+    @staticmethod
+    def _sample_points(feature_map: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+        b, channels, _, _ = feature_map.shape
+        q, k, p = points.shape[1], points.shape[2], points.shape[3]
+        grid = points.to(device=feature_map.device, dtype=feature_map.dtype) * 2.0 - 1.0
+        grid = grid.view(b, q * k * p, 1, 2)
+        sampled = F.grid_sample(feature_map, grid, align_corners=False)
+        sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, k, p, channels)
+        return sampled
+
+    @staticmethod
+    def _zero_init_last_linear(module: nn.Module) -> None:
+        for child in reversed(list(module.modules())):
+            if isinstance(child, nn.Linear):
+                nn.init.zeros_(child.weight)
+                if child.bias is not None:
+                    nn.init.zeros_(child.bias)
+                return
+
+
 class ConvNormAct(nn.Module):
     """Lightweight RGB stem block used by the trainable visual pose branch."""
 
@@ -314,6 +393,12 @@ class QwenPoseModel(nn.Module):
             batch_first=True,
         )
         self.pose_decoder = nn.TransformerDecoder(pose_decoder_layer, num_layers=config.pose_decoder_layers)
+        self.deformable_joint_attention = JointDeformableKeypointAttention(
+            c,
+            num_scales=2,
+            num_points=4,
+            offset_scale=0.35,
+        )
         self.pose_xy_head = MLP(c, c, 2, depth=3)
         self.pose_vis_head = MLP(c, c, 1, depth=3)
         if config.use_refinement:
@@ -328,18 +413,26 @@ class QwenPoseModel(nn.Module):
             )
             self.joint_context = nn.TransformerEncoder(joint_context_layer, num_layers=1)
             refinement_steps = max(int(config.refinement_steps), 1)
+            refine_patch_points = 9
             self.refine_heads = nn.ModuleList([MLP(c * 3, c, 2, depth=3) for _ in range(refinement_steps)])
             self.refine_token_fusers = nn.ModuleList([MLP(c * 3, c, c, depth=2) for _ in range(refinement_steps)])
+            self.refine_patch_weight_heads = nn.ModuleList(
+                [nn.Linear(c, refine_patch_points) for _ in range(refinement_steps)]
+            )
             self.refine_step_scales = nn.Parameter(torch.full((refinement_steps,), -1.4))
             for head in self.refine_heads:
                 self._zero_init_last_linear(head)
             for fuser in self.refine_token_fusers:
                 self._zero_init_last_linear(fuser)
+            for weight_head in self.refine_patch_weight_heads:
+                nn.init.zeros_(weight_head.weight)
+                nn.init.zeros_(weight_head.bias)
         else:
             self.local_proj = None
             self.joint_context = None
             self.refine_heads = None
             self.refine_token_fusers = None
+            self.refine_patch_weight_heads = None
             self.refine_step_scales = None
         self._zero_init_last_linear(self.pose_xy_head)
 
@@ -476,9 +569,18 @@ class QwenPoseModel(nn.Module):
         )
         pose_tokens = pose_tokens.view(b, num_boxes, active_k, c)
 
+        wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
+        prior_reference_xy = boxes[..., None, :2] + joint_prior.view(b, 1, active_k, 2) * wh[..., None, :]
+        prior_reference_xy = prior_reference_xy.clamp(0.0, 1.0)
+        pose_tokens = self.deformable_joint_attention(
+            pose_tokens,
+            prior_reference_xy,
+            wh,
+            [feature_map, refine_feature_map],
+        )
+
         prior_logits = torch.logit(joint_prior.clamp(1e-4, 1.0 - 1e-4)).view(b, 1, active_k, 2)
         rel_xy = torch.sigmoid(prior_logits + self.pose_xy_head(pose_tokens))
-        wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
         keypoint_xy = boxes[..., None, :2] + rel_xy * wh[..., None, :]
         keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
 
@@ -486,18 +588,29 @@ class QwenPoseModel(nn.Module):
         if (
             self.refine_heads is not None
             and self.refine_token_fusers is not None
+            and self.refine_patch_weight_heads is not None
             and self.joint_context is not None
             and self.local_proj is not None
         ):
             local_feature_map = self.local_proj(refine_feature_map)
             context_mask = ~pose_valid.reshape(b * num_boxes, active_k)
             context_mask = context_mask.masked_fill(context_mask.all(dim=1, keepdim=True), False)
-            for refine_idx, (refine_head, token_fuser) in enumerate(zip(self.refine_heads, self.refine_token_fusers)):
+            for refine_idx, (refine_head, token_fuser, patch_weight_head) in enumerate(
+                zip(self.refine_heads, self.refine_token_fusers, self.refine_patch_weight_heads)
+            ):
                 pose_tokens = self.joint_context(
                     pose_tokens.reshape(b * num_boxes, active_k, c),
                     src_key_padding_mask=context_mask,
                 ).reshape(b, num_boxes, active_k, c)
-                local = self._sample_local_features(local_feature_map, keypoint_xy)
+                patch_logits = patch_weight_head(pose_tokens.to(dtype=patch_weight_head.weight.dtype))
+                local = self._sample_local_patch_features(
+                    local_feature_map,
+                    keypoint_xy,
+                    wh,
+                    patch_logits,
+                    patch_size=3,
+                    radius_scale=0.08,
+                )
                 point_pe = point_fourier_pe(keypoint_xy, c)
                 refine_input = torch.cat([pose_tokens, local, point_pe], dim=-1)
                 delta = torch.tanh(refine_head(refine_input))
@@ -569,6 +682,38 @@ class QwenPoseModel(nn.Module):
         sampled = F.grid_sample(feature_map, grid, align_corners=False)
         sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, u, c)
         return sampled
+
+    @staticmethod
+    def _sample_local_patch_features(
+        feature_map: torch.Tensor,
+        keypoint_xy: torch.Tensor,
+        box_wh: torch.Tensor,
+        patch_logits: torch.Tensor | None,
+        *,
+        patch_size: int = 3,
+        radius_scale: float = 0.08,
+    ) -> torch.Tensor:
+        b, c, _, _ = feature_map.shape
+        q, u = keypoint_xy.shape[1], keypoint_xy.shape[2]
+        patch_size = max(int(patch_size), 1)
+        y, x = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, patch_size, device=feature_map.device, dtype=feature_map.dtype),
+            torch.linspace(-1.0, 1.0, patch_size, device=feature_map.device, dtype=feature_map.dtype),
+            indexing="ij",
+        )
+        offsets = torch.stack([x, y], dim=-1).view(1, 1, 1, patch_size * patch_size, 2)
+        radius = box_wh.to(device=feature_map.device, dtype=feature_map.dtype).view(b, q, 1, 1, 2)
+        radius = radius * float(radius_scale)
+        points = keypoint_xy.to(device=feature_map.device, dtype=feature_map.dtype).unsqueeze(3) + offsets * radius
+        points = points.clamp(0.0, 1.0)
+        grid = points.view(b, q * u * patch_size * patch_size, 1, 2) * 2.0 - 1.0
+        sampled = F.grid_sample(feature_map, grid, align_corners=False)
+        sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, u, patch_size * patch_size, c)
+        if patch_logits is None or patch_logits.shape[-1] != patch_size * patch_size:
+            weights = sampled.new_full((b, q, u, patch_size * patch_size), 1.0 / float(patch_size * patch_size))
+        else:
+            weights = patch_logits.to(device=feature_map.device).float().softmax(dim=-1).to(dtype=sampled.dtype)
+        return (sampled * weights.unsqueeze(-1)).sum(dim=3)
 
     @staticmethod
     def _sample_box_feature_maps(feature_map: torch.Tensor, boxes: torch.Tensor, roi_size: int) -> torch.Tensor:

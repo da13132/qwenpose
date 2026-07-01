@@ -59,6 +59,15 @@ class LossWeights:
     # Experimental hard-joint mining. Kept for later ablation, default off.
     hard_joint: float = 0.0
     hard_joint_fraction: float = 0.2
+    # Auxiliary supervision defaults stay off for backwards-compatible direct
+    # LossWeights construction; train_pose enables the new recipe explicitly.
+    coarse_coord: float = 0.0
+    deform_coord: float = 0.0
+    refine_coords: tuple[float, ...] = ()
+    simcc_coarse: float = 0.0
+    simcc_deform: float = 0.0
+    simcc_refine: tuple[float, ...] = ()
+    simcc_sigma: float = 2.0
 
 
 def compute_pose_losses(
@@ -110,8 +119,22 @@ def compute_box_conditioned_pose_losses(
     total_coord = torch.tensor(0.0, device=device)
     total_hard_joint = torch.tensor(0.0, device=device)
     total_vis = torch.tensor(0.0, device=device)
+    total_coarse_coord = torch.tensor(0.0, device=device)
+    total_deform_coord = torch.tensor(0.0, device=device)
+    total_simcc_coarse = torch.tensor(0.0, device=device)
+    total_simcc_deform = torch.tensor(0.0, device=device)
     total_joint_loss = torch.zeros(len(UNION_KEYPOINTS), device=device)
     total_joint_count = torch.zeros(len(UNION_KEYPOINTS), device=device)
+    refine_keypoints = outputs.get("refine_keypoints", [])
+    if not isinstance(refine_keypoints, list):
+        refine_keypoints = []
+    total_refine_coord = [torch.tensor(0.0, device=device) for _ in refine_keypoints]
+    simcc_refine_x = outputs.get("simcc_refine_x", [])
+    simcc_refine_y = outputs.get("simcc_refine_y", [])
+    if not isinstance(simcc_refine_x, list) or not isinstance(simcc_refine_y, list):
+        simcc_refine_x, simcc_refine_y = [], []
+    simcc_refine_count = min(len(simcc_refine_x), len(simcc_refine_y))
+    total_simcc_refine = [torch.tensor(0.0, device=device) for _ in range(simcc_refine_count)]
     num_pos = 0
     num_hard_groups = 0
 
@@ -133,6 +156,50 @@ def compute_box_conditioned_pose_losses(
         visible_f = gt_valid.float()
         total_coord = total_coord + (coord_joint * visible_f).sum()
         total_oks = total_oks + (oks_joint * visible_f).sum()
+
+        if "coarse_keypoints" in outputs:
+            coarse_joint = per_joint_normalized_coord_loss(outputs["coarse_keypoints"][b, q], gt_keypoints, gt_valid, gt_boxes)
+            total_coarse_coord = total_coarse_coord + (coarse_joint * visible_f).sum()
+        if "deform_keypoints" in outputs:
+            deform_joint = per_joint_normalized_coord_loss(outputs["deform_keypoints"][b, q], gt_keypoints, gt_valid, gt_boxes)
+            total_deform_coord = total_deform_coord + (deform_joint * visible_f).sum()
+        for refine_idx, refine_pred in enumerate(refine_keypoints):
+            refine_joint = per_joint_normalized_coord_loss(refine_pred[b, q], gt_keypoints, gt_valid, gt_boxes)
+            total_refine_coord[refine_idx] = total_refine_coord[refine_idx] + (refine_joint * visible_f).sum()
+
+        if "simcc_coarse_x" in outputs and "simcc_coarse_y" in outputs:
+            total_simcc_coarse = total_simcc_coarse + simcc_box_loss(
+                outputs["simcc_coarse_x"][b, q],
+                outputs["simcc_coarse_y"][b, q],
+                gt_keypoints,
+                gt_valid,
+                outputs["pose_boxes"][b, q],
+                outputs["schema_joint_indices"][b],
+                outputs["schema_joint_valid"][b],
+                sigma=weights.simcc_sigma,
+            )
+        if "simcc_deform_x" in outputs and "simcc_deform_y" in outputs:
+            total_simcc_deform = total_simcc_deform + simcc_box_loss(
+                outputs["simcc_deform_x"][b, q],
+                outputs["simcc_deform_y"][b, q],
+                gt_keypoints,
+                gt_valid,
+                outputs["pose_boxes"][b, q],
+                outputs["schema_joint_indices"][b],
+                outputs["schema_joint_valid"][b],
+                sigma=weights.simcc_sigma,
+            )
+        for refine_idx in range(simcc_refine_count):
+            total_simcc_refine[refine_idx] = total_simcc_refine[refine_idx] + simcc_box_loss(
+                simcc_refine_x[refine_idx][b, q],
+                simcc_refine_y[refine_idx][b, q],
+                gt_keypoints,
+                gt_valid,
+                outputs["pose_boxes"][b, q],
+                outputs["schema_joint_indices"][b],
+                outputs["schema_joint_valid"][b],
+                sigma=weights.simcc_sigma,
+            )
 
         if weights.hard_joint > 0.0:
             hard_source = coord_joint + oks_joint
@@ -163,6 +230,18 @@ def compute_box_conditioned_pose_losses(
         "loss_hard_joint": total_hard_joint / max(num_hard_groups, 1),
         "loss_vis": total_vis / denom,
     }
+    if "coarse_keypoints" in outputs:
+        loss_parts["loss_coord_coarse"] = total_coarse_coord / denom
+    if "deform_keypoints" in outputs:
+        loss_parts["loss_coord_deform"] = total_deform_coord / denom
+    for refine_idx, total_refine in enumerate(total_refine_coord, start=1):
+        loss_parts[f"loss_coord_refine_{refine_idx}"] = total_refine / denom
+    if "simcc_coarse_x" in outputs and "simcc_coarse_y" in outputs:
+        loss_parts["loss_simcc_coarse"] = total_simcc_coarse / denom
+    if "simcc_deform_x" in outputs and "simcc_deform_y" in outputs:
+        loss_parts["loss_simcc_deform"] = total_simcc_deform / denom
+    for refine_idx, total_refine in enumerate(total_simcc_refine, start=1):
+        loss_parts[f"loss_simcc_refine_{refine_idx}"] = total_refine / denom
     joint_means = total_joint_loss / total_joint_count.clamp(min=1.0)
     observed = total_joint_count > 0
     if observed.any():
@@ -178,6 +257,14 @@ def compute_box_conditioned_pose_losses(
         + weights.vis * loss_parts["loss_vis"]
         + graph_anchor
     )
+    total = total + weights.coarse_coord * loss_parts.get("loss_coord_coarse", graph_anchor)
+    total = total + weights.deform_coord * loss_parts.get("loss_coord_deform", graph_anchor)
+    for refine_idx, refine_weight in enumerate(_weight_sequence(weights.refine_coords), start=1):
+        total = total + refine_weight * loss_parts.get(f"loss_coord_refine_{refine_idx}", graph_anchor)
+    total = total + weights.simcc_coarse * loss_parts.get("loss_simcc_coarse", graph_anchor)
+    total = total + weights.simcc_deform * loss_parts.get("loss_simcc_deform", graph_anchor)
+    for refine_idx, refine_weight in enumerate(_weight_sequence(weights.simcc_refine), start=1):
+        total = total + refine_weight * loss_parts.get(f"loss_simcc_refine_{refine_idx}", graph_anchor)
     loss_parts["loss_total"] = total
     return total, loss_parts
 
@@ -212,3 +299,51 @@ def per_joint_oks_loss(
     sigma2 = (sigmas.to(pred_keypoints.device)[None, :] ** 2).clamp(min=1e-6)
     oks = torch.exp(-d2 / (2.0 * areas * sigma2))
     return (1.0 - oks).masked_fill(~valid, 0.0)
+
+
+def simcc_box_loss(
+    logits_x: torch.Tensor,
+    logits_y: torch.Tensor,
+    gt_keypoints: torch.Tensor,
+    gt_valid: torch.Tensor,
+    pose_boxes: torch.Tensor,
+    schema_joint_indices: torch.Tensor,
+    schema_joint_valid: torch.Tensor,
+    sigma: float = 2.0,
+) -> torch.Tensor:
+    if logits_x.numel() == 0 or logits_y.numel() == 0:
+        return logits_x.sum() * 0.0 + logits_y.sum() * 0.0
+    bins = int(logits_x.shape[-1])
+    if bins <= 1:
+        return logits_x.sum() * 0.0 + logits_y.sum() * 0.0
+    device = logits_x.device
+    joint_indices = schema_joint_indices.to(device=device, dtype=torch.long)
+    schema_valid = schema_joint_valid.to(device=device).bool()
+    gt_schema_keypoints = gt_keypoints.to(device).index_select(1, joint_indices)
+    gt_schema_valid = gt_valid.to(device).index_select(1, joint_indices) & schema_valid.view(1, -1)
+    if not gt_schema_valid.any():
+        return logits_x.sum() * 0.0 + logits_y.sum() * 0.0
+    pose_boxes = pose_boxes.to(device=device, dtype=gt_schema_keypoints.dtype)
+    box_wh = (pose_boxes[:, 2:] - pose_boxes[:, :2]).clamp(min=1e-4)
+    target_xy = ((gt_schema_keypoints[..., :2] - pose_boxes[:, None, :2]) / box_wh[:, None, :]).clamp(0.0, 1.0)
+    center = target_xy.float() * float(bins - 1)
+    grid = torch.arange(bins, device=device, dtype=torch.float32).view(1, 1, bins)
+    sigma = max(float(sigma), 1e-3)
+    target_x = torch.exp(-0.5 * ((grid - center[..., 0:1]) / sigma) ** 2)
+    target_y = torch.exp(-0.5 * ((grid - center[..., 1:2]) / sigma) ** 2)
+    target_x = target_x / target_x.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    target_y = target_y / target_y.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    loss_x = -(target_x * F.log_softmax(logits_x.float(), dim=-1)).sum(dim=-1)
+    loss_y = -(target_y * F.log_softmax(logits_y.float(), dim=-1)).sum(dim=-1)
+    per_joint = 0.5 * (loss_x + loss_y)
+    valid_f = gt_schema_valid.float()
+    per_instance = (per_joint * valid_f).sum(dim=-1) / valid_f.sum(dim=-1).clamp(min=1.0)
+    return per_instance.sum()
+
+
+def _weight_sequence(value: tuple[float, ...] | list[float] | float | None) -> tuple[float, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (int, float)):
+        return (float(value),)
+    return tuple(float(item) for item in value)

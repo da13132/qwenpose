@@ -189,6 +189,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--box_condition_scale", type=float, default=1.2)
     parser.add_argument("--pose_roi_size", type=int, default=16)
+    parser.add_argument("--simcc_bins", type=int, default=128)
     parser.add_argument("--disable_refinement", action="store_true")
 
     # ---------------------------------------------------------------------
@@ -244,6 +245,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_lm", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
+    parser.add_argument("--w_coarse_coord", type=float, default=0.5)
+    parser.add_argument("--w_deform_coord", type=float, default=0.75)
+    parser.add_argument("--w_refine_coords", type=str, default="0.75,1.0,1.25")
+    parser.add_argument("--w_simcc_coarse", type=float, default=0.1)
+    parser.add_argument("--w_simcc_deform", type=float, default=0.15)
+    parser.add_argument("--w_simcc_refine", type=str, default="0.15,0.2,0.25")
+    parser.add_argument("--simcc_sigma", type=float, default=2.0)
     parser.add_argument("--box_jitter_scale", type=float, default=0.1)
     parser.add_argument("--box_jitter_shift", type=float, default=0.1)
     parser.add_argument(
@@ -293,6 +301,15 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def parse_float_list(value: str | list[float] | tuple[float, ...]) -> tuple[float, ...]:
+    if isinstance(value, (list, tuple)):
+        return tuple(float(item) for item in value)
+    text = str(value).strip()
+    if not text:
+        return ()
+    return tuple(float(item.strip()) for item in text.split(",") if item.strip())
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -1845,6 +1862,20 @@ def update_progress_bar(progress_bar, postfix: dict[str, object]) -> None:
         progress_bar.set_postfix(postfix, refresh=False)
 
 
+def _format_loss_float(value: float, digits: int = 3) -> str:
+    value = float(value)
+    if not math.isfinite(value):
+        return str(value)
+    return f"{value:.{digits}f}"
+
+
+def _format_loss_weight(value: float) -> str:
+    value = float(value)
+    if not math.isfinite(value):
+        return str(value)
+    return f"{value:.4g}"
+
+
 class HomogeneousDatasetBatchSampler:
     """Yield one-dataset-only batches for InterleavedPoseDataset.
 
@@ -1976,22 +2007,110 @@ def build_progress_loss_postfix(
     loss_metrics: dict[str, float],
     weights: LossWeights,
 ) -> dict[str, str]:
-    """Build tqdm/log postfix for the active clean pose/LM objectives."""
+    """Build a compact tqdm postfix from weighted loss contributions."""
 
-    def _enabled(weight: float, key: str, flag: bool = True) -> bool:
-        return bool(flag) and float(weight) > 0.0 and key in loss_metrics
-
-    def _add(postfix: dict[str, str], label: str, key: str, weight: float, flag: bool = True) -> None:
-        if _enabled(weight, key, flag):
-            postfix[label] = f"{float(loss_metrics.get(key, 0.0)):.3f}"
-
-    postfix = {"loss": f"{float(loss_metrics.get('loss_total', 0.0)):.3f}"}
-    _add(postfix, "oks", "loss_oks", weights.oks)
-    _add(postfix, "coord", "loss_coord", weights.coord)
-    _add(postfix, "hard", "loss_hard_joint", weights.hard_joint)
-    _add(postfix, "vis", "loss_vis", weights.vis)
-    _add(postfix, "lm", "loss_lm", weights.lm)
+    group_totals = _weighted_loss_group_totals(loss_metrics, weights)
+    postfix = {"loss": _format_loss_float(loss_metrics.get("loss_total", 0.0))}
+    if group_totals.get("pose", 0.0) > 0.0:
+        postfix["pose"] = _format_loss_float(group_totals["pose"])
+    if group_totals.get("coord_aux", 0.0) > 0.0:
+        postfix["caux"] = _format_loss_float(group_totals["coord_aux"])
+    if group_totals.get("simcc", 0.0) > 0.0:
+        postfix["simcc"] = _format_loss_float(group_totals["simcc"])
+    if group_totals.get("lm", 0.0) > 0.0:
+        postfix["lm"] = _format_loss_float(group_totals["lm"])
     return postfix
+
+
+def _weighted_loss_items(
+    loss_metrics: dict[str, float],
+    weights: LossWeights,
+) -> list[tuple[str, str, float, float, float]]:
+    items: list[tuple[str, str, float, float, float]] = []
+
+    def add(group: str, label: str, key: str, weight: float) -> None:
+        weight = float(weight)
+        if weight <= 0.0 or key not in loss_metrics:
+            return
+        raw = float(loss_metrics.get(key, 0.0))
+        items.append((group, label, raw, weight, raw * weight))
+
+    add("pose", "oks", "loss_oks", weights.oks)
+    add("pose", "coord", "loss_coord", weights.coord)
+    add("pose", "hard", "loss_hard_joint", weights.hard_joint)
+    add("pose", "vis", "loss_vis", weights.vis)
+    add("coord_aux", "coarse", "loss_coord_coarse", weights.coarse_coord)
+    add("coord_aux", "deform", "loss_coord_deform", weights.deform_coord)
+    for refine_idx, refine_weight in enumerate(parse_float_list(weights.refine_coords), start=1):
+        add("coord_aux", f"ref{refine_idx}", f"loss_coord_refine_{refine_idx}", refine_weight)
+    add("simcc", "coarse", "loss_simcc_coarse", weights.simcc_coarse)
+    add("simcc", "deform", "loss_simcc_deform", weights.simcc_deform)
+    for refine_idx, refine_weight in enumerate(parse_float_list(weights.simcc_refine), start=1):
+        add("simcc", f"ref{refine_idx}", f"loss_simcc_refine_{refine_idx}", refine_weight)
+    add("lm", "lm", "loss_lm", float(loss_metrics.get("loss_lm_weight", weights.lm)))
+    return items
+
+
+def _weighted_loss_group_totals(
+    loss_metrics: dict[str, float],
+    weights: LossWeights,
+) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for group, _label, _raw, _weight, weighted in _weighted_loss_items(loss_metrics, weights):
+        totals[group] = totals.get(group, 0.0) + weighted
+    return totals
+
+
+def build_detailed_loss_message(
+    loss_metrics: dict[str, float],
+    weights: LossWeights,
+) -> str:
+    items = _weighted_loss_items(loss_metrics, weights)
+    group_totals = _weighted_loss_group_totals(loss_metrics, weights)
+    group_names = {
+        "pose": "pose",
+        "coord_aux": "coord_aux",
+        "simcc": "simcc",
+        "lm": "lm",
+    }
+    summary = [
+        f"total={_format_loss_float(loss_metrics.get('loss_total', 0.0))}",
+        *[
+            f"{name}={_format_loss_float(group_totals[group])}"
+            for group, name in group_names.items()
+            if group_totals.get(group, 0.0) > 0.0
+        ],
+    ]
+    groups: list[str] = []
+    for group, name in group_names.items():
+        group_items = [item for item in items if item[0] == group]
+        if not group_items:
+            continue
+        detail = " ".join(
+            f"{label}={_format_loss_float(weighted)}"
+            f"(raw={_format_loss_float(raw)},w={_format_loss_weight(weight)})"
+            for _group, label, raw, weight, weighted in group_items
+        )
+        groups.append(f"{name}: {detail}")
+    return "loss_detail " + " ".join(summary) + "; " + "; ".join(groups)
+
+
+def format_loss_weights(weights: LossWeights) -> str:
+    coord_refine = ",".join(_format_loss_weight(value) for value in parse_float_list(weights.refine_coords)) or "none"
+    simcc_refine = ",".join(_format_loss_weight(value) for value in parse_float_list(weights.simcc_refine)) or "none"
+    return (
+        "Loss weights: "
+        f"oks={_format_loss_weight(weights.oks)} "
+        f"coord={_format_loss_weight(weights.coord)} "
+        f"vis={_format_loss_weight(weights.vis)} "
+        f"hard={_format_loss_weight(weights.hard_joint)} "
+        f"coord_aux(coarse={_format_loss_weight(weights.coarse_coord)},"
+        f"deform={_format_loss_weight(weights.deform_coord)},refine={coord_refine}) "
+        f"simcc(coarse={_format_loss_weight(weights.simcc_coarse)},"
+        f"deform={_format_loss_weight(weights.simcc_deform)},refine={simcc_refine},"
+        f"sigma={_format_loss_weight(weights.simcc_sigma)}) "
+        f"lm={_format_loss_weight(weights.lm)}"
+    )
 
 
 def progress_write(progress_bar, message: str) -> None:
@@ -2869,6 +2988,10 @@ def main() -> None:
         raise ValueError("--box_condition_scale must be positive.")
     if args.pose_roi_size <= 1:
         raise ValueError("--pose_roi_size must be greater than 1.")
+    if args.simcc_bins < 0 or args.simcc_bins == 1:
+        raise ValueError("--simcc_bins must be 0 to disable SimCC or greater than 1.")
+    if args.simcc_sigma <= 0:
+        raise ValueError("--simcc_sigma must be positive.")
     if not 0.0 <= args.hard_joint_fraction <= 1.0:
         raise ValueError("--hard_joint_fraction must be in [0, 1].")
     if args.box_jitter_scale < 0.0 or args.box_jitter_shift < 0.0:
@@ -3127,6 +3250,7 @@ def main() -> None:
             box_condition_scale=float(saved_pose_config.get("box_condition_scale", args.box_condition_scale)),
             pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
+            simcc_bins=int(saved_pose_config.get("simcc_bins", args.simcc_bins)),
         )
     else:
         model_config = QwenPoseConfig(
@@ -3138,6 +3262,7 @@ def main() -> None:
             box_condition_scale=args.box_condition_scale,
             pose_roi_size=args.pose_roi_size,
             use_refinement=not args.disable_refinement,
+            simcc_bins=args.simcc_bins,
         )
     model = QwenPoseModel(model_config).to(device)
     trainable, total = count_trainable_parameters(model)
@@ -3216,6 +3341,7 @@ def main() -> None:
         print(f"Freeze backbone/LoRA: {freeze_backbone}")
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
+        print(f"SimCC bins: {model_config.simcc_bins}, sigma={args.simcc_sigma}")
         print(f"Box source: {args.box_source}")
         print(f"Box jitter: scale={args.box_jitter_scale}, shift={args.box_jitter_shift}")
         if args.box_source == "qwen_generate":
@@ -3295,7 +3421,16 @@ def main() -> None:
         lm=args.w_lm,
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
+        coarse_coord=args.w_coarse_coord,
+        deform_coord=args.w_deform_coord,
+        refine_coords=parse_float_list(args.w_refine_coords),
+        simcc_coarse=args.w_simcc_coarse,
+        simcc_deform=args.w_simcc_deform,
+        simcc_refine=parse_float_list(args.w_simcc_refine),
+        simcc_sigma=args.simcc_sigma,
     )
+    if is_main_process():
+        print(format_loss_weights(weights))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     global_step = 0
     micro_step = 0
@@ -3441,11 +3576,16 @@ def main() -> None:
                 total_batches = min(total_batches, max(batches_to_skip + remaining_batches, batches_to_skip + 1))
             progress_bar = tqdm(
                 total=total_batches,
-                desc=f"epoch {epoch + 1}/{total_epochs}",
+                desc=f"Epoch {epoch + 1:02d}/{total_epochs}",
                 unit="batch",
                 dynamic_ncols=True,
-                mininterval=1.0,
+                mininterval=0.5,
+                smoothing=0.05,
                 initial=batches_to_skip,
+                bar_format=(
+                    "{desc} {percentage:3.0f}%|{bar:28}| {n_fmt}/{total_fmt} "
+                    "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+                ),
             )
         last_iter_end = time.perf_counter()
         timing_sums = {"data": 0.0, "prep": 0.0, "fwd": 0.0, "bwd": 0.0, "micro": 0}
@@ -3761,6 +3901,7 @@ def main() -> None:
                         + " "
                         + timing_message,
                     )
+                    progress_write(progress_bar, "  " + build_detailed_loss_message(loss_metrics, weights))
                     timing_sums = {"data": 0.0, "prep": 0.0, "fwd": 0.0, "bwd": 0.0, "micro": 0}
 
                 if is_main_process() and args.visualize_every > 0 and (

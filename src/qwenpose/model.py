@@ -305,6 +305,7 @@ class QwenPoseConfig:
     box_condition_scale: float = 1.2
     pose_roi_size: int = 16
     use_refinement: bool = True
+    simcc_bins: int = 128
     rgb_low_gate_expand_ratio: float = 0.10
     rgb_refine_gate_expand_ratio: float = 0.15
     rgb_gate_background: float = 0.05
@@ -399,8 +400,16 @@ class QwenPoseModel(nn.Module):
             num_points=4,
             offset_scale=0.35,
         )
+        self.coarse_xy_head = MLP(c, c, 2, depth=3)
         self.pose_xy_head = MLP(c, c, 2, depth=3)
         self.pose_vis_head = MLP(c, c, 1, depth=3)
+        self.simcc_bins = max(int(config.simcc_bins), 0)
+        if self.simcc_bins > 1:
+            self.simcc_x_head = nn.Linear(c, self.simcc_bins)
+            self.simcc_y_head = nn.Linear(c, self.simcc_bins)
+        else:
+            self.simcc_x_head = None
+            self.simcc_y_head = None
         if config.use_refinement:
             self.local_proj = nn.Conv2d(c, c, 1)
             joint_context_layer = nn.TransformerEncoderLayer(
@@ -434,6 +443,7 @@ class QwenPoseModel(nn.Module):
             self.refine_token_fusers = None
             self.refine_patch_weight_heads = None
             self.refine_step_scales = None
+        self._zero_init_last_linear(self.coarse_xy_head)
         self._zero_init_last_linear(self.pose_xy_head)
 
     def forward(
@@ -570,21 +580,30 @@ class QwenPoseModel(nn.Module):
         pose_tokens = pose_tokens.view(b, num_boxes, active_k, c)
 
         wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
-        prior_reference_xy = boxes[..., None, :2] + joint_prior.view(b, 1, active_k, 2) * wh[..., None, :]
-        prior_reference_xy = prior_reference_xy.clamp(0.0, 1.0)
+        prior_logits = torch.logit(joint_prior.clamp(1e-4, 1.0 - 1e-4)).view(b, 1, active_k, 2)
+        coarse_tokens = pose_tokens
+        coarse_rel_xy = torch.sigmoid(prior_logits + self.coarse_xy_head(coarse_tokens))
+        coarse_reference_xy = boxes[..., None, :2] + coarse_rel_xy * wh[..., None, :]
+        coarse_reference_xy = coarse_reference_xy.clamp(0.0, 1.0)
+        simcc_coarse_x, simcc_coarse_y = self._simcc_logits(coarse_tokens)
+
         pose_tokens = self.deformable_joint_attention(
-            pose_tokens,
-            prior_reference_xy,
+            coarse_tokens,
+            coarse_reference_xy,
             wh,
             [feature_map, refine_feature_map],
         )
 
-        prior_logits = torch.logit(joint_prior.clamp(1e-4, 1.0 - 1e-4)).view(b, 1, active_k, 2)
+        deform_tokens = pose_tokens
         rel_xy = torch.sigmoid(prior_logits + self.pose_xy_head(pose_tokens))
         keypoint_xy = boxes[..., None, :2] + rel_xy * wh[..., None, :]
         keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
+        deform_keypoint_xy = keypoint_xy
+        simcc_deform_x, simcc_deform_y = self._simcc_logits(deform_tokens)
 
         refine_keypoint_xy_steps: list[torch.Tensor] = []
+        refine_simcc_x_steps: list[torch.Tensor] = []
+        refine_simcc_y_steps: list[torch.Tensor] = []
         if (
             self.refine_heads is not None
             and self.refine_token_fusers is not None
@@ -609,17 +628,30 @@ class QwenPoseModel(nn.Module):
                     wh,
                     patch_logits,
                     patch_size=3,
-                    radius_scale=0.08,
+                    radius_scale=0.12,
                 )
                 point_pe = point_fourier_pe(keypoint_xy, c)
                 refine_input = torch.cat([pose_tokens, local, point_pe], dim=-1)
                 delta = torch.tanh(refine_head(refine_input))
-                scale = self.refine_step_scales[refine_idx].sigmoid().to(dtype=delta.dtype) * 0.25
+                scale = self.refine_step_scales[refine_idx].sigmoid().to(dtype=delta.dtype) * 0.35
                 keypoint_xy = (keypoint_xy + delta * wh[..., None, :] * scale).clamp(0.0, 1.0)
                 refine_keypoint_xy_steps.append(keypoint_xy)
                 pose_tokens = pose_tokens + token_fuser(refine_input)
+                simcc_refine_x, simcc_refine_y = self._simcc_logits(pose_tokens)
+                if simcc_refine_x is not None and simcc_refine_y is not None:
+                    refine_simcc_x_steps.append(simcc_refine_x)
+                    refine_simcc_y_steps.append(simcc_refine_y)
 
         keypoint_vis = self.pose_vis_head(pose_tokens).sigmoid()
+        aux_vis = keypoint_vis.detach()
+        coarse_keypoints = self._scatter_schema_keypoints(
+            torch.cat([coarse_reference_xy, aux_vis], dim=-1),
+            schema_scatter_map,
+        )
+        deform_keypoints = self._scatter_schema_keypoints(
+            torch.cat([deform_keypoint_xy, aux_vis], dim=-1),
+            schema_scatter_map,
+        )
         schema_keypoints = torch.cat([keypoint_xy, keypoint_vis], dim=-1)
         keypoints = self._scatter_schema_keypoints(schema_keypoints, schema_scatter_map)
         keypoint_valid_mask = schema_scatter_map.bool().any(dim=1)
@@ -630,16 +662,27 @@ class QwenPoseModel(nn.Module):
             "box_mask": box_mask,
             "keypoints": keypoints,
             "keypoint_valid_mask": keypoint_valid_mask,
+            "coarse_keypoints": coarse_keypoints,
+            "deform_keypoints": deform_keypoints,
             "ref_logits": ref_logits,
             "instance_emb": instance,
             "schema_joint_indices": schema_joint_indices,
             "schema_joint_valid": schema_joint_valid,
         }
+        if simcc_coarse_x is not None and simcc_coarse_y is not None:
+            outputs["simcc_coarse_x"] = simcc_coarse_x
+            outputs["simcc_coarse_y"] = simcc_coarse_y
+        if simcc_deform_x is not None and simcc_deform_y is not None:
+            outputs["simcc_deform_x"] = simcc_deform_x
+            outputs["simcc_deform_y"] = simcc_deform_y
         if refine_keypoint_xy_steps:
             outputs["refine_keypoints"] = [
-                self._scatter_schema_keypoints(torch.cat([xy, keypoint_vis], dim=-1), schema_scatter_map)
+                self._scatter_schema_keypoints(torch.cat([xy, aux_vis], dim=-1), schema_scatter_map)
                 for xy in refine_keypoint_xy_steps
             ]
+        if refine_simcc_x_steps and refine_simcc_y_steps:
+            outputs["simcc_refine_x"] = refine_simcc_x_steps
+            outputs["simcc_refine_y"] = refine_simcc_y_steps
         return outputs
 
     def _rgb_box_gate(
@@ -672,6 +715,12 @@ class QwenPoseModel(nn.Module):
         schema_scatter_map: torch.Tensor,
     ) -> torch.Tensor:
         return torch.einsum("bqkd,bku->bqud", values, schema_scatter_map)
+
+    def _simcc_logits(self, tokens: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.simcc_x_head is None or self.simcc_y_head is None:
+            return None, None
+        token_input = tokens.to(dtype=self.simcc_x_head.weight.dtype)
+        return self.simcc_x_head(token_input), self.simcc_y_head(token_input)
 
     @staticmethod
     def _sample_local_features(feature_map: torch.Tensor, keypoint_xy: torch.Tensor) -> torch.Tensor:

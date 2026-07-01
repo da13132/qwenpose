@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v1.1`
+Release: `v1.2`
 
 English | [中文说明](README_zh.md)
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v1.1` snapshot was validated with:
+This `v1.2` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -334,8 +334,8 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 
 Additional default knobs:
 
-- `CUDA_VISIBLE_DEVICES=0,1,2,3`
-- `NPROC_PER_NODE=4`
+- `CUDA_VISIBLE_DEVICES=0,3`
+- `NPROC_PER_NODE=2`
 - `STAGE1_BATCH_SIZE=8`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
@@ -346,6 +346,14 @@ Additional default knobs:
 - `STAGE1_BOX_JITTER_SHIFT=0.1`
 - `W_OKS=0.5`
 - `W_COORD=3.0`
+- `SIMCC_BINS=128`
+- `W_COARSE_COORD=0.5`
+- `W_DEFORM_COORD=0.75`
+- `W_REFINE_COORDS=0.75,1.0,1.25`
+- `W_SIMCC_COARSE=0.1`
+- `W_SIMCC_DEFORM=0.15`
+- `W_SIMCC_REFINE=0.15,0.2,0.25`
+- `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
@@ -360,12 +368,12 @@ Start a new run:
 bash scripts/locatepose.sh
 ```
 
-Example with explicit run name and 4 GPUs:
+Example with explicit run name and the current 2-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v1_1 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=4 \
+RUN_NAME=locatepose_v1_2 \
+CUDA_VISIBLE_DEVICES=0,3 \
+NPROC_PER_NODE=2 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -391,6 +399,9 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
 - `STAGE1_BOX_JITTER_SCALE`, `STAGE1_BOX_JITTER_SHIFT`: stage-1 GT-box perturbation knobs
 - `LOCATE_ATTN_IMPLEMENTATION`: LocateAnything attention backend used during training, default `flash_attention_2`
+- `SIMCC_BINS`: auxiliary SimCC bins per axis, use `0` to disable SimCC entirely
+- `W_COARSE_COORD`, `W_DEFORM_COORD`, `W_REFINE_COORDS`: coordinate deep-supervision weights for the coarse, deformable, and refinement stages
+- `W_SIMCC_COARSE`, `W_SIMCC_DEFORM`, `W_SIMCC_REFINE`, `SIMCC_SIGMA`: SimCC auxiliary supervision weights and Gaussian target width
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
 - `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
 - `LOCATE_VISION_SCALE`: learning-rate multiplier for Locate vision LoRA parameters
@@ -600,6 +611,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v1.1`
+- Git tags such as `v1.2`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

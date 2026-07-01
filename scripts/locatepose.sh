@@ -357,9 +357,9 @@ esac
 # DEEPSPEED_CONFIG：DeepSpeed JSON 配置路径；ZERO_STAGE=none 时为空。
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${DEFAULT_DEEPSPEED_CONFIG}}"
 # CUDA_VISIBLE_DEVICES：可见 GPU 列表。
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,3}"
 # NPROC_PER_NODE：每个节点启动的训练进程数，一般等于可见 GPU 数。
-export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 # MASTER_ADDR：torch.distributed 主节点地址。
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 # MASTER_PORT：torch.distributed 端口；默认随机选一个高位端口。
@@ -459,6 +459,8 @@ DECODER_HEADS="${DECODER_HEADS:-8}"
 BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
 # POSE_ROI_SIZE：每个 box 从 Locate feature map 上采样的 ROI 特征边长。
 POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
+# SIMCC_BINS：SimCC 辅助头每个坐标轴的离散 bin 数；0 表示关闭。
+SIMCC_BINS="${SIMCC_BINS:-128}"
 # DISABLE_REFINEMENT：是否关闭 keypoint refinement。
 DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
 
@@ -517,6 +519,17 @@ W_VIS="${W_VIS:-0.05}"
 W_HARD_JOINT="${W_HARD_JOINT:-0.0}"
 # HARD_JOINT_FRACTION：hard-joint mining 选取最难关节点比例。
 HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.2}"
+# W_COARSE_COORD / W_DEFORM_COORD：coarse 与 deformable 后坐标深监督权重。
+W_COARSE_COORD="${W_COARSE_COORD:-0.5}"
+W_DEFORM_COORD="${W_DEFORM_COORD:-0.75}"
+# W_REFINE_COORDS：每个 refinement step 的坐标深监督权重，逗号分隔。
+W_REFINE_COORDS="${W_REFINE_COORDS:-0.75,1.0,1.25}"
+# W_SIMCC_*：SimCC 分布辅助监督权重。
+W_SIMCC_COARSE="${W_SIMCC_COARSE:-0.1}"
+W_SIMCC_DEFORM="${W_SIMCC_DEFORM:-0.15}"
+W_SIMCC_REFINE="${W_SIMCC_REFINE:-0.15,0.2,0.25}"
+# SIMCC_SIGMA：SimCC soft-label 高斯分布的 bin-space sigma。
+SIMCC_SIGMA="${SIMCC_SIGMA:-2.0}"
 
 ###############################################################################
 # Locate 生成框 / grounding 辅助监督参数
@@ -652,9 +665,14 @@ for spec in \
   "STAGE2_MAX_STEPS:${STAGE2_MAX_STEPS}" \
   "NUM_WORKERS:${NUM_WORKERS}" \
   "VISUALIZE_EVERY:${VISUALIZE_EVERY}" \
+  "SIMCC_BINS:${SIMCC_BINS}" \
   "LOCATE_LM_LOSS_EVERY:${LOCATE_LM_LOSS_EVERY}"; do
   require_nonnegative_int "${spec%%:*}" "${spec#*:}"
 done
+if [[ "${SIMCC_BINS}" == "1" ]]; then
+  echo "SIMCC_BINS must be 0 to disable SimCC or greater than 1." >&2
+  exit 1
+fi
 
 for spec in \
   RUN_STAGE1 RUN_STAGE2 STAGE1_FREEZE_LOCATE STAGE2_FREEZE_LOCATE STAGE2_INIT_FROM_STAGE1 \
@@ -842,7 +860,7 @@ common_args() {
   a+=(--locate_lora_r "${LOCATE_LORA_R}" --locate_lora_alpha "${LOCATE_LORA_ALPHA}" --locate_lora_dropout "${LOCATE_LORA_DROPOUT}")
   a+=(--locate_vision_lora_r "${LOCATE_VISION_LORA_R}" --locate_vision_lora_alpha "${LOCATE_VISION_LORA_ALPHA}" --locate_vision_lora_dropout "${LOCATE_VISION_LORA_DROPOUT}")
   a+=(--hidden_dim "${HIDDEN_DIM}" --pose_decoder_layers "${POSE_DECODER_LAYERS}" --refinement_steps "${REFINEMENT_STEPS}" --decoder_heads "${DECODER_HEADS}")
-  a+=(--box_condition_scale "${BOX_CONDITION_SCALE}" --pose_roi_size "${POSE_ROI_SIZE}")
+  a+=(--box_condition_scale "${BOX_CONDITION_SCALE}" --pose_roi_size "${POSE_ROI_SIZE}" --simcc_bins "${SIMCC_BINS}")
   a+=(--locate_vision_scale "${LOCATE_VISION_SCALE}")
   a+=(--locate_generation_mode "${LOCATE_GENERATION_MODE}" --locate_box_max_new_tokens "${LOCATE_BOX_MAX_NEW_TOKENS}")
   a+=(--box_match_iou_thresh "${BOX_MATCH_IOU_THRESH}" --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}")
@@ -850,6 +868,8 @@ common_args() {
   a+=(--log_every "${LOG_EVERY}" --save_every "${SAVE_EVERY}" --save_total_limit "${SAVE_TOTAL_LIMIT}" --seed "${SEED}" --device "${DEVICE}")
   a+=(--w_oks "${W_OKS}" --w_coord "${W_COORD}" --w_vis "${W_VIS}")
   a+=(--w_hard_joint "${W_HARD_JOINT}" --hard_joint_fraction "${HARD_JOINT_FRACTION}")
+  a+=(--w_coarse_coord "${W_COARSE_COORD}" --w_deform_coord "${W_DEFORM_COORD}" --w_refine_coords "${W_REFINE_COORDS}")
+  a+=(--w_simcc_coarse "${W_SIMCC_COARSE}" --w_simcc_deform "${W_SIMCC_DEFORM}" --w_simcc_refine "${W_SIMCC_REFINE}" --simcc_sigma "${SIMCC_SIGMA}")
   a+=(--visualize_every "${VISUALIZE_EVERY}" --visualize_max_instances "${VISUALIZE_MAX_INSTANCES}")
   add_opt a --max_samples_per_dataset "${MAX_SAMPLES_PER_DATASET}"
   add_opt a --deepspeed_config "${DEEPSPEED_CONFIG}"
@@ -912,6 +932,14 @@ run_stage() {
   echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS}"
   echo "LOCATE_IMAGE_TOKEN_LIMIT=${LOCATE_IMAGE_TOKEN_LIMIT}"
   echo "BOX_SOURCE=${box_source}"
+  echo "SIMCC_BINS=${SIMCC_BINS}"
+  echo "W_COARSE_COORD=${W_COARSE_COORD}"
+  echo "W_DEFORM_COORD=${W_DEFORM_COORD}"
+  echo "W_REFINE_COORDS=${W_REFINE_COORDS}"
+  echo "W_SIMCC_COARSE=${W_SIMCC_COARSE}"
+  echo "W_SIMCC_DEFORM=${W_SIMCC_DEFORM}"
+  echo "W_SIMCC_REFINE=${W_SIMCC_REFINE}"
+  echo "SIMCC_SIGMA=${SIMCC_SIGMA}"
   echo "BOX_JITTER_SCALE=${jitter_scale}"
   echo "BOX_JITTER_SHIFT=${jitter_shift}"
   echo "W_LOCATE_BOX_LM=${w_box_lm}"

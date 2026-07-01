@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v1.2 - 2026-07-01
+
+- Refreshed the published LocatePose launch defaults in `scripts/locatepose.sh`, moving the default visible devices back to `0,3` with `NPROC_PER_NODE=2` and keeping the current two-stage `crowdpose -> coco,mpii,crowdpose,refhuman` training schedule.
+- Added the current auxiliary supervision recipe for LocatePose through `simcc_bins`, coarse/deform/refine coordinate deep supervision, and SimCC distribution losses across `scripts/locatepose.sh`, `qwenpose.model`, `qwenpose.losses`, and `qwenpose.train_pose`.
+- Updated the public English and Chinese READMEs so the documented LocatePose defaults, example launch command, and exposed knobs match the live training script for this release.
+- Bumped the repository snapshot version to `v1.2` through `VERSION`, `qwenpose.__version__`, dependency headers, and the Git tag convention used for public releases.
+
 ## v1.1 - 2026-06-30
 
 - Refreshed the published LocatePose training defaults in `scripts/locatepose.sh`, including the current `crowdpose` stage-1 dataset, the `80 + 5` epoch two-stage schedule, updated stage-1 box jitter, aligned pose loss weights, and the current four-GPU launch defaults.

@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v1.1`
+版本：`v1.2`
 
 [English](README.md) | 中文
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v1.1` 快照在以下环境中完成验证：
+这个 `v1.2` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -334,8 +334,8 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 
 其他关键默认值：
 
-- `CUDA_VISIBLE_DEVICES=0,1,2,3`
-- `NPROC_PER_NODE=4`
+- `CUDA_VISIBLE_DEVICES=0,3`
+- `NPROC_PER_NODE=2`
 - `STAGE1_BATCH_SIZE=8`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
@@ -346,6 +346,14 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 - `STAGE1_BOX_JITTER_SHIFT=0.1`
 - `W_OKS=0.5`
 - `W_COORD=3.0`
+- `SIMCC_BINS=128`
+- `W_COARSE_COORD=0.5`
+- `W_DEFORM_COORD=0.75`
+- `W_REFINE_COORDS=0.75,1.0,1.25`
+- `W_SIMCC_COARSE=0.1`
+- `W_SIMCC_DEFORM=0.15`
+- `W_SIMCC_REFINE=0.15,0.2,0.25`
+- `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
@@ -360,12 +368,12 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 bash scripts/locatepose.sh
 ```
 
-4 卡训练示例：
+按当前默认 2 卡布局启动的示例：
 
 ```bash
-RUN_NAME=locatepose_v1_1 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=4 \
+RUN_NAME=locatepose_v1_2 \
+CUDA_VISIBLE_DEVICES=0,3 \
+NPROC_PER_NODE=2 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -391,6 +399,9 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表
 - `STAGE1_BOX_JITTER_SCALE`、`STAGE1_BOX_JITTER_SHIFT`：stage 1 GT box 扰动强度
 - `LOCATE_ATTN_IMPLEMENTATION`：训练时 LocateAnything 的 attention 后端，默认 `flash_attention_2`
+- `SIMCC_BINS`：SimCC 辅助头每个坐标轴的 bin 数；设为 `0` 可完全关闭 SimCC
+- `W_COARSE_COORD`、`W_DEFORM_COORD`、`W_REFINE_COORDS`：coarse、deformable 和 refinement 各阶段的坐标深监督权重
+- `W_SIMCC_COARSE`、`W_SIMCC_DEFORM`、`W_SIMCC_REFINE`、`SIMCC_SIGMA`：SimCC 辅助监督权重与高斯 soft-label 宽度
 - `LOCATE_IMAGE_TOKEN_LIMIT`：每张图的 raw MoonViT token 上限
 - `LOCATE_GENERATION_MODE`：LocateAnything 生成模式，可选 `fast`、`slow`、`hybrid`
 - `LOCATE_VISION_SCALE`：Locate vision LoRA 参数的学习率倍率
@@ -600,6 +611,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v1.1`
+- Git tag，例如 `v1.2`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

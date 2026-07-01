@@ -1,5 +1,5 @@
 # Optional add-on dependencies for integrated LocatePose vLLM inference/eval.
-# Tested with the v1.1 public snapshot on Linux + Python 3.11 + CUDA 12.6.
+# Tested with the v1.2 public snapshot on Linux + Python 3.11 + CUDA 12.6.
 #
 # Install this after the base environment:
 #   pip install -r requirements.txt

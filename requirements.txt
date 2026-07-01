@@ -1,5 +1,5 @@
 # Core runtime dependencies for the public LocatePose + QwenPose workflows.
-# Tested with Python 3.11.15 and CUDA 12.6 for release v1.1.
+# Tested with Python 3.11.15 and CUDA 12.6 for release v1.2.
 #
 # Install the PyTorch stack first so that flash-attn and the rest of the
 # training stack resolve against the correct CUDA build, for example:

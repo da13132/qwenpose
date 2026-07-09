@@ -254,22 +254,15 @@ if target.is_dir() and ((target / STAGE1_NAME).is_dir() or (target / STAGE2_NAME
     run_dir = target
     s1 = run_dir / STAGE1_NAME
     s2 = run_dir / STAGE2_NAME
-    s2_init = run_dir / "stage2_init_weights"
     stage1_dir = str(s1) if s1.exists() else ""
     stage2_dir = str(s2)
     if s2.exists() and has_checkpoint_payload(s2):
+        # A real stage-2 checkpoint wins when resuming from a full run dir.
         stage2_resume = latest_checkpoint(s2)
-    elif stage_has_activity(s2):
-        # Stage 2 has already been entered but has not saved a stage-2
-        # checkpoint yet. Continue the current stage from its weight-only init
-        # checkpoint if present; otherwise initialize from stage 1.
-        if has_checkpoint_payload(s2_init):
-            stage2_resume = latest_checkpoint(s2_init)
-        elif s1.exists() and has_checkpoint_payload(s1):
-            stage2_init = str(s1)
     elif s1.exists() and has_checkpoint_payload(s1):
-        # Only stage 1 has checkpoint payloads and stage 2 has not started, so
-        # resume stage 1 instead of prematurely jumping to stage 2.
+        # If stage 2 has only logs, an empty directory, or a weight-only init
+        # made by an earlier mistaken resume, it is not a resumable stage-2
+        # state. Continue the unfinished stage 1 checkpoint first.
         stage1_resume = latest_checkpoint(s1)
         run_stage1 = "1"
         run_stage2 = "1"

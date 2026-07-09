@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v1.3 - 2026-07-09
+
+- Updated the LocatePose public defaults to the current multi-dataset stage-1 recipe, four-GPU launch layout, larger pose ROI, and configurable dataset mixing weights in `scripts/locatepose.sh`.
+- Fixed dataset conversion details for stronger cross-dataset training: COCO/CrowdPose now preserve visible-vs-occluded labels, CrowdPose uses an explicit CrowdPose14 prompt, and MPII uses center/scale-derived pseudo boxes instead of tight visible-keypoint boxes.
+- Added split-aware AIC train/validation path resolution for both training records and metric loading so AIC validation uses the official validation annotations and images.
+- Bumped the repository snapshot version to `v1.3` through `VERSION`, `qwenpose.__version__`, dependency headers, README release notes, and the Git tag convention used for public releases.
+
 ## v1.2 - 2026-07-01
 
 - Refreshed the published LocatePose launch defaults in `scripts/locatepose.sh`, moving the default visible devices back to `0,3` with `NPROC_PER_NODE=2` and keeping the current two-stage `crowdpose -> coco,mpii,crowdpose,refhuman` training schedule.

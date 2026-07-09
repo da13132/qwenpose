@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v1.2`
+Release: `v1.3`
 
 English | [中文说明](README_zh.md)
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v1.2` snapshot was validated with:
+This `v1.3` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -329,23 +329,25 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `crowdpose` | `80` |
+| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `coco,mpii,crowdpose` | `100` |
 | stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA and vision LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
 Additional default knobs:
 
-- `CUDA_VISIBLE_DEVICES=0,3`
-- `NPROC_PER_NODE=2`
+- `CUDA_VISIBLE_DEVICES=0,1,2,3`
+- `NPROC_PER_NODE=4`
 - `STAGE1_BATCH_SIZE=8`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
-- `STAGE2_GRAD_ACCUM_STEPS=8`
+- `STAGE2_GRAD_ACCUM_STEPS=4`
 - `STAGE1_LR=2e-4`
 - `STAGE2_LR=5e-5`
 - `STAGE1_BOX_JITTER_SCALE=0.1`
 - `STAGE1_BOX_JITTER_SHIFT=0.1`
+- `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use values such as `coco:1,mpii:1,crowdpose:1` for balanced sampling
 - `W_OKS=0.5`
 - `W_COORD=3.0`
+- `POSE_ROI_SIZE=32`
 - `SIMCC_BINS=128`
 - `W_COARSE_COORD=0.5`
 - `W_DEFORM_COORD=0.75`
@@ -368,12 +370,12 @@ Start a new run:
 bash scripts/locatepose.sh
 ```
 
-Example with explicit run name and the current 2-GPU default layout:
+Example with explicit run name and the current 4-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v1_2 \
-CUDA_VISIBLE_DEVICES=0,3 \
-NPROC_PER_NODE=2 \
+RUN_NAME=locatepose_v1_3 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -611,6 +613,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v1.2`
+- Git tags such as `v1.3`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

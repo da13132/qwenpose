@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v1.2`
+版本：`v1.3`
 
 [English](README.md) | 中文
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v1.2` 快照在以下环境中完成验证：
+这个 `v1.3` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -329,23 +329,25 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 
 | 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
 |------|--------|----------------|------------|------------|------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 LocateAnything | `gt` | `crowdpose` | `80` |
+| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 LocateAnything | `gt` | `coco,mpii,crowdpose` | `100` |
 | stage 2 | `stage2_locate_box_closed_loop` | 解冻 Locate LoRA 和 vision LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
 其他关键默认值：
 
-- `CUDA_VISIBLE_DEVICES=0,3`
-- `NPROC_PER_NODE=2`
+- `CUDA_VISIBLE_DEVICES=0,1,2,3`
+- `NPROC_PER_NODE=4`
 - `STAGE1_BATCH_SIZE=8`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
-- `STAGE2_GRAD_ACCUM_STEPS=8`
+- `STAGE2_GRAD_ACCUM_STEPS=4`
 - `STAGE1_LR=2e-4`
 - `STAGE2_LR=5e-5`
 - `STAGE1_BOX_JITTER_SCALE=0.1`
 - `STAGE1_BOX_JITTER_SHIFT=0.1`
+- `DATASET_MIX_WEIGHTS=auto` 表示按数据量比例 interleave；例如 `coco:1,mpii:1,crowdpose:1` 可用于均衡采样
 - `W_OKS=0.5`
 - `W_COORD=3.0`
+- `POSE_ROI_SIZE=32`
 - `SIMCC_BINS=128`
 - `W_COARSE_COORD=0.5`
 - `W_DEFORM_COORD=0.75`
@@ -368,12 +370,12 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 bash scripts/locatepose.sh
 ```
 
-按当前默认 2 卡布局启动的示例：
+按当前默认 4 卡布局启动的示例：
 
 ```bash
-RUN_NAME=locatepose_v1_2 \
-CUDA_VISIBLE_DEVICES=0,3 \
-NPROC_PER_NODE=2 \
+RUN_NAME=locatepose_v1_3 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -611,6 +613,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v1.2`
+- Git tag，例如 `v1.3`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

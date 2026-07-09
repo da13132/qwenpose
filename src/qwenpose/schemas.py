@@ -168,17 +168,25 @@ def get_schema(name: str) -> SchemaSpec:
     )
 
 
-def schema_to_union(
+def _schema_to_union_impl(
     flat_keypoints: list[float] | list[int],
     schema_name: str,
     image_width: float,
     image_height: float,
+    *,
+    visibility_target: str = "valid",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert schema-specific keypoints to fixed union tensors.
 
+    Args:
+        visibility_target: How to fill the third channel used by the visibility
+            BCE target. ``valid`` keeps the previous behavior: every supervised
+            coordinate has target 1.0. ``coco`` treats ``v > 0`` as coordinate
+            supervision, but only ``v > 1`` as visible.
+
     Returns:
         keypoints: [U, 3] normalized x/y and confidence target.
-        valid: [U] bool mask. Only true keypoints contribute to losses.
+        valid: [U] bool mask. Only true keypoints contribute to coordinate losses.
     """
     spec = get_schema(schema_name)
     keypoints = torch.zeros(len(UNION_KEYPOINTS), 3, dtype=torch.float32)
@@ -187,15 +195,74 @@ def schema_to_union(
         raise ValueError(
             f"{schema_name} expects {len(spec.keypoints) * 3} values, got {len(flat_keypoints)}"
         )
+    width = max(float(image_width), 1.0)
+    height = max(float(image_height), 1.0)
     for local_idx, union_idx in enumerate(spec.indices.tolist()):
         x, y, v = flat_keypoints[local_idx * 3 : local_idx * 3 + 3]
-        if float(v) <= 0:
+        visibility = float(v)
+        if visibility <= 0:
             continue
-        keypoints[union_idx, 0] = float(x) / max(float(image_width), 1.0)
-        keypoints[union_idx, 1] = float(y) / max(float(image_height), 1.0)
-        keypoints[union_idx, 2] = 1.0
+        keypoints[union_idx, 0] = float(x) / width
+        keypoints[union_idx, 1] = float(y) / height
+        if visibility_target == "coco":
+            keypoints[union_idx, 2] = 1.0 if visibility > 1.0 else 0.0
+        elif visibility_target == "valid":
+            keypoints[union_idx, 2] = 1.0
+        else:
+            raise ValueError(f"Unknown visibility target mode: {visibility_target!r}")
         valid[union_idx] = True
     return keypoints.clamp_(0.0, 1.0), valid
+
+
+def schema_to_union(
+    flat_keypoints: list[float] | list[int],
+    schema_name: str,
+    image_width: float,
+    image_height: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _schema_to_union_impl(flat_keypoints, schema_name, image_width, image_height)
+
+
+def coco_to_union(
+    flat_keypoints: list[float] | list[int],
+    image_width: float,
+    image_height: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert COCO-style keypoints and preserve visible-vs-occluded labels.
+
+    COCO-style annotations use ``v == 0`` for missing, ``v == 1`` for labeled
+    but not visible, and ``v == 2`` for labeled and visible. Coordinates with
+    ``v in {1, 2}`` remain valid supervision, while the visibility target is 1
+    only for visible joints.
+    """
+    return _schema_to_union_impl(
+        flat_keypoints,
+        "COCO17",
+        image_width,
+        image_height,
+        visibility_target="coco",
+    )
+
+
+def crowdpose_to_union(
+    flat_keypoints: list[float] | list[int],
+    image_width: float,
+    image_height: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert CrowdPose keypoints and preserve visible-vs-occluded labels.
+
+    The local MMPose CrowdPose annotation names the 13th joint ``head``. To keep
+    the existing union output dimension and checkpoint format stable, this
+    schema maps that joint to the union ``head_top`` slot consistently in both
+    training and evaluation.
+    """
+    return _schema_to_union_impl(
+        flat_keypoints,
+        "CrowdPose14",
+        image_width,
+        image_height,
+        visibility_target="coco",
+    )
 
 
 def mpii_to_union(

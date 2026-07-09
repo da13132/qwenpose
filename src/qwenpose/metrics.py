@@ -459,6 +459,25 @@ def _flat_to_schema_keypoints(flat: list[float] | list[int], schema: str) -> tup
     return arr[:, :2], valid
 
 
+def _mpii_bbox_from_center_scale(
+    center: Any,
+    scale: Any,
+    *,
+    scale_multiplier: float = 1.25,
+) -> list[float] | None:
+    if center is None or len(center) < 2:
+        return None
+    try:
+        cx, cy = float(center[0]), float(center[1])
+        side = float(scale) * 200.0 * float(scale_multiplier)
+    except Exception:
+        return None
+    if not math.isfinite(cx) or not math.isfinite(cy) or not math.isfinite(side) or side <= 1.0:
+        return None
+    half = side * 0.5
+    return [cx - half, cy - half, cx + half, cy + half]
+
+
 def _load_mpii_gt(ann_path: Path, wanted_image_ids: set[str] | None) -> list[GTInstance]:
     if not ann_path.is_file():
         return []
@@ -476,9 +495,11 @@ def _load_mpii_gt(ann_path: Path, wanted_image_ids: set[str] | None) -> list[GTI
         valid = valid[:16]
         if not bool(valid.any()):
             continue
-        xs = joints[valid, 0]
-        ys = joints[valid, 1]
-        bbox = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+        bbox = _mpii_bbox_from_center_scale(ann.get("center"), ann.get("scale"))
+        if bbox is None:
+            xs = joints[valid, 0]
+            ys = joints[valid, 1]
+            bbox = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
         area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 1.0)
         instances.append(
             GTInstance(
@@ -503,8 +524,8 @@ def _load_aic_gt(root: Path, split: str, wanted_image_ids: set[str] | None) -> l
     except Exception:
         return []
     try:
-        ann_path = resolve_aic_annotation_path(root)
-        image_root = resolve_aic_image_root(root)
+        ann_path = resolve_aic_annotation_path(root, split)
+        image_root = resolve_aic_image_root(root, split)
     except FileNotFoundError:
         return []
     data = json.loads(ann_path.read_text(encoding="utf-8"))
@@ -531,7 +552,7 @@ def _load_aic_gt(root: Path, split: str, wanted_image_ids: set[str] | None) -> l
             instances.append(
                 GTInstance(
                     dataset="aic",
-                image_id=normalize_image_id("aic", image_id),
+                    image_id=normalize_image_id("aic", image_id),
                     schema="AIC14",
                     width=width,
                     height=height,

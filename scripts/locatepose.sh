@@ -357,9 +357,9 @@ esac
 # DEEPSPEED_CONFIG：DeepSpeed JSON 配置路径；ZERO_STAGE=none 时为空。
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${DEFAULT_DEEPSPEED_CONFIG}}"
 # CUDA_VISIBLE_DEVICES：可见 GPU 列表。
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 # NPROC_PER_NODE：每个节点启动的训练进程数，一般等于可见 GPU 数。
-export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 # MASTER_ADDR：torch.distributed 主节点地址。
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 # MASTER_PORT：torch.distributed 端口；默认随机选一个高位端口。
@@ -387,6 +387,9 @@ DATASET_ROOT="${DATASET_ROOT:-datasets}"
 SPLIT="${SPLIT:-train}"
 # MIXING_STRATEGY：多数据集混合方式。interleave 会按数据集交错采样。
 MIXING_STRATEGY="${MIXING_STRATEGY:-interleave}"
+# DATASET_MIX_WEIGHTS：多数据集采样权重；auto/空值表示按数据量比例。
+# 例如 DATASET_MIX_WEIGHTS=coco:1,mpii:1,crowdpose:1 可避免 COCO 更新占比过高。
+DATASET_MIX_WEIGHTS="${DATASET_MIX_WEIGHTS:-auto}"
 # MAX_INSTANCES：每张图最多保留/训练的人体实例数。
 MAX_INSTANCES="${MAX_INSTANCES:-80}"
 # MAX_SAMPLES_PER_DATASET：每个数据集最多样本数；空值表示不截断。
@@ -458,7 +461,7 @@ DECODER_HEADS="${DECODER_HEADS:-8}"
 # BOX_CONDITION_SCALE：PoseHead 使用条件框前的放大比例，给关键点留上下文。
 BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
 # POSE_ROI_SIZE：每个 box 从 Locate feature map 上采样的 ROI 特征边长。
-POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
+POSE_ROI_SIZE="${POSE_ROI_SIZE:-32}"
 # SIMCC_BINS：SimCC 辅助头每个坐标轴的离散 bin 数；0 表示关闭。
 SIMCC_BINS="${SIMCC_BINS:-128}"
 # DISABLE_REFINEMENT：是否关闭 keypoint refinement。
@@ -567,11 +570,11 @@ STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_DIR}/stage2_locate_box_closed_l
 # STAGE2_INIT_WEIGHTS_DIR：stage2 weight-only 初始化 checkpoint 临时目录。
 STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_weights}"
 # STAGE1_TRAIN_DATASETS：stage1 训练数据集。 #coco,mpii,crowdpose,refhuman,aic
-STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-crowdpose}"
+STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose}"
 # STAGE2_TRAIN_DATASETS：stage2 训练数据集。
 STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 # STAGE1_EPOCHS：stage1 epoch 数。
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-80}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
 # STAGE2_EPOCHS：stage2 epoch 数。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 # STAGE1_BATCH_SIZE：stage1 每卡 micro batch size；Locate vision 走 flash_attention_2 full-batch forward。
@@ -581,7 +584,7 @@ STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-1}"
 # STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。
 STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
 # STAGE2_GRAD_ACCUM_STEPS：stage2 梯度累积步数。
-STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-8}"
+STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-4}"
 # STAGE1_LR：stage1 基础学习率。
 STAGE1_LR="${STAGE1_LR:-2e-4}"
 # STAGE2_LR：stage2 基础学习率。
@@ -851,6 +854,7 @@ common_args() {
   a+=(--refhuman_max_captions_per_instance "${REFHUMAN_MAX_CAPTIONS_PER_INSTANCE}")
   a+=(--num_workers "${NUM_WORKERS}" --prefetch_factor "${PREFETCH_FACTOR}")
   a+=(--mixing_strategy "${MIXING_STRATEGY}" --record_cache_dir "${RECORD_CACHE_DIR}")
+  add_opt a --dataset_mix_weights "${DATASET_MIX_WEIGHTS}"
   a+=(--locate_model_path "${LOCATE_MODEL_PATH}" --locate_dtype "${LOCATE_DTYPE}" --locate_attn_implementation "${LOCATE_ATTN_IMPLEMENTATION}")
   add_opt a --locate_min_pixels "${LOCATE_MIN_PIXELS}"
   add_opt a --locate_max_pixels "${LOCATE_MAX_PIXELS}"

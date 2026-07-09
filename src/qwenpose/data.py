@@ -22,11 +22,18 @@ try:
 except Exception:  # pragma: no cover - tqdm is optional for minimal envs.
     tqdm = None
 
-from .schemas import SCHEMA_TO_ID, UNION_KEYPOINTS, get_schema, mpii_to_union, schema_to_union
+from .schemas import (
+    SCHEMA_TO_ID,
+    UNION_KEYPOINTS,
+    coco_to_union,
+    crowdpose_to_union,
+    get_schema,
+    mpii_to_union,
+)
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 7
+RECORD_CACHE_VERSION = 8
 
 
 def _distributed_rank() -> int:
@@ -130,6 +137,34 @@ def box_from_keypoints(keypoints: torch.Tensor, valid: torch.Tensor) -> list[flo
     pad_x = max((x2 - x1) * 0.15, 0.03)
     pad_y = max((y2 - y1) * 0.15, 0.03)
     return [max(x1 - pad_x, 0.0), max(y1 - pad_y, 0.0), min(x2 + pad_x, 1.0), min(y2 + pad_y, 1.0)]
+
+
+def mpii_box_from_center_scale(
+    center: list[float] | tuple[float, float],
+    scale: float,
+    width: float,
+    height: float,
+    *,
+    scale_multiplier: float = 1.25,
+) -> list[float] | None:
+    """Build a MPII pseudo person box from the official center/scale fields.
+
+    MPII does not provide COCO-style person boxes. Its top-down protocol is
+    centered on ``center`` and ``scale`` where one scale unit corresponds to
+    roughly 200 pixels. Using this crop-derived pseudo box is more stable for a
+    box-conditioned pose head than a tight box around visible keypoints.
+    """
+    if center is None or len(center) < 2:
+        return None
+    try:
+        cx, cy = float(center[0]), float(center[1])
+        side = float(scale) * 200.0 * float(scale_multiplier)
+    except Exception:
+        return None
+    if not math.isfinite(cx) or not math.isfinite(cy) or not math.isfinite(side) or side <= 1.0:
+        return None
+    half = side * 0.5
+    return clamp_box_xyxy([cx - half, cy - half, cx + half, cy + half], width, height)
 
 
 def read_image_tensor(path: Path, image_size: int) -> tuple[torch.Tensor, int, int]:
@@ -605,7 +640,7 @@ def _load_aic_image_sizes(
     disable_cache: bool,
     show_progress: bool,
 ) -> dict[str, tuple[int, int]]:
-    ann_path = resolve_aic_annotation_path(root)
+    ann_path = resolve_aic_annotation_path(root, split)
     source_paths = [ann_path, image_root]
     target_annotations = annotations if max_images is None else annotations[: max(int(max_images), 0)]
     cache_path = None
@@ -674,33 +709,52 @@ def _load_aic_image_sizes(
     return size_map
 
 
-def resolve_aic_annotation_path(root: Path) -> Path:
-    candidates = [
-        root / "ai_challenger_keypoint_train_annotations_20170909" / "keypoint_train_annotations_20170909.json",
-        root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_annotations_20170902.json",
-    ]
+def _normalize_aic_split(split: str) -> str:
+    split_name = str(split).lower()
+    if split_name in {"val", "valid", "validation"}:
+        return "val"
+    # The local tree has the official train and validation files separately;
+    # keep trainval as the historical train-only behavior unless a caller
+    # explicitly asks for val.
+    return "train"
+
+
+def resolve_aic_annotation_path(root: Path, split: str = "train") -> Path:
+    normalized_split = _normalize_aic_split(split)
+    if normalized_split == "val":
+        candidates = [
+            root / "ai_challenger_keypoint_validation_20170911" / "keypoint_validation_annotations_20170911.json",
+        ]
+    else:
+        candidates = [
+            root / "ai_challenger_keypoint_train_annotations_20170909" / "keypoint_train_annotations_20170909.json",
+            root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_annotations_20170902.json",
+        ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        "Could not find the AIC annotation JSON. Supported layouts are: "
-        "ai_challenger_keypoint_train_annotations_20170909/keypoint_train_annotations_20170909.json "
-        "or ai_challenger_keypoint_train_20170902/keypoint_train_annotations_20170902.json. "
-        f"Tried: {', '.join(str(path) for path in candidates)}"
+        f"Could not find the AIC {normalized_split} annotation JSON. Tried: "
+        f"{', '.join(str(path) for path in candidates)}"
     )
 
 
-def resolve_aic_image_root(root: Path) -> Path:
-    candidates = [
-        root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_images_20170902",
-    ]
+def resolve_aic_image_root(root: Path, split: str = "train") -> Path:
+    normalized_split = _normalize_aic_split(split)
+    if normalized_split == "val":
+        candidates = [
+            root / "ai_challenger_keypoint_validation_20170911" / "keypoint_validation_images_20170911",
+        ]
+    else:
+        candidates = [
+            root / "ai_challenger_keypoint_train_20170902" / "keypoint_train_images_20170902",
+        ]
     for candidate in candidates:
         if candidate.is_dir():
             return candidate
     raise FileNotFoundError(
-        "Could not find the AIC image directory. Expected: "
-        "ai_challenger_keypoint_train_20170902/keypoint_train_images_20170902. "
-        f"Tried: {', '.join(str(path) for path in candidates)}"
+        f"Could not find the AIC {normalized_split} image directory. Tried: "
+        f"{', '.join(str(path) for path in candidates)}"
     )
 
 
@@ -723,7 +777,7 @@ def load_coco_records(
         img = images[image_id]
         boxes, kpts, masks = [], [], []
         for ann in anns:
-            kp, valid = schema_to_union(ann["keypoints"], "COCO17", img["width"], img["height"])
+            kp, valid = coco_to_union(ann["keypoints"], img["width"], img["height"])
             if valid.sum().item() == 0:
                 continue
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(ann["bbox"]), img["width"], img["height"]))
@@ -764,7 +818,7 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
         img = images[image_id]
         boxes, kpts, masks = [], [], []
         for ann in anns:
-            kp, valid = schema_to_union(ann["keypoints"], "CrowdPose14", img["width"], img["height"])
+            kp, valid = crowdpose_to_union(ann["keypoints"], img["width"], img["height"])
             if valid.sum().item() == 0:
                 continue
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(ann["bbox"]), img["width"], img["height"]))
@@ -781,8 +835,8 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
             "CrowdPose14",
             "ALL_POSE",
             "Locate all the instances that match the following description: person. "
-            "Estimate the human pose for each located person. "
-            "Use the available keypoint schema.",
+            "Estimate the human pose for each located person using the CrowdPose14 keypoint schema "
+            "with 14 keypoints: shoulders, elbows, wrists, hips, knees, ankles, head, and neck.",
             "crowdpose",
             str(image_id),
         )
@@ -799,10 +853,8 @@ def load_aic_records(
     disable_cache: bool = False,
     show_progress: bool = True,
 ) -> list[PoseRecord]:
-    if split not in ("train", "trainval"):
-        _data_log(f"AIC split {split!r} is not available in this local tree; falling back to train.")
-    ann_path = resolve_aic_annotation_path(root)
-    image_root = resolve_aic_image_root(root)
+    ann_path = resolve_aic_annotation_path(root, split)
+    image_root = resolve_aic_image_root(root, split)
     data = json.load(open(ann_path, encoding="utf-8"))
     image_size_map = _load_aic_image_sizes(
         root=root,
@@ -899,17 +951,18 @@ def load_mpii_records(root: Path, split: str = "train", max_samples: int | None 
             kp, valid = mpii_to_union(ann["joints"], ann["joints_vis"], width, height)
             if valid.sum().item() == 0:
                 continue
-            box_norm = box_from_keypoints(kp, valid)
-            if box_norm is None:
-                continue
-            boxes.append(
-                [
+            box = mpii_box_from_center_scale(ann.get("center"), ann.get("scale", 0.0), width, height)
+            if box is None:
+                box_norm = box_from_keypoints(kp, valid)
+                if box_norm is None:
+                    continue
+                box = [
                     box_norm[0] * width,
                     box_norm[1] * height,
                     box_norm[2] * width,
                     box_norm[3] * height,
                 ]
-            )
+            boxes.append(box)
             kpts.append(kp)
             masks.append(valid)
         _record_if_valid(
@@ -970,7 +1023,7 @@ def load_refhuman_records(
         ref_target = -1
         for idx, cand in enumerate(candidates):
             cand_ann = cand["ann"]
-            kp, valid = schema_to_union(cand_ann["keypoints"], "COCO17", img["width"], img["height"])
+            kp, valid = coco_to_union(cand_ann["keypoints"], img["width"], img["height"])
             if valid.sum().item() == 0:
                 continue
             if cand["candidate_key"] == target_key:
@@ -1095,7 +1148,7 @@ def build_datasets(
             )
         elif name == "aic":
             root = dataset_root / "aic"
-            source_paths = [resolve_aic_annotation_path(root)]
+            source_paths = [resolve_aic_annotation_path(root, split), resolve_aic_image_root(root, split)]
             records = _load_records_cached(
                 dataset_name=name,
                 root=root,

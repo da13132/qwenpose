@@ -208,6 +208,28 @@ def has_checkpoint_payload(path: Path) -> bool:
         return True
     return any(path.glob("checkpoint-*")) or any(path.glob("checkpoint_step_*.pt"))
 
+def checkpoint_step(path: Path) -> int:
+    import re
+
+    if path.is_dir():
+        match = re.search(r"checkpoint-(\d+)$", path.name)
+    else:
+        match = re.search(r"checkpoint_step_(\d+)\.pt$", path.name)
+    return int(match.group(1)) if match else -1
+
+def latest_checkpoint(path: Path) -> str:
+    if path.is_file() or (path / CHECKPOINT_PAYLOAD_NAME).is_file() or (path / "deepspeed").exists():
+        return str(path)
+    candidates = [candidate for candidate in list(path.glob("checkpoint-*")) + list(path.glob("checkpoint_step_*.pt")) if checkpoint_step(candidate) >= 0]
+    return str(sorted(candidates, key=checkpoint_step)[-1]) if candidates else ""
+
+def stage_has_activity(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if has_checkpoint_payload(path):
+        return True
+    return any(path.iterdir())
+
 def latest_log_file(run_dir: Path) -> str:
     log_dir = run_dir / "logs"
     if not log_dir.is_dir():
@@ -232,18 +254,39 @@ if target.is_dir() and ((target / STAGE1_NAME).is_dir() or (target / STAGE2_NAME
     run_dir = target
     s1 = run_dir / STAGE1_NAME
     s2 = run_dir / STAGE2_NAME
+    s2_init = run_dir / "stage2_init_weights"
     stage1_dir = str(s1) if s1.exists() else ""
     stage2_dir = str(s2)
     if s2.exists() and has_checkpoint_payload(s2):
-        stage2_resume = str(s2)
+        stage2_resume = latest_checkpoint(s2)
+    elif stage_has_activity(s2):
+        # Stage 2 has already been entered but has not saved a stage-2
+        # checkpoint yet. Continue the current stage from its weight-only init
+        # checkpoint if present; otherwise initialize from stage 1.
+        if has_checkpoint_payload(s2_init):
+            stage2_resume = latest_checkpoint(s2_init)
+        elif s1.exists() and has_checkpoint_payload(s1):
+            stage2_init = str(s1)
     elif s1.exists() and has_checkpoint_payload(s1):
-        stage2_init = str(s1)
+        # Only stage 1 has checkpoint payloads and stage 2 has not started, so
+        # resume stage 1 instead of prematurely jumping to stage 2.
+        stage1_resume = latest_checkpoint(s1)
+        run_stage1 = "1"
+        run_stage2 = "1"
 elif target.is_dir() and target.name == STAGE2_NAME:
     run_dir = target.parent
     stage1_candidate = run_dir / STAGE1_NAME
+    s2_init = run_dir / "stage2_init_weights"
     stage1_dir = str(stage1_candidate) if stage1_candidate.exists() else ""
     stage2_dir = str(target)
-    stage2_resume = str(target)
+    if has_checkpoint_payload(target):
+        stage2_resume = latest_checkpoint(target)
+    elif has_checkpoint_payload(s2_init):
+        stage2_resume = latest_checkpoint(s2_init)
+    elif stage1_candidate.exists() and has_checkpoint_payload(stage1_candidate):
+        stage2_init = str(stage1_candidate)
+    else:
+        stage2_resume = str(target)
 elif target.parent.name == STAGE2_NAME:
     run_dir = target.parent.parent
     stage1_candidate = run_dir / STAGE1_NAME
@@ -260,17 +303,23 @@ elif target.is_dir() and target.name == STAGE1_NAME:
     run_dir = target.parent
     stage1_dir = str(target)
     stage2_dir = str(run_dir / STAGE2_NAME)
-    stage2_init = str(target)
+    stage1_resume = latest_checkpoint(target)
+    run_stage1 = "1"
+    run_stage2 = "1"
 elif target.parent.name == STAGE1_NAME:
     run_dir = target.parent.parent
     stage1_dir = str(target.parent)
     stage2_dir = str(run_dir / STAGE2_NAME)
-    stage2_init = str(target.parent)
+    stage1_resume = str(target)
+    run_stage1 = "1"
+    run_stage2 = "1"
 elif target.parent.name.startswith("checkpoint-") and target.parent.parent.name == STAGE1_NAME:
     run_dir = target.parent.parent.parent
     stage1_dir = str(target.parent.parent)
     stage2_dir = str(run_dir / STAGE2_NAME)
-    stage2_init = str(target.parent.parent)
+    stage1_resume = str(target)
+    run_stage1 = "1"
+    run_stage2 = "1"
 elif target.is_dir() and has_checkpoint_payload(target):
     run_dir = target.parent
     stage2_dir = str(target)
@@ -974,6 +1023,9 @@ echo "STAGE1_OUTPUT_DIR=${STAGE1_OUTPUT_DIR}"
 echo "STAGE2_OUTPUT_DIR=${STAGE2_OUTPUT_DIR}"
 echo "RUN_STAGE1=${RUN_STAGE1}"
 echo "RUN_STAGE2=${RUN_STAGE2}"
+echo "STAGE1_RESUME_FROM_CHECKPOINT=${STAGE1_RESUME_FROM_CHECKPOINT}"
+echo "STAGE2_RESUME_FROM_CHECKPOINT=${STAGE2_RESUME_FROM_CHECKPOINT}"
+echo "STAGE2_INIT_CHECKPOINT=${STAGE2_INIT_CHECKPOINT}"
 echo "LOCATE_MODEL_PATH=${LOCATE_MODEL_PATH}"
 echo "LOCATE_ATTN_IMPLEMENTATION=${LOCATE_ATTN_IMPLEMENTATION}"
 echo "LOCATE_MIN_PIXELS=${LOCATE_MIN_PIXELS}"

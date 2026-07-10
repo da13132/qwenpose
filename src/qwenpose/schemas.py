@@ -246,13 +246,18 @@ def coco_to_union(
     image_width: float,
     image_height: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert COCO-style keypoints while preserving occlusion labels."""
+    """Treat every annotated COCO joint as a positive visibility target.
+
+    Both visible (v=2) and occluded-but-labeled (v=1) joints supervise
+    coordinates and the shared visibility head. Missing joints (v=0) remain
+    excluded from all pose losses.
+    """
     return _schema_to_union_impl(
         flat_keypoints,
         "COCO17",
         image_width,
         image_height,
-        visibility_target="coco",
+        visibility_target="visible_if_valid",
     )
 
 
@@ -261,13 +266,13 @@ def crowdpose_to_union(
     image_width: float,
     image_height: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert CrowdPose keypoints and keep its head joint semantically separate."""
+    """Treat every annotated CrowdPose joint as visible while keeping its head separate."""
     return _schema_to_union_impl(
         flat_keypoints,
         "CrowdPose14",
         image_width,
         image_height,
-        visibility_target="coco",
+        visibility_target="visible_if_valid",
     )
 
 
@@ -285,5 +290,5 @@ def mpii_to_union(
         "MPII16",
         image_width,
         image_height,
-        visibility_target="none",
+        visibility_target="visible_if_valid",
     )

@@ -21,8 +21,8 @@ fi
 # 目标模型：LocateAnything-3B + QwenPose PoseHead。
 #
 # Stage 1 / GT-box pose warmup：
-#   冻结 LocateAnything，只训练 PoseHead / 特征 refiner 等 pose 相关模块；
-#   PoseHead 输入 GT box，当前默认训练 80 epoch。
+#   跳过语言模型，只使用 MoonViT 视觉特征；训练 vision LoRA、PoseHead 和特征适配器；
+#   PoseHead 输入 GT box，按固定 optimizer step 快速收敛。
 #
 # Stage 2 / closed-loop Locate-box training：
 #   解冻 LocateAnything LoRA / vision LoRA 等可训练适配参数；
@@ -59,8 +59,8 @@ Options:
   -h, --help      Show this help message.
 
 Stages:
-  stage1_freeze_locate_gt_box       freeze LocateAnything, use GT boxes
-  stage2_locate_box_closed_loop     unfreeze Locate adapters, use Locate-generated boxes
+  stage1_freeze_locate_gt_box       MoonViT vision-only warmup with vision LoRA and GT boxes
+  stage2_locate_box_closed_loop     full multimodal Locate adapters with generated boxes
 EOF
 }
 
@@ -430,7 +430,7 @@ SPLIT="${SPLIT:-train}"
 # MIXING_STRATEGY：多数据集混合方式。interleave 会按数据集交错采样。
 MIXING_STRATEGY="${MIXING_STRATEGY:-interleave}"
 # DATASET_MIX_WEIGHTS：多数据集采样权重；默认 auto，严格按各数据集 record 数量比例训练。
-# 仅做消融实验时才手动指定 name:weight；正式五数据集训练保持 auto。
+# 仅做消融实验时才手动指定 name:weight；正式训练保持 auto。
 DATASET_MIX_WEIGHTS="${DATASET_MIX_WEIGHTS:-auto}"
 # MAX_INSTANCES：每张图最多保留/训练的人体实例数。
 MAX_INSTANCES="${MAX_INSTANCES:-80}"
@@ -474,19 +474,19 @@ LOCATE_FEATURE_REFINER_LAYERS="${LOCATE_FEATURE_REFINER_LAYERS:-2}"
 # LOCATE_FEATURE_REFINER_BOTTLENECK_DIM：Locate 特征 refiner bottleneck 隐藏维度。
 LOCATE_FEATURE_REFINER_BOTTLENECK_DIM="${LOCATE_FEATURE_REFINER_BOTTLENECK_DIM:-256}"
 # LOCATE_FEATURE_REFINER_INIT_SCALE：refiner 残差初始化尺度，越小越稳。
-LOCATE_FEATURE_REFINER_INIT_SCALE="${LOCATE_FEATURE_REFINER_INIT_SCALE:-0.1}"
+LOCATE_FEATURE_REFINER_INIT_SCALE="${LOCATE_FEATURE_REFINER_INIT_SCALE:-0.05}"
 # LOCATE_LORA_R：LocateAnything 语言/主干 LoRA rank。
 LOCATE_LORA_R="${LOCATE_LORA_R:-32}"
 # LOCATE_LORA_ALPHA：LocateAnything 语言/主干 LoRA alpha。
 LOCATE_LORA_ALPHA="${LOCATE_LORA_ALPHA:-64}"
 # LOCATE_LORA_DROPOUT：LocateAnything 语言/主干 LoRA dropout。
-LOCATE_LORA_DROPOUT="${LOCATE_LORA_DROPOUT:-0.05}"
+LOCATE_LORA_DROPOUT="${LOCATE_LORA_DROPOUT:-0.0}"
 # LOCATE_VISION_LORA_R：LocateAnything vision 分支 LoRA rank。
 LOCATE_VISION_LORA_R="${LOCATE_VISION_LORA_R:-16}"
 # LOCATE_VISION_LORA_ALPHA：LocateAnything vision 分支 LoRA alpha。
 LOCATE_VISION_LORA_ALPHA="${LOCATE_VISION_LORA_ALPHA:-32}"
 # LOCATE_VISION_LORA_DROPOUT：LocateAnything vision 分支 LoRA dropout。
-LOCATE_VISION_LORA_DROPOUT="${LOCATE_VISION_LORA_DROPOUT:-0.05}"
+LOCATE_VISION_LORA_DROPOUT="${LOCATE_VISION_LORA_DROPOUT:-0.0}"
 
 ###############################################################################
 # PoseHead 结构参数
@@ -500,6 +500,8 @@ POSE_DECODER_LAYERS="${POSE_DECODER_LAYERS:-3}"
 REFINEMENT_STEPS="${REFINEMENT_STEPS:-3}"
 # DECODER_HEADS：pose decoder attention head 数。
 DECODER_HEADS="${DECODER_HEADS:-8}"
+# POSE_DROPOUT：快速收敛阶段关闭 Transformer dropout。
+POSE_DROPOUT="${POSE_DROPOUT:-0.0}"
 # BOX_CONDITION_SCALE：全局二次放大比例。数据记录已携带 per-dataset context scale，固定为 1。
 BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.0}"
 # SCHEMA_JOINT_PRIORS_PATH：各 schema 在自身 box 协议下的关节点几何先验。
@@ -518,13 +520,13 @@ DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
 # LR：全局基础学习率；stage 可用 STAGE*_LR 单独覆盖。
 LR="${LR:-2e-4}"
 # LOCATE_VISION_SCALE：LocateAnything vision LoRA 参数学习率相对 LR 的倍率。
-LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.02}"
+LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.05}"
 # WEIGHT_DECAY：AdamW weight decay。
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 # GRAD_CLIP：梯度裁剪范数。
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 # WARMUP_STEPS：scheduler warmup step 数。
-WARMUP_STEPS="${WARMUP_STEPS:-100}"
+WARMUP_STEPS="${WARMUP_STEPS:-500}"
 # MIN_LR_RATIO：cosine scheduler 最低学习率比例。
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.1}"
 # DEVICE：训练设备。cuda 为正式训练，cpu 主要用于 dry-run/debug。
@@ -534,13 +536,13 @@ AMP="${AMP:-0}"
 # LOG_EVERY：训练日志打印间隔。
 LOG_EVERY="${LOG_EVERY:-10}"
 # SAVE_EVERY：checkpoint 保存间隔。
-SAVE_EVERY="${SAVE_EVERY:-500}"
+SAVE_EVERY="${SAVE_EVERY:-2000}"
 # SAVE_TOTAL_LIMIT：每个 stage 最多保留多少个 checkpoint。
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1}"
 # SEED：随机种子。
 SEED="${SEED:-42}"
 # VISUALIZE_EVERY：训练可视化保存间隔，0 表示关闭。
-VISUALIZE_EVERY="${VISUALIZE_EVERY:-10}"
+VISUALIZE_EVERY="${VISUALIZE_EVERY:-100}"
 # VISUALIZE_MAX_INSTANCES：每张可视化最多绘制实例数。
 VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-8}"
 # DRY_RUN_DATA：只解析数据和打印首个 batch，不加载模型、不训练。
@@ -574,9 +576,9 @@ W_DEFORM_COORD="${W_DEFORM_COORD:-0.75}"
 # W_REFINE_COORDS：每个 refinement step 的坐标深监督权重，逗号分隔。
 W_REFINE_COORDS="${W_REFINE_COORDS:-0.75,1.0,1.25}"
 # W_SIMCC_*：SimCC 分布辅助监督权重。
-W_SIMCC_COARSE="${W_SIMCC_COARSE:-0.1}"
-W_SIMCC_DEFORM="${W_SIMCC_DEFORM:-0.15}"
-W_SIMCC_REFINE="${W_SIMCC_REFINE:-0.15,0.2,0.25}"
+W_SIMCC_COARSE="${W_SIMCC_COARSE:-0.0}"
+W_SIMCC_DEFORM="${W_SIMCC_DEFORM:-0.0}"
+W_SIMCC_REFINE="${W_SIMCC_REFINE:-0.0,0.0,0.5}"
 # SIMCC_SIGMA：SimCC soft-label 高斯分布的 bin-space sigma。
 SIMCC_SIGMA="${SIMCC_SIGMA:-2.0}"
 
@@ -615,15 +617,15 @@ STAGE1_OUTPUT_DIR="${STAGE1_OUTPUT_DIR:-${OUTPUT_DIR}/stage1_freeze_locate_gt_bo
 STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_DIR}/stage2_locate_box_closed_loop}"
 # STAGE2_INIT_WEIGHTS_DIR：stage2 weight-only 初始化 checkpoint 临时目录。
 STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_weights}"
-# STAGE1_TRAIN_DATASETS / STAGE2_TRAIN_DATASETS：正式五数据集训练配置。
-STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose,aic,refhuman}"
-STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,aic,refhuman}"
-# STAGE1_EPOCHS：stage1 epoch 数。
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
+# Stage 1 只训练纯姿态数据；Stage 2 再加入需要文本条件的 RefHuman。
+STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose}"
+STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
+# STAGE1_EPOCHS：仅作为 MAX_STEPS 未达到时的上限。
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-20}"
 # STAGE2_EPOCHS：stage2 epoch 数。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 # STAGE1_BATCH_SIZE：stage1 每卡 micro batch size；Locate vision 走 flash_attention_2 full-batch forward。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-12}"
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-3}"
 # STAGE2_BATCH_SIZE：stage2 每卡 micro batch size；locate_generate 逐图生成，默认 1。
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-1}"
 # STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。
@@ -631,17 +633,25 @@ STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
 # STAGE2_GRAD_ACCUM_STEPS：stage2 梯度累积步数。
 STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-4}"
 # STAGE1_LR：stage1 基础学习率。
-STAGE1_LR="${STAGE1_LR:-2e-4}"
+STAGE1_LR="${STAGE1_LR:-3e-4}"
 # STAGE2_LR：stage2 基础学习率。
 STAGE2_LR="${STAGE2_LR:-5e-5}"
 # STAGE1_MAX_STEPS：stage1 最大 optimizer step；0 表示按 epoch 跑满。
-STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-${MAX_STEPS:-0}}"
+STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-${MAX_STEPS:-60000}}"
 # STAGE2_MAX_STEPS：stage2 最大 optimizer step；0 表示按 epoch 跑满。
 STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-0}"
-# STAGE1_FREEZE_LOCATE：stage1 是否冻结 LocateAnything。
-STAGE1_FREEZE_LOCATE="${STAGE1_FREEZE_LOCATE:-1}"
+# Stage 1 不整体冻结 LocateAnything，只开放 vision LoRA。
+STAGE1_FREEZE_LOCATE="${STAGE1_FREEZE_LOCATE:-0}"
 # STAGE2_FREEZE_LOCATE：stage2 是否冻结 LocateAnything。
 STAGE2_FREEZE_LOCATE="${STAGE2_FREEZE_LOCATE:-0}"
+# Stage 1 跳过 LLM，只开放 vision LoRA；Stage 2 恢复完整多模态和全部 LoRA。
+STAGE1_LOCATE_FEATURE_SOURCE="${STAGE1_LOCATE_FEATURE_SOURCE:-vision_only}"
+STAGE2_LOCATE_FEATURE_SOURCE="${STAGE2_LOCATE_FEATURE_SOURCE:-multimodal}"
+STAGE1_LOCATE_TRAIN_SCOPE="${STAGE1_LOCATE_TRAIN_SCOPE:-vision_lora}"
+STAGE2_LOCATE_TRAIN_SCOPE="${STAGE2_LOCATE_TRAIN_SCOPE:-all_lora}"
+# Stage 1 关闭 checkpointing 提速；Stage 2 生成闭环按需开启以节省显存。
+STAGE1_LOCATE_GRADIENT_CHECKPOINTING="${STAGE1_LOCATE_GRADIENT_CHECKPOINTING:-0}"
+STAGE2_LOCATE_GRADIENT_CHECKPOINTING="${STAGE2_LOCATE_GRADIENT_CHECKPOINTING:-${LOCATE_GRADIENT_CHECKPOINTING}}"
 # STAGE1_BOX_SOURCE：stage1 条件框来源，默认 GT box。
 STAGE1_BOX_SOURCE="${STAGE1_BOX_SOURCE:-gt}"
 # STAGE2_BOX_SOURCE：stage2 条件框来源，默认 LocateAnything 生成框。
@@ -724,11 +734,29 @@ fi
 
 for spec in \
   RUN_STAGE1 RUN_STAGE2 STAGE1_FREEZE_LOCATE STAGE2_FREEZE_LOCATE STAGE2_INIT_FROM_STAGE1 \
+  STAGE1_LOCATE_GRADIENT_CHECKPOINTING STAGE2_LOCATE_GRADIENT_CHECKPOINTING \
   MERGE_FINAL_WEIGHTS LOCATE_GRADIENT_CHECKPOINTING AMP DRY_RUN_DATA PROGRESS_BAR SYNC_TIMING \
   DISABLE_BATCH_TRACE DISABLE_HOMOGENEOUS_BATCHES DISABLE_REFINEMENT DISABLE_LOCATE_GROUNDING_AUX \
   DISABLE_RECORD_CACHE; do
   require_bool "${spec}" "${!spec}"
 done
+
+for feature_source in "${STAGE1_LOCATE_FEATURE_SOURCE}" "${STAGE2_LOCATE_FEATURE_SOURCE}"; do
+  if [[ "${feature_source}" != "vision_only" && "${feature_source}" != "multimodal" ]]; then
+    echo "Locate feature source must be vision_only or multimodal, got: ${feature_source}" >&2
+    exit 1
+  fi
+done
+for train_scope in "${STAGE1_LOCATE_TRAIN_SCOPE}" "${STAGE2_LOCATE_TRAIN_SCOPE}"; do
+  if [[ "${train_scope}" != "frozen" && "${train_scope}" != "vision_lora" && "${train_scope}" != "all_lora" ]]; then
+    echo "Locate train scope must be frozen, vision_lora, or all_lora, got: ${train_scope}" >&2
+    exit 1
+  fi
+done
+if [[ "${STAGE1_LOCATE_FEATURE_SOURCE}" == "vision_only" && ",${STAGE1_TRAIN_DATASETS}," == *",refhuman,"* ]]; then
+  echo "Stage 1 vision_only cannot include refhuman; RefHuman requires multimodal text conditioning." >&2
+  exit 1
+fi
 
 if [[ "${LOCATE_GENERATION_MODE}" != "fast" && "${LOCATE_GENERATION_MODE}" != "slow" && "${LOCATE_GENERATION_MODE}" != "hybrid" ]]; then
   echo "LOCATE_GENERATION_MODE must be fast, slow, or hybrid, got: ${LOCATE_GENERATION_MODE}" >&2
@@ -908,7 +936,7 @@ common_args() {
   a+=(--locate_feature_refiner_bottleneck_dim "${LOCATE_FEATURE_REFINER_BOTTLENECK_DIM}" --locate_feature_refiner_init_scale "${LOCATE_FEATURE_REFINER_INIT_SCALE}")
   a+=(--locate_lora_r "${LOCATE_LORA_R}" --locate_lora_alpha "${LOCATE_LORA_ALPHA}" --locate_lora_dropout "${LOCATE_LORA_DROPOUT}")
   a+=(--locate_vision_lora_r "${LOCATE_VISION_LORA_R}" --locate_vision_lora_alpha "${LOCATE_VISION_LORA_ALPHA}" --locate_vision_lora_dropout "${LOCATE_VISION_LORA_DROPOUT}")
-  a+=(--hidden_dim "${HIDDEN_DIM}" --pose_decoder_layers "${POSE_DECODER_LAYERS}" --refinement_steps "${REFINEMENT_STEPS}" --decoder_heads "${DECODER_HEADS}")
+  a+=(--hidden_dim "${HIDDEN_DIM}" --pose_decoder_layers "${POSE_DECODER_LAYERS}" --refinement_steps "${REFINEMENT_STEPS}" --decoder_heads "${DECODER_HEADS}" --pose_dropout "${POSE_DROPOUT}")
   a+=(--box_condition_scale "${BOX_CONDITION_SCALE}" --pose_roi_size "${POSE_ROI_SIZE}" --simcc_bins "${SIMCC_BINS}")
   a+=(--schema_joint_priors_path "${SCHEMA_JOINT_PRIORS_PATH}")
   a+=(--locate_vision_scale "${LOCATE_VISION_SCALE}")
@@ -923,7 +951,6 @@ common_args() {
   a+=(--visualize_every "${VISUALIZE_EVERY}" --visualize_max_instances "${VISUALIZE_MAX_INSTANCES}")
   add_opt a --max_samples_per_dataset "${MAX_SAMPLES_PER_DATASET}"
   add_opt a --deepspeed_config "${DEEPSPEED_CONFIG}"
-  [[ "${LOCATE_GRADIENT_CHECKPOINTING}" == "1" ]] && a+=(--locate_gradient_checkpointing)
   [[ "${DISABLE_RECORD_CACHE}" == "1" ]] && a+=(--disable_record_cache)
   [[ "${AMP}" == "1" ]] && a+=(--amp)
   [[ "${SYNC_TIMING}" == "1" ]] && a+=(--sync_timing)
@@ -952,12 +979,17 @@ run_stage() {
   local w_box_lm="${13}"
   local w_point_lm="${14}"
   local resume_arg="${15}"
+  local locate_feature_source="${16}"
+  local locate_train_scope="${17}"
+  local locate_gradient_checkpointing="${18}"
 
   local effective_batch=$((NPROC_PER_NODE * batch_size * grad_accum_steps))
   mkdir -p "${output_dir}" "${output_dir}/logs"
   local args=()
   common_args args
   args+=(--datasets "${datasets}" --output_dir "${output_dir}")
+  args+=(--locate_feature_source "${locate_feature_source}" --locate_train_scope "${locate_train_scope}")
+  [[ "${locate_gradient_checkpointing}" == "1" ]] && args+=(--locate_gradient_checkpointing)
   args+=(--epochs "${epochs}" --batch_size "${batch_size}" --grad_accum_steps "${grad_accum_steps}" --lr "${lr}" --max_steps "${max_steps}")
   args+=(--box_source "${box_source}" --box_jitter_scale "${jitter_scale}" --box_jitter_shift "${jitter_shift}")
   args+=(--w_locate_box_lm "${w_box_lm}" --w_locate_point_lm "${w_point_lm}" --locate_lm_loss_every "${LOCATE_LM_LOSS_EVERY}")
@@ -978,10 +1010,14 @@ run_stage() {
   echo "EPOCHS=${epochs}"
   echo "MAX_STEPS=${max_steps}"
   echo "FREEZE_LOCATE=${freeze_locate}"
+  echo "LOCATE_FEATURE_SOURCE=${locate_feature_source}"
+  echo "LOCATE_TRAIN_SCOPE=${locate_train_scope}"
+  echo "LOCATE_GRADIENT_CHECKPOINTING=${locate_gradient_checkpointing}"
   echo "LOCATE_ATTN_IMPLEMENTATION=${LOCATE_ATTN_IMPLEMENTATION}"
   echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS}"
   echo "LOCATE_IMAGE_TOKEN_LIMIT=${LOCATE_IMAGE_TOKEN_LIMIT}"
   echo "BOX_SOURCE=${box_source}"
+  echo "POSE_DROPOUT=${POSE_DROPOUT}"
   echo "SIMCC_BINS=${SIMCC_BINS}"
   echo "W_COARSE_COORD=${W_COARSE_COORD}"
   echo "W_DEFORM_COORD=${W_DEFORM_COORD}"
@@ -999,6 +1035,8 @@ run_stage() {
   echo "BOX_MATCH_IOU_THRESH=${BOX_MATCH_IOU_THRESH}"
   echo "BOX_NMS_IOU_THRESH=${BOX_NMS_IOU_THRESH}"
   echo "LR=${lr}"
+  echo "LOCATE_LORA_DROPOUT=${LOCATE_LORA_DROPOUT}"
+  echo "LOCATE_VISION_LORA_DROPOUT=${LOCATE_VISION_LORA_DROPOUT}"
   echo "LOCATE_VISION_SCALE=${LOCATE_VISION_SCALE}"
   echo "RESUME_ARG=${resume_arg}"
   echo "===================================================="
@@ -1036,7 +1074,7 @@ if [[ "${RUN_STAGE1}" == "1" ]]; then
   stage1_resume_arg=""
   [[ "${STAGE1_RESUME_FROM_CHECKPOINT}" != "none" ]] && stage1_resume_arg="${STAGE1_RESUME_FROM_CHECKPOINT}"
   run_stage \
-    "Stage 1 / freeze Locate GT-box warmup" \
+    "Stage 1 / MoonViT vision-only GT-box warmup" \
     "${STAGE1_OUTPUT_DIR}" \
     "${STAGE1_TRAIN_DATASETS}" \
     "${STAGE1_EPOCHS}" \
@@ -1050,7 +1088,10 @@ if [[ "${RUN_STAGE1}" == "1" ]]; then
     "${STAGE1_BOX_JITTER_SHIFT}" \
     "${STAGE1_W_LOCATE_BOX_LM}" \
     "${STAGE1_W_LOCATE_POINT_LM}" \
-    "${stage1_resume_arg}"
+    "${stage1_resume_arg}" \
+    "${STAGE1_LOCATE_FEATURE_SOURCE}" \
+    "${STAGE1_LOCATE_TRAIN_SCOPE}" \
+    "${STAGE1_LOCATE_GRADIENT_CHECKPOINTING}"
   last_stage_output="${STAGE1_OUTPUT_DIR}"
 else
   echo "Skipping stage 1 because RUN_STAGE1=0"
@@ -1090,7 +1131,10 @@ if [[ "${RUN_STAGE2}" == "1" ]]; then
     "${STAGE2_BOX_JITTER_SHIFT}" \
     "${STAGE2_W_LOCATE_BOX_LM}" \
     "${STAGE2_W_LOCATE_POINT_LM}" \
-    "${stage2_resume_arg}"
+    "${stage2_resume_arg}" \
+    "${STAGE2_LOCATE_FEATURE_SOURCE}" \
+    "${STAGE2_LOCATE_TRAIN_SCOPE}" \
+    "${STAGE2_LOCATE_GRADIENT_CHECKPOINTING}"
   last_stage_output="${STAGE2_OUTPUT_DIR}"
 else
   echo "Skipping stage 2 because RUN_STAGE2=0"

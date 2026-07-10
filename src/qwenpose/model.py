@@ -98,7 +98,7 @@ class JointDeformableKeypointAttention(nn.Module):
         self.offset_head = nn.Linear(hidden_dim, sample_count * 2)
         self.weight_head = nn.Linear(hidden_dim, sample_count)
         self.context_proj = MLP(hidden_dim * 3, hidden_dim, hidden_dim, depth=2)
-        self.scale = nn.Parameter(torch.tensor(-2.0))
+        self.scale = nn.Parameter(torch.tensor(-1.0))
         nn.init.zeros_(self.offset_head.weight)
         nn.init.zeros_(self.offset_head.bias)
         nn.init.zeros_(self.weight_head.weight)
@@ -348,6 +348,7 @@ class QwenPoseConfig:
     pose_decoder_layers: int = 1
     refinement_steps: int = 3
     decoder_heads: int = 8
+    dropout: float = 0.0
     box_condition_scale: float = 1.2
     pose_roi_size: int = 16
     use_refinement: bool = True
@@ -391,8 +392,8 @@ class QwenPoseModel(nn.Module):
         )
         # Start close to the pure-Qwen path, then let training learn how much RGB
         # local detail to inject.
-        self.rgb_low_scale = nn.Parameter(torch.tensor(-3.0))
-        self.rgb_refine_scale = nn.Parameter(torch.tensor(-3.0))
+        self.rgb_low_scale = nn.Parameter(torch.tensor(-1.0))
+        self.rgb_refine_scale = nn.Parameter(torch.tensor(-1.0))
         self._zero_init_last_conv(self.rgb_low_fuse)
         self._zero_init_last_conv(self.rgb_refine_fuse)
         self.pos_encoding = SinePositionEncoding(c)
@@ -425,7 +426,7 @@ class QwenPoseModel(nn.Module):
             d_model=c,
             nhead=config.decoder_heads,
             dim_feedforward=c * 4,
-            dropout=0.1,
+            dropout=float(config.dropout),
             activation="gelu",
             batch_first=True,
         )
@@ -445,7 +446,7 @@ class QwenPoseModel(nn.Module):
             d_model=c,
             nhead=config.decoder_heads,
             dim_feedforward=c * 4,
-            dropout=0.1,
+            dropout=float(config.dropout),
             activation="gelu",
             batch_first=True,
         )
@@ -472,7 +473,7 @@ class QwenPoseModel(nn.Module):
                 d_model=c,
                 nhead=config.decoder_heads,
                 dim_feedforward=c * 4,
-                dropout=0.1,
+                dropout=float(config.dropout),
                 activation="gelu",
                 batch_first=True,
             )
@@ -484,7 +485,7 @@ class QwenPoseModel(nn.Module):
             self.refine_patch_weight_heads = nn.ModuleList(
                 [nn.Linear(c, refine_patch_points) for _ in range(refinement_steps)]
             )
-            self.refine_step_scales = nn.Parameter(torch.full((refinement_steps,), -1.4))
+            self.refine_step_scales = nn.Parameter(torch.full((refinement_steps,), -0.5))
             for head in self.refine_heads:
                 self._zero_init_last_linear(head)
             for fuser in self.refine_token_fusers:
@@ -657,7 +658,6 @@ class QwenPoseModel(nn.Module):
         coarse_rel_xy = torch.sigmoid(prior_logits + self.coarse_xy_head(coarse_tokens))
         coarse_reference_xy = boxes[..., None, :2] + coarse_rel_xy * wh[..., None, :]
         coarse_reference_xy = coarse_reference_xy.clamp(0.0, 1.0)
-        simcc_coarse_x, simcc_coarse_y = self._simcc_logits(coarse_tokens)
 
         pose_tokens = self.deformable_joint_attention(
             coarse_tokens,
@@ -671,11 +671,10 @@ class QwenPoseModel(nn.Module):
         keypoint_xy = boxes[..., None, :2] + rel_xy * wh[..., None, :]
         keypoint_xy = keypoint_xy.clamp(0.0, 1.0)
         deform_keypoint_xy = keypoint_xy
-        simcc_deform_x, simcc_deform_y = self._simcc_logits(deform_tokens)
 
         refine_keypoint_xy_steps: list[torch.Tensor] = []
-        refine_simcc_x_steps: list[torch.Tensor] = []
-        refine_simcc_y_steps: list[torch.Tensor] = []
+        refine_simcc_x_steps: list[torch.Tensor | None] = []
+        refine_simcc_y_steps: list[torch.Tensor | None] = []
         if (
             self.refine_heads is not None
             and self.refine_token_fusers is not None
@@ -709,10 +708,15 @@ class QwenPoseModel(nn.Module):
                 keypoint_xy = (keypoint_xy + delta * wh[..., None, :] * scale).clamp(0.0, 1.0)
                 refine_keypoint_xy_steps.append(keypoint_xy)
                 pose_tokens = pose_tokens + token_fuser(refine_input)
-                simcc_refine_x, simcc_refine_y = self._simcc_logits(pose_tokens)
-                if simcc_refine_x is not None and simcc_refine_y is not None:
-                    refine_simcc_x_steps.append(simcc_refine_x)
-                    refine_simcc_y_steps.append(simcc_refine_y)
+
+            # SimCC is intentionally final-only. Coarse, deformable, and
+            # intermediate refinement stages keep coordinate supervision, but do
+            # not allocate classification logits or SimCC activation graphs.
+            final_simcc_x, final_simcc_y = self._simcc_logits(pose_tokens)
+            if final_simcc_x is not None and final_simcc_y is not None:
+                last_idx = len(refine_keypoint_xy_steps) - 1
+                refine_simcc_x_steps = [None] * last_idx + [final_simcc_x]
+                refine_simcc_y_steps = [None] * last_idx + [final_simcc_y]
 
         keypoint_vis = self.pose_vis_head(pose_tokens).sigmoid()
         aux_vis = keypoint_vis.detach()
@@ -741,12 +745,6 @@ class QwenPoseModel(nn.Module):
             "schema_joint_indices": schema_joint_indices,
             "schema_joint_valid": schema_joint_valid,
         }
-        if simcc_coarse_x is not None and simcc_coarse_y is not None:
-            outputs["simcc_coarse_x"] = simcc_coarse_x
-            outputs["simcc_coarse_y"] = simcc_coarse_y
-        if simcc_deform_x is not None and simcc_deform_y is not None:
-            outputs["simcc_deform_x"] = simcc_deform_x
-            outputs["simcc_deform_y"] = simcc_deform_y
         if refine_keypoint_xy_steps:
             outputs["refine_keypoints"] = [
                 self._scatter_schema_keypoints(torch.cat([xy, aux_vis], dim=-1), schema_scatter_map)

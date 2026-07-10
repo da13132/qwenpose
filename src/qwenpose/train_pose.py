@@ -183,10 +183,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_vision_lora_r", "--eagle_vision_lora_r", dest="eagle_vision_lora_r", type=int, default=16)
     parser.add_argument("--locate_vision_lora_alpha", "--eagle_vision_lora_alpha", dest="eagle_vision_lora_alpha", type=int, default=32)
     parser.add_argument("--locate_vision_lora_dropout", "--eagle_vision_lora_dropout", dest="eagle_vision_lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--locate_feature_source",
+        choices=["vision_only", "multimodal"],
+        default="multimodal",
+        help="Use MoonViT visual features only, or fuse MoonViT with final LLM image-token features.",
+    )
+    parser.add_argument(
+        "--locate_train_scope",
+        choices=["frozen", "vision_lora", "all_lora"],
+        default="all_lora",
+        help="Select which LocateAnything adapters receive gradients.",
+    )
+    parser.add_argument("--train_locate_projector", action="store_true")
     parser.add_argument("--freeze_locate", "--freeze_eagle", dest="freeze_eagle", action="store_true")
     parser.add_argument("--pose_decoder_layers", type=int, default=1)
     parser.add_argument("--refinement_steps", type=int, default=3)
     parser.add_argument("--decoder_heads", type=int, default=8)
+    parser.add_argument("--pose_dropout", type=float, default=0.0)
     parser.add_argument("--box_condition_scale", type=float, default=1.0)
     parser.add_argument(
         "--schema_joint_priors_path",
@@ -1435,6 +1449,40 @@ def generate_locate_bbox_responses_with_features(
     return responses, torch.cat(feature_maps, dim=0), torch.cat(text_embeds, dim=0)
 
 
+def configure_backbone_train_scope(
+    model: torch.nn.Module | None,
+    scope: str,
+    *,
+    train_projector: bool = False,
+) -> dict[str, int]:
+    """Enable exactly the requested pretrained-backbone adapter parameters."""
+    scope = str(scope)
+    if scope not in {"frozen", "vision_lora", "all_lora"}:
+        raise ValueError(f"Unsupported backbone train scope: {scope!r}")
+    counts = {"vision_lora": 0, "language_lora": 0, "projector": 0}
+    if model is None:
+        return counts
+    for name, param in model.named_parameters():
+        is_lora = "lora_" in name
+        is_vision = is_vision_parameter(name)
+        is_projector = ".mlp1." in name or name.startswith("mlp1.")
+        enabled = False
+        if scope == "vision_lora":
+            enabled = is_lora and is_vision
+        elif scope == "all_lora":
+            enabled = is_lora or (train_projector and is_projector)
+        param.requires_grad = bool(enabled)
+        if not enabled:
+            continue
+        if is_projector:
+            counts["projector"] += param.numel()
+        elif is_vision:
+            counts["vision_lora"] += param.numel()
+        else:
+            counts["language_lora"] += param.numel()
+    return counts
+
+
 class QwenPoseTrainingModel(torch.nn.Module):
     """Single trainable module for PoseHead plus backbone LoRA (Qwen3-VL or Eagle)."""
 
@@ -1451,6 +1499,8 @@ class QwenPoseTrainingModel(torch.nn.Module):
         backbone_extractor: torch.nn.Module | None = None,
         backbone_name: str = "qwen3vl",
         freeze_backbone: bool = False,
+        backbone_train_scope: str = "all_lora",
+        train_backbone_projector: bool = False,
     ) -> None:
         super().__init__()
         self.pose_model = pose_model
@@ -1476,9 +1526,14 @@ class QwenPoseTrainingModel(torch.nn.Module):
             else:
                 self.backbone_extractor = None
 
-        if self.freeze_backbone and self.backbone_model is not None:
-            for param in self.backbone_model.parameters():
-                param.requires_grad = False
+        requested_scope = "frozen" if self.freeze_backbone else str(backbone_train_scope)
+        self.backbone_train_scope = requested_scope
+        self.backbone_trainable_counts = configure_backbone_train_scope(
+            self.backbone_model,
+            requested_scope,
+            train_projector=train_backbone_projector,
+        )
+        self.freeze_backbone = requested_scope == "frozen"
 
         # Aliases for backward compatibility with checkpoint save/load
         self.qwen_model = self.backbone_model
@@ -2529,6 +2584,7 @@ def save_pose_visualization(
     sample_idx: int = 0,
     max_instances: int = 8,
     score_threshold: float = 0.05,
+    draw_all_schema_keypoints: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image_path = batch["image_paths"][sample_idx]
@@ -2569,7 +2625,11 @@ def save_pose_visualization(
     gt_boxes = target["boxes"].detach().float().cpu()
     gt_keypoints = target["keypoints"].detach().float().cpu()
     gt_valid = target["keypoint_valid"].detach().cpu().bool()
-    gt_visible = gt_valid & (gt_keypoints[..., 2] > 0.5)
+    gt_draw_valid = (
+        gt_valid
+        if draw_all_schema_keypoints
+        else gt_valid & (gt_keypoints[..., 2] > 0.5)
+    )
 
     valid_indices = torch.nonzero(valid_boxes, as_tuple=False).flatten()
     if valid_indices.numel() > 0:
@@ -2583,10 +2643,14 @@ def save_pose_visualization(
             continue
         if idx < gt_boxes.shape[0]:
             _draw_box(draw, gt_boxes[idx], width, height, (50, 200, 80), f"gt {idx}")
-            _draw_pose(draw, gt_keypoints[idx], gt_visible[idx], width, height, (50, 200, 80), edge_indices)
+            _draw_pose(draw, gt_keypoints[idx], gt_draw_valid[idx], width, height, (50, 200, 80), edge_indices)
         _draw_box(draw, boxes[idx], width, height, (255, 220, 0), f"box {idx}")
         _draw_box(draw, pose_boxes[idx], width, height, (255, 140, 0), f"pose box {idx}")
-        pred_valid = schema_valid & (keypoints[idx, :, 2] >= score_threshold)
+        pred_valid = (
+            schema_valid
+            if draw_all_schema_keypoints
+            else schema_valid & (keypoints[idx, :, 2] >= score_threshold)
+        )
         _draw_pose(draw, keypoints[idx], pred_valid, width, height, (240, 70, 70), edge_indices)
 
     draw.rectangle([0, 0, min(width, 940), 44], fill=(0, 0, 0))
@@ -2862,6 +2926,8 @@ def save_checkpoint(
     if module.qwen_extractor is not None:
         feature_config = {
             "output_size": int(module.qwen_extractor.output_size),
+            "feature_source": str(getattr(module.qwen_extractor, "feature_source", "multimodal")),
+            "backbone_train_scope": str(getattr(module, "backbone_train_scope", "all_lora")),
         }
         payload["backbone_feature_config"] = feature_config
         payload["qwen_feature_config"] = feature_config
@@ -3152,7 +3218,13 @@ def load_deepspeed_config(path: Path, args: argparse.Namespace, world_size: int)
 
 def is_vision_parameter(name: str) -> bool:
     """Check if a parameter belongs to the vision encoder (Qwen or Eagle)."""
-    return ".visual." in name or ".vision_model." in name or "qwen_model.visual." in name or "backbone_model.vision_model." in name
+    return (
+        name.startswith(("visual.", "vision_model."))
+        or ".visual." in name
+        or ".vision_model." in name
+        or "qwen_model.visual." in name
+        or "backbone_model.vision_model." in name
+    )
 
 
 def build_optimizer_param_groups(
@@ -3264,6 +3336,8 @@ def main() -> None:
         raise ValueError("--refhuman_max_captions_per_instance must be >= 0.")
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
+    if not 0.0 <= args.pose_dropout < 1.0:
+        raise ValueError("--pose_dropout must be in [0, 1).")
     if args.schema_joint_priors_path and not Path(args.schema_joint_priors_path).is_file():
         raise FileNotFoundError(
             f"--schema_joint_priors_path does not exist: {args.schema_joint_priors_path}"
@@ -3346,6 +3420,11 @@ def main() -> None:
     #    ALL_POSE from pose datasets and REF_POSE from RefHuman.
     # ------------------------------------------------------------------
     dataset_names = [name.strip().lower() for name in args.datasets.replace("/", ",").split(",") if name.strip()]
+    if args.locate_feature_source == "vision_only" and "refhuman" in dataset_names:
+        raise ValueError(
+            "--locate_feature_source=vision_only cannot train RefHuman text conditioning. "
+            "Use pose-only datasets in Stage 1 and add RefHuman in multimodal Stage 2."
+        )
     dataset = build_datasets(
         dataset_root=args.dataset_root,
         names=dataset_names,
@@ -3477,17 +3556,12 @@ def main() -> None:
                 gradient_checkpointing=args.eagle_gradient_checkpointing,
             )
         )
-        eagle_base = get_eagle_base_model(backbone_model)
-        projector = getattr(eagle_base, "mlp1", None)
-        if projector is not None:
-            for param in projector.parameters():
-                param.requires_grad = True
         backbone_model.to(device)
         backbone_model.train()
         external_dim = eagle_hidden_size(backbone_model)
         bb_trainable, bb_total = count_eagle_lora_parameters(backbone_model)
         if is_main_process():
-            print(f"Eagle LoRA trainable parameters: {bb_trainable:,} / {bb_total:,}")
+            print(f"Eagle LoRA parameters available before stage scope: {bb_trainable:,} / {bb_total:,}")
     else:
         qwen_init_source = detect_qwen_initialization_source(args.qwen_model_path)
         if qwen_init_source.adapter_path is not None and not qwen_init_source.is_merged_backbone:
@@ -3541,6 +3615,7 @@ def main() -> None:
             pose_decoder_layers=int(saved_pose_config.get("pose_decoder_layers", args.pose_decoder_layers)),
             refinement_steps=int(saved_pose_config.get("refinement_steps", args.refinement_steps)),
             decoder_heads=int(saved_pose_config.get("decoder_heads", args.decoder_heads)),
+            dropout=float(saved_pose_config.get("dropout", args.pose_dropout)),
             box_condition_scale=float(saved_pose_config.get("box_condition_scale", args.box_condition_scale)),
             pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
@@ -3558,6 +3633,7 @@ def main() -> None:
             pose_decoder_layers=args.pose_decoder_layers,
             refinement_steps=args.refinement_steps,
             decoder_heads=args.decoder_heads,
+            dropout=args.pose_dropout,
             box_condition_scale=args.box_condition_scale,
             pose_roi_size=args.pose_roi_size,
             use_refinement=not args.disable_refinement,
@@ -3600,6 +3676,7 @@ def main() -> None:
             refiner_layers=refiner_layers,
             refiner_bottleneck_dim=refiner_bottleneck_dim,
             refiner_init_scale=refiner_init_scale,
+            feature_source=args.locate_feature_source,
         )
     else:
         backbone_extractor = QwenFeatureExtractor(
@@ -3616,6 +3693,8 @@ def main() -> None:
         backbone_extractor=backbone_extractor,
         backbone_name=backbone_name,
         freeze_backbone=freeze_backbone,
+        backbone_train_scope=args.locate_train_scope,
+        train_backbone_projector=args.train_locate_projector,
     ).to(device)
     if backbone_name == "qwen3vl" and qwen_init_source is not None and qwen_init_source.pose_checkpoint_path is not None:
         _, _, _, init_checkpoint, _ = load_training_checkpoint(
@@ -3638,7 +3717,11 @@ def main() -> None:
                 f"max_pixels={args.eagle_max_pixels}, "
                 f"image_token_limit={args.eagle_image_token_limit}"
             )
-        print(f"Freeze backbone/LoRA: {freeze_backbone}")
+        print(f"Backbone train scope: {training_model.backbone_train_scope}")
+        print(f"Backbone trainable counts: {training_model.backbone_trainable_counts}")
+        if backbone_name == "eagle":
+            print(f"Locate feature source: {args.locate_feature_source}")
+        print(f"Pose dropout: {model_config.dropout}")
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
         print(f"SimCC bins: {model_config.simcc_bins}, sigma={args.simcc_sigma}")
@@ -4239,6 +4322,7 @@ def main() -> None:
                             vis_path,
                             sample_idx=0,
                             max_instances=args.visualize_max_instances,
+                            draw_all_schema_keypoints=True,
                         )
                         progress_write(progress_bar, f"saved_visualization={vis_path}")
                     except Exception as vis_exc:

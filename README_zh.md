@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v1.4`
+版本：`v2.0`
 
 [English](README.md) | 中文
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v1.4` 快照在以下环境中完成验证：
+这个 `v2.0` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -207,10 +207,10 @@ datasets/
 
 当前默认配方说明：
 
-- `LocatePose` 的 stage 1 默认只用 `crowdpose`
-- `LocatePose` 的 stage 2 默认使用 `coco,mpii,crowdpose,refhuman`
+- `LocatePose` 的 stage 1 使用 `coco,mpii,crowdpose`，并只走 MoonViT 视觉特征
+- `LocatePose` 的 stage 2 使用 `coco,mpii,crowdpose,refhuman`，恢复完整多模态 Locate 路径
 - `QwenPose` 的 stage 1 和 stage 2 默认都使用 `coco`
-- `AIC` 已在代码中支持，但不在当前公开默认训练配方中启用
+- RefHuman 需要文本条件，因此明确延后到 stage 2
 
 ### COCO
 
@@ -329,21 +329,30 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 
 | 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
 |------|--------|----------------|------------|------------|------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 LocateAnything | `gt` | `coco,mpii,crowdpose,aic,refhuman` | `100` |
-| stage 2 | `stage2_locate_box_closed_loop` | 解冻 Locate LoRA 和 vision LoRA | `locate_generate` | `coco,mpii,crowdpose,aic,refhuman` | `5` |
+| stage 1 | `stage1_freeze_locate_gt_box` | 仅用 MoonViT，训练 vision LoRA | `gt` | `coco,mpii,crowdpose` | `20`，并限制最多 `60,000` step |
+| stage 2 | `stage2_locate_box_closed_loop` | 恢复完整多模态 Locate，训练全部 LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
 其他关键默认值：
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=12`
+- `STAGE1_BATCH_SIZE=3`（4 卡全局 batch 为 `12`）
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
-- `STAGE1_LR=2e-4`
+- `STAGE1_LR=3e-4`
+- `STAGE1_MAX_STEPS=60000`
 - `STAGE2_LR=5e-5`
+- `STAGE1_LOCATE_FEATURE_SOURCE=vision_only`
+- `STAGE1_LOCATE_TRAIN_SCOPE=vision_lora`
+- `STAGE1_LOCATE_GRADIENT_CHECKPOINTING=0`
+- `STAGE2_LOCATE_FEATURE_SOURCE=multimodal`
+- `STAGE2_LOCATE_TRAIN_SCOPE=all_lora`
+- `POSE_DROPOUT=0.0`
+- `LOCATE_LORA_DROPOUT=0.0`、`LOCATE_VISION_LORA_DROPOUT=0.0`
+- `LOCATE_VISION_SCALE=0.05`
 - `STAGE1_BOX_JITTER_SCALE=0.0`、`STAGE1_BOX_JITTER_SHIFT=0.0` 仅作为全局 fallback；每条数据记录携带各数据集自己的默认扰动策略
-- `DATASET_MIX_WEIGHTS=auto` 表示按数据量比例 interleave；仅在均衡消融时使用 `coco:1,mpii:1,crowdpose:1,aic:1,refhuman:1`
+- `DATASET_MIX_WEIGHTS=auto` 表示按数据量比例 interleave；手动权重仅用于受控消融
 - `W_OKS=0.5`
 - `W_COORD=3.0`
 - `W_IMAGE_COORD=5.0`
@@ -352,9 +361,10 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 - `W_COARSE_COORD=0.5`
 - `W_DEFORM_COORD=0.75`
 - `W_REFINE_COORDS=0.75,1.0,1.25`
-- `W_SIMCC_COARSE=0.1`
-- `W_SIMCC_DEFORM=0.15`
-- `W_SIMCC_REFINE=0.15,0.2,0.25`
+- SimCC 只在最后一次 refinement 后计算一次
+- `W_SIMCC_COARSE=0.0`
+- `W_SIMCC_DEFORM=0.0`
+- `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
 - `LOCATE_GENERATION_MODE=hybrid`
@@ -373,7 +383,7 @@ bash scripts/locatepose.sh
 按当前默认 4 卡布局启动的示例：
 
 ```bash
-RUN_NAME=locatepose_v1_4 \
+RUN_NAME=locatepose_v2_0 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -398,7 +408,10 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `DATASET_ROOT`：数据根目录，默认 `datasets`
 - `OUTPUT_ROOT`：训练输出根目录，默认 `outputs/locatepose`
 - `ZERO_STAGE`：`zero2`、`zero3`、`zero3_offload` 或 `none`
-- `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表
+- `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表；vision-only 的 stage 1 不能包含 RefHuman
+- `STAGE1_LOCATE_FEATURE_SOURCE`、`STAGE2_LOCATE_FEATURE_SOURCE`：快速姿态 warmup 使用 `vision_only`，闭环阶段使用 `multimodal`
+- `STAGE1_LOCATE_TRAIN_SCOPE`、`STAGE2_LOCATE_TRAIN_SCOPE`：可选 `frozen`、`vision_lora` 或 `all_lora`
+- `POSE_DROPOUT`：PoseHead 内部 Transformer dropout，默认 `0.0`
 - `STAGE1_BOX_JITTER_SCALE`、`STAGE1_BOX_JITTER_SHIFT`：stage 1 GT box 扰动强度
 - `LOCATE_ATTN_IMPLEMENTATION`：训练时 LocateAnything 的 attention 后端，默认 `flash_attention_2`
 - `SIMCC_BINS`：SimCC 辅助头每个坐标轴的 bin 数，默认 `256`；设为 `0` 可完全关闭 SimCC
@@ -615,6 +628,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v1.4`
+- Git tag，例如 `v2.0`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

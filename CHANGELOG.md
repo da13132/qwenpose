@@ -2,6 +2,14 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v2.0 - 2026-07-10
+
+- Reworked Stage 1 into a fast pose warmup: skip the 3B language model, use MoonViT visual features directly, train only vision LoRA plus pose adapters, keep RefHuman for multimodal Stage 2, and use a 60,000-step schedule with a default four-GPU global batch of 12.
+- Added explicit `vision_only`/`multimodal` feature sources and `frozen`/`vision_lora`/`all_lora` backbone scopes, with checkpoint metadata and regression coverage that verifies the vision-only path never calls the language model while preserving visual gradients.
+- Switched pose transformers and Locate LoRA adapters to zero dropout, made visual/refinement adapters start from exact identity, opened local/deformable refinement gates faster, and removed all coarse/deform/intermediate SimCC forward passes so only the final refinement output allocates logits and receives SimCC supervision at weight `0.5`.
+- Restored the positive-visibility policy for all annotated joints, including occluded COCO/CrowdPose/AIC joints and valid MPII joints, while retaining coordinate-valid training visualization and bumping the record cache contract to v10.
+- Updated the default LocatePose schedule to `coco,mpii,crowdpose` for vision-only Stage 1 and `coco,mpii,crowdpose,refhuman` for multimodal Stage 2, synchronized the English/Chinese documentation, and bumped the public snapshot to `v2.0`.
+
 ## v1.4 - 2026-07-10
 
 - Expanded the maintained LocatePose recipe to the five-dataset `coco,mpii,crowdpose,aic,refhuman` schedule with size-proportional homogeneous-source batches, shared ALL_POSE semantics, RefHuman-only text conditioning, and schema-specific geometric priors.

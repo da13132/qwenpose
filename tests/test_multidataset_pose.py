@@ -1,20 +1,31 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 import unittest
 import warnings
 
+from PIL import Image
 import torch
 
-from qwenpose.data import ALL_POSE_PROMPT, InterleavedPoseDataset, mpii_boxes_from_center_scale
+from qwenpose.data import ALL_POSE_PROMPT, InterleavedPoseDataset, aic_to_union, mpii_boxes_from_center_scale
+from qwenpose.eagle_lora import EagleFeatureExtractor
 from qwenpose.losses import LossWeights, compute_pose_losses, simcc_box_loss
 from qwenpose.metrics import _mpii_bbox_from_center_scale, targets_to_gt_instances
 from qwenpose.model import QwenPoseConfig, QwenPoseModel, build_schema_joint_priors
-from qwenpose.train_pose import SCHEMA_POSE_EDGE_INDICES
+from qwenpose.qwen_lora import QwenFeatureRefiner
+from qwenpose.train_pose import (
+    SCHEMA_POSE_EDGE_INDICES,
+    configure_backbone_train_scope,
+    save_pose_visualization,
+)
 from qwenpose.schemas import (
     SCHEMA_INDICES,
     SCHEMA_TO_ID,
     UNION_KEYPOINTS,
     UNION_TO_ID,
+    coco_to_union,
     crowdpose_to_union,
     mpii_to_union,
 )
@@ -31,7 +42,96 @@ class _TinyDataset(torch.utils.data.Dataset):
         return index
 
 
+class _DummyBackbone(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vision_model = torch.nn.Module()
+        self.vision_model.block = torch.nn.Module()
+        self.vision_model.block.lora_A = torch.nn.Linear(4, 2, bias=False)
+        self.language_model = torch.nn.Module()
+        self.language_model.block = torch.nn.Module()
+        self.language_model.block.lora_A = torch.nn.Linear(4, 2, bias=False)
+        self.mlp1 = torch.nn.Linear(4, 4)
+        self.base_weight = torch.nn.Parameter(torch.ones(1))
+
+
+class _TinyEagle(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=8))
+        self.vision_model = torch.nn.Module()
+        self.vision_model.merge_kernel_size = (2, 2)
+        self.vision_model.proj = torch.nn.Linear(8, 8, bias=False)
+        self.mlp1 = torch.nn.Identity()
+
+    def extract_feature(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_hws: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        del image_grid_hws
+        return [self.vision_model.proj(sample) for sample in pixel_values]
+
+
 class MultiDatasetPoseTests(unittest.TestCase):
+    def test_vision_only_extractor_skips_language_model_and_backpropagates(self) -> None:
+        backbone = _TinyEagle()
+        extractor = EagleFeatureExtractor(
+            backbone,
+            output_size=4,
+            refiner_layers=1,
+            refiner_bottleneck_dim=4,
+            refiner_init_scale=0.05,
+            feature_source="vision_only",
+        )
+
+        def fail_language(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("vision_only unexpectedly called the language model")
+
+        extractor.run_language_hidden = fail_language  # type: ignore[method-assign]
+        inputs = {
+            "input_ids": torch.zeros(2, 3, dtype=torch.long),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+            "pixel_values": torch.randn(2, 4, 8),
+            "image_grid_hws": torch.tensor([[4, 4], [4, 4]]),
+        }
+        feature_map, text_embed = extractor(inputs, freeze_eagle=False)
+        self.assertEqual(tuple(feature_map.shape), (2, 8, 4, 4))
+        self.assertEqual(tuple(text_embed.shape), (2, 8))
+        self.assertEqual(float(text_embed.abs().sum()), 0.0)
+        feature_map.square().mean().backward()
+        self.assertIsNotNone(backbone.vision_model.proj.weight.grad)
+
+    def test_fast_stage_backbone_scope_only_opens_vision_lora(self) -> None:
+        model = _DummyBackbone()
+        counts = configure_backbone_train_scope(model, "vision_lora")
+        trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+        self.assertEqual(trainable, {"vision_model.block.lora_A.weight"})
+        self.assertGreater(counts["vision_lora"], 0)
+        self.assertEqual(counts["language_lora"], 0)
+        self.assertEqual(counts["projector"], 0)
+
+        counts = configure_backbone_train_scope(model, "all_lora", train_projector=True)
+        trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+        self.assertEqual(
+            trainable,
+            {
+                "vision_model.block.lora_A.weight",
+                "language_model.block.lora_A.weight",
+                "mlp1.weight",
+                "mlp1.bias",
+            },
+        )
+        self.assertGreater(counts["language_lora"], 0)
+        self.assertGreater(counts["projector"], 0)
+
+    def test_feature_refiner_starts_as_exact_identity(self) -> None:
+        refiner = QwenFeatureRefiner(8, num_layers=2, bottleneck_dim=4, init_scale=0.05)
+        inputs = torch.randn(2, 8, 5, 5)
+        outputs = refiner(inputs)
+        self.assertTrue(torch.equal(outputs, inputs))
+
     def test_mpii_geometry_matches_mmpose(self) -> None:
         geometry = mpii_boxes_from_center_scale(
             center=[501.0, 401.0],
@@ -78,6 +178,49 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertEqual(len(instances), 1)
         self.assertAlmostEqual(instances[0].area, 4000.0, delta=1e-3)
 
+    def test_training_visualization_does_not_hide_mpii_coordinates(self) -> None:
+        union = len(UNION_KEYPOINTS)
+        mpii_indices = SCHEMA_INDICES["MPII16"]
+        keypoints = torch.zeros(1, 1, union, 3)
+        for offset, joint_idx in enumerate(mpii_indices.tolist()):
+            keypoints[0, 0, joint_idx, 0] = 0.4 + 0.02 * (offset % 5)
+            keypoints[0, 0, joint_idx, 1] = 0.5 + 0.03 * (offset // 5)
+            keypoints[0, 0, joint_idx, 2] = 0.0
+        schema_valid = torch.zeros(1, union, dtype=torch.bool)
+        schema_valid[:, mpii_indices] = True
+        outputs = {
+            "boxes": torch.tensor([[[0.1, 0.1, 0.9, 0.9]]]),
+            "pose_boxes": torch.tensor([[[0.1, 0.1, 0.9, 0.9]]]),
+            "box_mask": torch.tensor([[True]]),
+            "person_logits": torch.tensor([[10.0]]),
+            "keypoints": keypoints,
+            "keypoint_valid_mask": schema_valid,
+        }
+        target = {
+            "boxes": torch.tensor([[0.1, 0.1, 0.9, 0.9]]),
+            "keypoints": keypoints[0].clone(),
+            "keypoint_valid": schema_valid[0].unsqueeze(0),
+            "dataset": "mpii",
+            "schema": "MPII16",
+            "task": "ALL_POSE",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "source.png"
+            output_path = Path(tmpdir) / "vis.png"
+            Image.new("RGB", (128, 128), (255, 255, 255)).save(image_path)
+            save_pose_visualization(
+                outputs,
+                {
+                    "image_paths": [str(image_path)],
+                    "targets": [target],
+                    "source_datasets": ["mpii"],
+                },
+                output_path,
+                draw_all_schema_keypoints=True,
+            )
+            pixels = list(Image.open(output_path).convert("RGB").get_flattened_data())
+        self.assertIn((240, 70, 70), pixels)
+
     def test_crowdpose_visualization_uses_separate_head_joint(self) -> None:
         crowdpose_head = UNION_TO_ID["crowdpose_head"]
         head_top = UNION_TO_ID["head_top"]
@@ -86,27 +229,39 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertIn((crowdpose_head, neck), edges)
         self.assertNotIn((head_top, neck), edges)
 
-    def test_visibility_semantics_and_crowdpose_head_slot(self) -> None:
+    def test_all_annotated_joints_train_as_visible_and_crowdpose_head_is_separate(self) -> None:
         mpii_kpts, mpii_valid, mpii_vis_valid = mpii_to_union(
             [[10.0, 20.0]] * 16,
             [1] * 16,
             100.0,
             100.0,
         )
-        self.assertTrue(mpii_valid.any())
-        self.assertFalse(mpii_vis_valid.any())
-        self.assertEqual(float(mpii_kpts[..., 2].sum()), 0.0)
+        self.assertTrue(torch.equal(mpii_vis_valid, mpii_valid))
+        self.assertEqual(float(mpii_kpts[..., 2].sum()), 16.0)
+
+        coco_flat = [10.0, 20.0, 1.0] + [0.0, 0.0, 0.0] * 16
+        coco_kpts, coco_valid, coco_vis_valid = coco_to_union(coco_flat, 100.0, 100.0)
+        self.assertTrue(bool(coco_valid[UNION_TO_ID["nose"]]))
+        self.assertTrue(bool(coco_vis_valid[UNION_TO_ID["nose"]]))
+        self.assertEqual(float(coco_kpts[UNION_TO_ID["nose"], 2]), 1.0)
 
         flat = []
         for idx in range(14):
-            flat.extend([float(idx + 1), float(idx + 2), 2.0])
+            flat.extend([float(idx + 1), float(idx + 2), 1.0])
         crowd_kpts, crowd_valid, crowd_vis_valid = crowdpose_to_union(flat, 100.0, 100.0)
         head_idx = UNION_TO_ID["crowdpose_head"]
         old_head_top_idx = UNION_TO_ID["head_top"]
         self.assertTrue(bool(crowd_valid[head_idx]))
         self.assertTrue(bool(crowd_vis_valid[head_idx]))
         self.assertFalse(bool(crowd_valid[old_head_top_idx]))
-        self.assertGreater(float(crowd_kpts[head_idx, 2]), 0.0)
+        self.assertEqual(float(crowd_kpts[head_idx, 2]), 1.0)
+
+        aic_flat = [10.0, 20.0, 2.0] + [0.0, 0.0, 3.0] * 13
+        aic_kpts, aic_valid, aic_vis_valid = aic_to_union(aic_flat, 100.0, 100.0)
+        aic_joint = int(SCHEMA_INDICES["AIC14"][0])
+        self.assertTrue(bool(aic_valid[aic_joint]))
+        self.assertTrue(bool(aic_vis_valid[aic_joint]))
+        self.assertEqual(float(aic_kpts[aic_joint, 2]), 1.0)
 
     def test_schema_priors_have_correct_left_right_order(self) -> None:
         priors = build_schema_joint_priors("configs/schema_joint_priors.json")
@@ -223,6 +378,49 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(source.schema_joint_priors, target.schema_joint_priors)
         )
+
+    def test_simcc_is_computed_only_for_final_refinement(self) -> None:
+        torch.manual_seed(11)
+        model = QwenPoseModel(
+            QwenPoseConfig(
+                hidden_dim=32,
+                external_dim=16,
+                pose_decoder_layers=1,
+                refinement_steps=3,
+                decoder_heads=4,
+                dropout=0.0,
+                box_condition_scale=1.0,
+                pose_roi_size=4,
+                simcc_bins=32,
+                schema_joint_priors_path="configs/schema_joint_priors.json",
+            )
+        ).eval()
+        original_simcc = model._simcc_logits
+        call_count = 0
+
+        def counted_simcc(tokens: torch.Tensor):
+            nonlocal call_count
+            call_count += 1
+            return original_simcc(tokens)
+
+        model._simcc_logits = counted_simcc  # type: ignore[method-assign]
+        with torch.no_grad():
+            outputs = model(
+                torch.tensor([SCHEMA_TO_ID["COCO17"]]),
+                torch.tensor([0]),
+                external_feature_map=torch.randn(1, 16, 8, 8),
+                external_text_embed=torch.zeros(1, 16),
+                target_boxes=torch.tensor([[[0.1, 0.1, 0.9, 0.9]]]),
+                target_box_mask=torch.tensor([[True]]),
+            )
+
+        self.assertEqual(call_count, 1)
+        self.assertNotIn("simcc_coarse_x", outputs)
+        self.assertNotIn("simcc_deform_x", outputs)
+        self.assertEqual(outputs["simcc_refine_x"][:2], [None, None])
+        self.assertEqual(outputs["simcc_refine_y"][:2], [None, None])
+        self.assertTrue(torch.is_tensor(outputs["simcc_refine_x"][2]))
+        self.assertTrue(torch.is_tensor(outputs["simcc_refine_y"][2]))
 
     def test_text_condition_only_affects_ref_pose(self) -> None:
         torch.manual_seed(7)

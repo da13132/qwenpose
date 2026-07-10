@@ -346,10 +346,17 @@ class EagleFeatureExtractor(nn.Module):
         refiner_layers: int = 0,
         refiner_bottleneck_dim: int = 256,
         refiner_init_scale: float = 0.1,
+        feature_source: str = "multimodal",
     ) -> None:
         super().__init__()
         self.eagle_model = eagle_model
         self.output_size = output_size
+        self.feature_source = str(feature_source)
+        if self.feature_source not in {"vision_only", "multimodal"}:
+            raise ValueError(
+                f"Unsupported Locate feature source {self.feature_source!r}; "
+                "expected 'vision_only' or 'multimodal'."
+            )
         hidden_size = eagle_hidden_size(eagle_model)
         self.raw_feature_norm = nn.LayerNorm(hidden_size)
         self.lm_feature_norm = nn.LayerNorm(hidden_size)
@@ -359,7 +366,14 @@ class EagleFeatureExtractor(nn.Module):
             nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size),
             nn.Conv2d(hidden_size, hidden_size, kernel_size=1),
         )
-        self.dual_feature_gate = nn.Parameter(torch.tensor(0.0))
+        # Start exactly from the pretrained LM feature map. The fusion branch is
+        # zero-initialized and opens gradually instead of perturbing features at
+        # step zero with a random 0.5-weight residual.
+        self.dual_feature_gate = nn.Parameter(torch.tensor(-4.0))
+        final_fuse = self.dual_feature_fuse[-1]
+        nn.init.zeros_(final_fuse.weight)
+        if final_fuse.bias is not None:
+            nn.init.zeros_(final_fuse.bias)
         self.feature_refiner = QwenFeatureRefiner(
             hidden_size,
             num_layers=refiner_layers,
@@ -372,15 +386,21 @@ class EagleFeatureExtractor(nn.Module):
         eagle_inputs: dict[str, torch.Tensor],
         freeze_eagle: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Match Qwen3VL Stage-1 behavior: when LocateAnything is frozen, run the
-        # heavy MoonViT+Qwen2.5 backbone under no_grad to avoid storing LLM
-        # activations for batch16. The extractor-owned fusion/refiner layers are
-        # applied outside no_grad and remain trainable.
-        raw_maps, lm_maps, text_embed = self._extract_eagle_feature_maps(
-            eagle_inputs,
-            freeze_backbone=bool(freeze_eagle),
-        )
-        visual_map = self.fuse_feature_maps(raw_maps, lm_maps)
+        # Stage 1 can use MoonViT features directly and completely skip the 3B
+        # language model. This both preserves local visual detail and removes the
+        # dominant wall-clock cost. Stage 2 switches back to multimodal features.
+        if self.feature_source == "vision_only":
+            raw_maps, text_embed = self._extract_eagle_vision_features(
+                eagle_inputs,
+                freeze_backbone=bool(freeze_eagle),
+            )
+            visual_map = self.normalize_raw_feature_maps(raw_maps)
+        else:
+            raw_maps, lm_maps, text_embed = self._extract_eagle_feature_maps(
+                eagle_inputs,
+                freeze_backbone=bool(freeze_eagle),
+            )
+            visual_map = self.fuse_feature_maps(raw_maps, lm_maps)
         visual_map = self.feature_refiner(visual_map)
         return visual_map, text_embed
 
@@ -495,6 +515,58 @@ class EagleFeatureExtractor(nn.Module):
             past_key_values = past_key_values.to_legacy_cache()
         return lm_outputs.hidden_states[-1], past_key_values
 
+    def build_raw_feature_maps(
+        self,
+        image_grid_hws: torch.Tensor | np.ndarray | None,
+        projected_vit_list: list[torch.Tensor],
+    ) -> torch.Tensor:
+        base = get_eagle_base_model(self.eagle_model)
+        if isinstance(image_grid_hws, torch.Tensor):
+            grid_hws_np = image_grid_hws.detach().cpu().numpy()
+        elif isinstance(image_grid_hws, np.ndarray):
+            grid_hws_np = image_grid_hws
+        else:
+            grid_hws_np = None
+        merge_kernel = getattr(getattr(base, "vision_model", None), "merge_kernel_size", (2, 2))
+        merge_h = max(int(merge_kernel[0]), 1) if isinstance(merge_kernel, (tuple, list)) else max(int(merge_kernel), 1)
+        merge_w = max(int(merge_kernel[1]), 1) if isinstance(merge_kernel, (tuple, list)) else max(int(merge_kernel), 1)
+        raw_maps: list[torch.Tensor] = []
+        for batch_idx, raw_tokens in enumerate(projected_vit_list):
+            if grid_hws_np is not None and batch_idx < len(grid_hws_np):
+                raw_h = max(int(grid_hws_np[batch_idx][0]), 1)
+                raw_w = max(int(grid_hws_np[batch_idx][1]), 1)
+                h = max(raw_h // merge_h, 1)
+                w = max(raw_w // merge_w, 1)
+            else:
+                n = int(raw_tokens.shape[0])
+                h = max(int(round(n ** 0.5)), 1)
+                w = max(n // h, 1)
+            expected = h * w
+            if int(raw_tokens.shape[0]) != expected:
+                raise ValueError(
+                    "LocateAnything raw visual token/grid mismatch: "
+                    f"sample={batch_idx}, raw_tokens={int(raw_tokens.shape[0])}, "
+                    f"merged_grid={h}x{w}, "
+                    f"raw_grid={None if grid_hws_np is None else grid_hws_np[batch_idx].tolist()}, "
+                    f"merge_kernel={merge_h}x{merge_w}."
+                )
+            raw_map = raw_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
+            raw_map = F.interpolate(
+                raw_map,
+                size=(self.output_size, self.output_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            raw_maps.append(raw_map.squeeze(0))
+        return torch.stack(raw_maps, dim=0)
+
+    def normalize_raw_feature_maps(self, raw_maps: torch.Tensor) -> torch.Tensor:
+        adapter_param = self.raw_feature_norm.weight
+        raw_maps = raw_maps.to(device=adapter_param.device, dtype=adapter_param.dtype)
+        b, c, h, w = raw_maps.shape
+        raw_tokens = raw_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        return self.raw_feature_norm(raw_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
+
     def build_feature_maps(
         self,
         input_ids: torch.Tensor,
@@ -561,15 +633,11 @@ class EagleFeatureExtractor(nn.Module):
         return raw_maps, lm_maps, text_embed
 
     def fuse_feature_maps(self, raw_maps: torch.Tensor, lm_maps: torch.Tensor) -> torch.Tensor:
-        adapter_param = self.raw_feature_norm.weight
-        adapter_device = adapter_param.device
-        adapter_dtype = adapter_param.dtype
-        raw_maps = raw_maps.to(device=adapter_device, dtype=adapter_dtype)
-        lm_maps = lm_maps.to(device=adapter_device, dtype=adapter_dtype)
-        b, c, h, w = raw_maps.shape
-        raw_tokens = raw_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        raw_maps = self.normalize_raw_feature_maps(raw_maps)
+        adapter_param = self.lm_feature_norm.weight
+        lm_maps = lm_maps.to(device=adapter_param.device, dtype=adapter_param.dtype)
+        b, c, h, w = lm_maps.shape
         lm_tokens = lm_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        raw_maps = self.raw_feature_norm(raw_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
         lm_maps = self.lm_feature_norm(lm_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
         fuse_dtype = next(self.dual_feature_fuse.parameters()).dtype
         if raw_maps.dtype != fuse_dtype:
@@ -768,6 +836,26 @@ class EagleFeatureExtractor(nn.Module):
             generated_ids = generated[:, seq_len:]
             response = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0]
         return str(response).strip(), feature_map, text_embed
+
+    def _extract_eagle_vision_features(
+        self,
+        eagle_inputs: dict[str, torch.Tensor],
+        freeze_backbone: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _, input_ids, _, pixel_values, image_grid_hws = self._prepare_locate_inputs(eagle_inputs)
+
+        def extract() -> tuple[torch.Tensor, torch.Tensor]:
+            _, projected_vit_list, _ = self.run_vision_tokens(pixel_values, image_grid_hws)
+            raw_maps = self.build_raw_feature_maps(image_grid_hws, projected_vit_list)
+            hidden_size = int(raw_maps.shape[1])
+            text_embed = raw_maps.new_zeros((int(input_ids.shape[0]), hidden_size))
+            return raw_maps, text_embed
+
+        if freeze_backbone:
+            with torch.no_grad():
+                raw_maps, text_embed = extract()
+            return raw_maps.detach(), text_embed.detach()
+        return extract()
 
     def _extract_eagle_feature_maps(
         self,

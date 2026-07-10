@@ -481,6 +481,11 @@ class QwenFeatureRefinerBlock(nn.Module):
             nn.GELU(),
             nn.Conv2d(bottleneck_dim, dim, 1),
         )
+        # Exact identity initialization keeps pretrained visual features intact.
+        # The final projection learns first, then gradients open the full block.
+        nn.init.zeros_(self.net[-1].weight)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
         self.scale = nn.Parameter(torch.tensor(float(init_scale)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

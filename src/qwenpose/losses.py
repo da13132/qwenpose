@@ -148,6 +148,7 @@ def compute_box_conditioned_pose_losses(
     if not isinstance(simcc_refine_x, list) or not isinstance(simcc_refine_y, list):
         simcc_refine_x, simcc_refine_y = [], []
     simcc_refine_count = min(len(simcc_refine_x), len(simcc_refine_y))
+    simcc_refine_weights = _weight_sequence(weights.simcc_refine)
     total_simcc_refine = [torch.tensor(0.0, device=device) for _ in range(simcc_refine_count)]
 
     num_pos = 0
@@ -202,7 +203,7 @@ def compute_box_conditioned_pose_losses(
                 + _mean_valid_joints(refine_joint, gt_valid).sum()
             )
 
-        if "simcc_coarse_x" in outputs and "simcc_coarse_y" in outputs:
+        if weights.simcc_coarse > 0.0 and "simcc_coarse_x" in outputs and "simcc_coarse_y" in outputs:
             total_simcc_coarse = total_simcc_coarse + simcc_box_loss(
                 outputs["simcc_coarse_x"][b, q],
                 outputs["simcc_coarse_y"][b, q],
@@ -213,7 +214,7 @@ def compute_box_conditioned_pose_losses(
                 outputs["schema_joint_valid"][b],
                 sigma=weights.simcc_sigma,
             )
-        if "simcc_deform_x" in outputs and "simcc_deform_y" in outputs:
+        if weights.simcc_deform > 0.0 and "simcc_deform_x" in outputs and "simcc_deform_y" in outputs:
             total_simcc_deform = total_simcc_deform + simcc_box_loss(
                 outputs["simcc_deform_x"][b, q],
                 outputs["simcc_deform_y"][b, q],
@@ -225,6 +226,9 @@ def compute_box_conditioned_pose_losses(
                 sigma=weights.simcc_sigma,
             )
         for refine_idx in range(simcc_refine_count):
+            refine_weight = simcc_refine_weights[refine_idx] if refine_idx < len(simcc_refine_weights) else 0.0
+            if refine_weight <= 0.0:
+                continue
             total_simcc_refine[refine_idx] = total_simcc_refine[refine_idx] + simcc_box_loss(
                 simcc_refine_x[refine_idx][b, q],
                 simcc_refine_y[refine_idx][b, q],

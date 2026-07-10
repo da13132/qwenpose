@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v1.4`
+Release: `v2.0`
 
 English | [中文说明](README_zh.md)
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v1.4` snapshot was validated with:
+This `v2.0` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -207,10 +207,10 @@ The public code supports `coco`, `aic`, `mpii`, `crowdpose`, and `refhuman`.
 
 Important defaults:
 
-- `LocatePose` stage 1 uses `crowdpose` by default
-- `LocatePose` stage 2 uses `coco,mpii,crowdpose,refhuman` by default
+- `LocatePose` stage 1 uses `coco,mpii,crowdpose` with vision-only MoonViT features
+- `LocatePose` stage 2 uses `coco,mpii,crowdpose,refhuman` with the full multimodal Locate path
 - `QwenPose` stage 1 and stage 2 use `coco` by default
-- `AIC` is supported by the loader, but it is not enabled in the default public training recipes
+- `RefHuman` is intentionally delayed until stage 2 because it requires text conditioning
 
 ### COCO
 
@@ -329,21 +329,30 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `coco,mpii,crowdpose,aic,refhuman` | `100` |
-| stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA and vision LoRA | `locate_generate` | `coco,mpii,crowdpose,aic,refhuman` | `5` |
+| stage 1 | `stage1_freeze_locate_gt_box` | MoonViT only; train vision LoRA | `gt` | `coco,mpii,crowdpose` | `20` with a `60,000`-step cap |
+| stage 2 | `stage2_locate_box_closed_loop` | full multimodal Locate; train all LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
 Additional default knobs:
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=12`
+- `STAGE1_BATCH_SIZE=3` (global batch `12` on four GPUs)
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
-- `STAGE1_LR=2e-4`
+- `STAGE1_LR=3e-4`
+- `STAGE1_MAX_STEPS=60000`
 - `STAGE2_LR=5e-5`
+- `STAGE1_LOCATE_FEATURE_SOURCE=vision_only`
+- `STAGE1_LOCATE_TRAIN_SCOPE=vision_lora`
+- `STAGE1_LOCATE_GRADIENT_CHECKPOINTING=0`
+- `STAGE2_LOCATE_FEATURE_SOURCE=multimodal`
+- `STAGE2_LOCATE_TRAIN_SCOPE=all_lora`
+- `POSE_DROPOUT=0.0`
+- `LOCATE_LORA_DROPOUT=0.0` and `LOCATE_VISION_LORA_DROPOUT=0.0`
+- `LOCATE_VISION_SCALE=0.05`
 - `STAGE1_BOX_JITTER_SCALE=0.0` and `STAGE1_BOX_JITTER_SHIFT=0.0` as global fallbacks; each dataset record carries its own default jitter policy
-- `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use values such as `coco:1,mpii:1,crowdpose:1,aic:1,refhuman:1` only for balanced ablations
+- `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use manual weights only for controlled ablations
 - `W_OKS=0.5`
 - `W_COORD=3.0`
 - `W_IMAGE_COORD=5.0`
@@ -352,9 +361,10 @@ Additional default knobs:
 - `W_COARSE_COORD=0.5`
 - `W_DEFORM_COORD=0.75`
 - `W_REFINE_COORDS=0.75,1.0,1.25`
-- `W_SIMCC_COARSE=0.1`
-- `W_SIMCC_DEFORM=0.15`
-- `W_SIMCC_REFINE=0.15,0.2,0.25`
+- SimCC is computed only once, after the final refinement step
+- `W_SIMCC_COARSE=0.0`
+- `W_SIMCC_DEFORM=0.0`
+- `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
 - `LOCATE_GENERATION_MODE=hybrid`
@@ -373,7 +383,7 @@ bash scripts/locatepose.sh
 Example with explicit run name and the current 4-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v1_4 \
+RUN_NAME=locatepose_v2_0 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -398,7 +408,10 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `DATASET_ROOT`: dataset root, default `datasets`
 - `OUTPUT_ROOT`: training root, default `outputs/locatepose`
 - `ZERO_STAGE`: one of `zero2`, `zero3`, `zero3_offload`, or `none`
-- `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
+- `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists; vision-only stage 1 must not include RefHuman
+- `STAGE1_LOCATE_FEATURE_SOURCE`, `STAGE2_LOCATE_FEATURE_SOURCE`: `vision_only` for fast pose warmup and `multimodal` for the closed loop
+- `STAGE1_LOCATE_TRAIN_SCOPE`, `STAGE2_LOCATE_TRAIN_SCOPE`: `frozen`, `vision_lora`, or `all_lora`
+- `POSE_DROPOUT`: Transformer dropout inside the pose head, default `0.0`
 - `STAGE1_BOX_JITTER_SCALE`, `STAGE1_BOX_JITTER_SHIFT`: stage-1 GT-box perturbation knobs
 - `LOCATE_ATTN_IMPLEMENTATION`: LocateAnything attention backend used during training, default `flash_attention_2`
 - `SIMCC_BINS`: auxiliary SimCC bins per axis, default `256`; use `0` to disable SimCC entirely
@@ -615,6 +628,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v1.4`
+- Git tags such as `v2.0`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

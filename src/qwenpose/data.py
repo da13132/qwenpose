@@ -33,7 +33,7 @@ from .schemas import (
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 9
+RECORD_CACHE_VERSION = 10
 
 ALL_POSE_PROMPT = (
     "Locate all the instances that match the following description: person. "
@@ -542,15 +542,11 @@ def aic_to_union(
     image_width: float,
     image_height: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert AIC14 keypoints while keeping visible vs occluded states.
+    """Treat every labeled AIC joint as a positive visibility target.
 
-    In the local AIC annotations:
-    - `v == 1` means labeled and visible.
-    - `v == 2` means labeled but occluded / not visible.
-    - `v >= 3` behaves like missing / outside image and is often paired with (0, 0).
-
-    We keep `v in {1, 2}` as valid supervision for coordinates, but only set
-    the visibility target channel to 1.0 for `v == 1`.
+    In the local AIC annotations, both visible (`v == 1`) and occluded
+    (`v == 2`) joints supervise coordinates and visibility. Missing/outside
+    joints (`v >= 3`) remain excluded.
     """
     if isinstance(flat_keypoints, dict):
         flat_keypoints = list(flat_keypoints.values())
@@ -569,7 +565,7 @@ def aic_to_union(
             continue
         keypoints[union_idx, 0] = float(x) / width
         keypoints[union_idx, 1] = float(y) / height
-        keypoints[union_idx, 2] = 1.0 if int(round(visibility)) == 1 else 0.0
+        keypoints[union_idx, 2] = 1.0
         valid[union_idx] = True
         visibility_valid[union_idx] = True
     return keypoints.clamp_(0.0, 1.0), valid, visibility_valid

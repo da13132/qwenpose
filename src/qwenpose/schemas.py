@@ -28,6 +28,7 @@ UNION_KEYPOINTS = [
     "pelvis",
     "thorax",
     "upper_neck",
+    "crowdpose_head",
 ]
 
 SCHEMA_KEYPOINTS = {
@@ -97,7 +98,7 @@ SCHEMA_KEYPOINTS = {
         "right_knee",
         "left_ankle",
         "right_ankle",
-        "head_top",
+        "crowdpose_head",
         "neck",
     ],
 }
@@ -140,6 +141,7 @@ def _default_sigmas() -> dict[str, float]:
         "pelvis": 0.107,
         "thorax": 0.079,
         "upper_neck": 0.079,
+        "crowdpose_head": 0.035,
     }
     return {**coco, **extra}
 
@@ -174,27 +176,24 @@ def _schema_to_union_impl(
     image_width: float,
     image_height: float,
     *,
-    visibility_target: str = "valid",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert schema-specific keypoints to fixed union tensors.
-
-    Args:
-        visibility_target: How to fill the third channel used by the visibility
-            BCE target. ``valid`` keeps the previous behavior: every supervised
-            coordinate has target 1.0. ``coco`` treats ``v > 0`` as coordinate
-            supervision, but only ``v > 1`` as visible.
+    visibility_target: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert schema-specific annotations to the fixed union representation.
 
     Returns:
-        keypoints: [U, 3] normalized x/y and confidence target.
-        valid: [U] bool mask. Only true keypoints contribute to coordinate losses.
+        keypoints: ``[U, 3]`` normalized x/y and visibility target.
+        coord_valid: ``[U]`` mask for coordinate/OKS/SimCC supervision.
+        visibility_valid: ``[U]`` mask for visibility BCE supervision.
     """
     spec = get_schema(schema_name)
     keypoints = torch.zeros(len(UNION_KEYPOINTS), 3, dtype=torch.float32)
-    valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
+    coord_valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
+    visibility_valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
     if len(flat_keypoints) != len(spec.keypoints) * 3:
         raise ValueError(
             f"{schema_name} expects {len(spec.keypoints) * 3} values, got {len(flat_keypoints)}"
         )
+
     width = max(float(image_width), 1.0)
     height = max(float(image_height), 1.0)
     for local_idx, union_idx in enumerate(spec.indices.tolist()):
@@ -202,16 +201,27 @@ def _schema_to_union_impl(
         visibility = float(v)
         if visibility <= 0:
             continue
+
         keypoints[union_idx, 0] = float(x) / width
         keypoints[union_idx, 1] = float(y) / height
+        coord_valid[union_idx] = True
+
         if visibility_target == "coco":
             keypoints[union_idx, 2] = 1.0 if visibility > 1.0 else 0.0
-        elif visibility_target == "valid":
+            visibility_valid[union_idx] = True
+        elif visibility_target == "visible_if_valid":
             keypoints[union_idx, 2] = 1.0
+            visibility_valid[union_idx] = True
+        elif visibility_target == "none":
+            # MPII joints_vis is a coordinate target weight, not a COCO-style
+            # visible-vs-occluded label. Do not train the shared visibility head.
+            keypoints[union_idx, 2] = 0.0
         else:
             raise ValueError(f"Unknown visibility target mode: {visibility_target!r}")
-        valid[union_idx] = True
-    return keypoints.clamp_(0.0, 1.0), valid
+
+    keypoints[..., :2].clamp_(0.0, 1.0)
+    keypoints[..., 2].clamp_(0.0, 1.0)
+    return keypoints, coord_valid, visibility_valid
 
 
 def schema_to_union(
@@ -219,22 +229,24 @@ def schema_to_union(
     schema_name: str,
     image_width: float,
     image_height: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _schema_to_union_impl(flat_keypoints, schema_name, image_width, image_height)
+    *,
+    visibility_target: str = "visible_if_valid",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _schema_to_union_impl(
+        flat_keypoints,
+        schema_name,
+        image_width,
+        image_height,
+        visibility_target=visibility_target,
+    )
 
 
 def coco_to_union(
     flat_keypoints: list[float] | list[int],
     image_width: float,
     image_height: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert COCO-style keypoints and preserve visible-vs-occluded labels.
-
-    COCO-style annotations use ``v == 0`` for missing, ``v == 1`` for labeled
-    but not visible, and ``v == 2`` for labeled and visible. Coordinates with
-    ``v in {1, 2}`` remain valid supervision, while the visibility target is 1
-    only for visible joints.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert COCO-style keypoints while preserving occlusion labels."""
     return _schema_to_union_impl(
         flat_keypoints,
         "COCO17",
@@ -248,14 +260,8 @@ def crowdpose_to_union(
     flat_keypoints: list[float] | list[int],
     image_width: float,
     image_height: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert CrowdPose keypoints and preserve visible-vs-occluded labels.
-
-    The local MMPose CrowdPose annotation names the 13th joint ``head``. To keep
-    the existing union output dimension and checkpoint format stable, this
-    schema maps that joint to the union ``head_top`` slot consistently in both
-    training and evaluation.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert CrowdPose keypoints and keep its head joint semantically separate."""
     return _schema_to_union_impl(
         flat_keypoints,
         "CrowdPose14",
@@ -270,9 +276,14 @@ def mpii_to_union(
     joints_vis: list[int] | list[float],
     image_width: float,
     image_height: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat: list[float] = []
     for joint, vis in zip(joints, joints_vis):
         flat.extend([float(joint[0]), float(joint[1]), float(vis)])
-    return schema_to_union(flat, "MPII16", image_width, image_height)
-
+    return schema_to_union(
+        flat,
+        "MPII16",
+        image_width,
+        image_height,
+        visibility_target="none",
+    )

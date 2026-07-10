@@ -33,7 +33,28 @@ from .schemas import (
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 8
+RECORD_CACHE_VERSION = 9
+
+ALL_POSE_PROMPT = (
+    "Locate all the instances that match the following description: person. "
+    "Estimate the human pose for each located person."
+)
+
+DATASET_BOX_CONTEXT_SCALE = {
+    "coco": 1.15,
+    "mpii": 1.00,
+    "crowdpose": 1.10,
+    "aic": 1.15,
+    "refhuman": 1.15,
+}
+
+DATASET_BOX_JITTER = {
+    "coco": (0.05, 0.03),
+    "mpii": (0.10, 0.00),
+    "crowdpose": (0.05, 0.02),
+    "aic": (0.05, 0.03),
+    "refhuman": (0.05, 0.03),
+}
 
 
 def _distributed_rank() -> int:
@@ -89,9 +110,18 @@ class PoseRecord:
     image_path: Path
     width: int
     height: int
+    # Normalized boxes used to condition the PoseHead.
     boxes_xyxy: torch.Tensor
+    # Normalized reference boxes used only for coordinate-loss scaling.
+    loss_boxes_xyxy: torch.Tensor
+    # Reference areas normalized by full-image area, used by OKS.
+    loss_areas: torch.Tensor
     keypoints: torch.Tensor
     keypoint_valid: torch.Tensor
+    visibility_valid: torch.Tensor
+    box_context_scale: torch.Tensor
+    box_jitter_scale: torch.Tensor
+    box_jitter_shift: torch.Tensor
     schema: str
     task: str
     prompt: str
@@ -119,13 +149,31 @@ def clamp_box_xyxy(box: list[float], width: float, height: float) -> list[float]
     return [x1, y1, x2, y2]
 
 
-def normalize_boxes(boxes: list[list[float]], width: float, height: float) -> torch.Tensor:
+def normalize_boxes(
+    boxes: list[list[float]],
+    width: float,
+    height: float,
+    *,
+    clamp: bool = True,
+) -> torch.Tensor:
     if not boxes:
         return torch.zeros(0, 4, dtype=torch.float32)
     out = torch.tensor(boxes, dtype=torch.float32)
     out[:, [0, 2]] /= max(float(width), 1.0)
     out[:, [1, 3]] /= max(float(height), 1.0)
-    return out.clamp_(0.0, 1.0)
+    return out.clamp_(0.0, 1.0) if clamp else out
+
+
+def normalize_areas(areas: list[float], width: float, height: float) -> torch.Tensor:
+    if not areas:
+        return torch.zeros(0, dtype=torch.float32)
+    image_area = max(float(width) * float(height), 1.0)
+    return torch.tensor(areas, dtype=torch.float32).div_(image_area).clamp_(min=1e-8)
+
+
+def box_area_abs(box: list[float]) -> float:
+    x1, y1, x2, y2 = [float(v) for v in box]
+    return max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
 
 
 def box_from_keypoints(keypoints: torch.Tensor, valid: torch.Tensor) -> list[float] | None:
@@ -139,32 +187,59 @@ def box_from_keypoints(keypoints: torch.Tensor, valid: torch.Tensor) -> list[flo
     return [max(x1 - pad_x, 0.0), max(y1 - pad_y, 0.0), min(x2 + pad_x, 1.0), min(y2 + pad_y, 1.0)]
 
 
-def mpii_box_from_center_scale(
+def mpii_boxes_from_center_scale(
     center: list[float] | tuple[float, float],
     scale: float,
     width: float,
     height: float,
     *,
-    scale_multiplier: float = 1.25,
-) -> list[float] | None:
-    """Build a MPII pseudo person box from the official center/scale fields.
+    padding: float = 1.25,
+) -> tuple[list[float], list[float], float] | None:
+    """Build MMPose-compatible MPII condition/loss boxes.
 
-    MPII does not provide COCO-style person boxes. Its top-down protocol is
-    centered on ``center`` and ``scale`` where one scale unit corresponds to
-    roughly 200 pixels. Using this crop-derived pseudo box is more stable for a
-    box-conditioned pose head than a tight box around visible keypoints.
+    MPII stores a MATLAB 1-based center and a scalar scale normalized by 200
+    pixels. MMPose shifts the center downward by ``15 * scale`` pixels, converts
+    the center to 0-based coordinates, uses ``scale * 200`` as the reference
+    square, and applies 1.25 padding in ``GetBBoxCenterScale`` before affine
+    cropping. We reproduce that geometry without applying an affine image warp.
+
+    Returns:
+        condition_box: 1.25-padded square used by the PoseHead.
+        loss_box: unpadded ``scale * 200`` square used for coordinate scaling.
+        loss_area: MMPose MPII area, ``base_side**2 * 0.53`` in pixel units.
     """
     if center is None or len(center) < 2:
         return None
     try:
-        cx, cy = float(center[0]), float(center[1])
-        side = float(scale) * 200.0 * float(scale_multiplier)
+        scale_value = float(scale)
+        cx = float(center[0]) - 1.0
+        cy = float(center[1]) - 1.0 + 15.0 * scale_value
     except Exception:
         return None
-    if not math.isfinite(cx) or not math.isfinite(cy) or not math.isfinite(side) or side <= 1.0:
+    if (
+        not math.isfinite(cx)
+        or not math.isfinite(cy)
+        or not math.isfinite(scale_value)
+        or scale_value <= 0.0
+    ):
         return None
-    half = side * 0.5
-    return clamp_box_xyxy([cx - half, cy - half, cx + half, cy + half], width, height)
+
+    base_side = scale_value * 200.0
+    if base_side <= 1.0:
+        return None
+    condition_side = base_side * max(float(padding), 1e-4)
+
+    def square(side: float) -> list[float]:
+        half = side * 0.5
+        return [cx - half, cy - half, cx + half, cy + half]
+
+    condition_box = clamp_box_xyxy(square(condition_side), width, height)
+    # Keep the full unpadded reference square even when it extends beyond the
+    # image. MMPose's affine crop pads outside-image regions instead of shrinking
+    # the person scale, and this box is used only as a loss normalization scale.
+    loss_box = square(base_side)
+    loss_area = max(base_side * base_side * 0.53, 1.0)
+    return condition_box, loss_box, loss_area
 
 
 def read_image_tensor(path: Path, image_size: int) -> tuple[torch.Tensor, int, int]:
@@ -209,8 +284,14 @@ class PoseRecordDataset(Dataset):
             image = torch.zeros(3, 1, 1, dtype=torch.float32)
         n = min(record.boxes_xyxy.shape[0], self.max_instances)
         boxes = record.boxes_xyxy[:n].clone()
+        loss_boxes = record.loss_boxes_xyxy[:n].clone()
+        loss_areas = record.loss_areas[:n].clone()
         keypoints = record.keypoints[:n].clone()
         valid = record.keypoint_valid[:n].clone()
+        visibility_valid = record.visibility_valid[:n].clone()
+        box_context_scale = record.box_context_scale[:n].clone()
+        box_jitter_scale = record.box_jitter_scale[:n].clone()
+        box_jitter_shift = record.box_jitter_shift[:n].clone()
         ref_target = record.ref_target
         if ref_target >= n:
             ref_target = -1
@@ -222,8 +303,14 @@ class PoseRecordDataset(Dataset):
             "task_id": torch.tensor(TASK_TO_ID[record.task], dtype=torch.long),
             "target": {
                 "boxes": boxes,
+                "loss_boxes": loss_boxes,
+                "loss_areas": loss_areas,
                 "keypoints": keypoints,
                 "keypoint_valid": valid,
+                "visibility_valid": visibility_valid,
+                "box_context_scale": box_context_scale,
+                "box_jitter_scale": box_jitter_scale,
+                "box_jitter_shift": box_jitter_shift,
                 "ref_target": torch.tensor(ref_target, dtype=torch.long),
                 "dataset": record.dataset_name,
                 "image_id": record.image_id,
@@ -391,17 +478,54 @@ def _record_if_valid(
     image_id: str,
     ref_text: str = "",
     ref_target: int = -1,
+    *,
+    loss_boxes: list[list[float]] | None = None,
+    loss_areas: list[float] | None = None,
+    visibility_valid: list[torch.Tensor] | None = None,
+    box_context_scales: list[float] | None = None,
+    box_jitter_scales: list[float] | None = None,
+    box_jitter_shifts: list[float] | None = None,
 ) -> None:
     if not image_path.exists() or not boxes:
         return
+    n = len(boxes)
+    if not (len(keypoints) == len(valid) == n):
+        raise ValueError("PoseRecord fields must have the same instance count.")
+    loss_boxes = boxes if loss_boxes is None else loss_boxes
+    loss_areas = [box_area_abs(box) for box in loss_boxes] if loss_areas is None else loss_areas
+    visibility_valid = valid if visibility_valid is None else visibility_valid
+    context_default = DATASET_BOX_CONTEXT_SCALE.get(dataset_name, 1.0)
+    jitter_scale_default, jitter_shift_default = DATASET_BOX_JITTER.get(dataset_name, (0.0, 0.0))
+    box_context_scales = [context_default] * n if box_context_scales is None else box_context_scales
+    box_jitter_scales = [jitter_scale_default] * n if box_jitter_scales is None else box_jitter_scales
+    box_jitter_shifts = [jitter_shift_default] * n if box_jitter_shifts is None else box_jitter_shifts
+    if not all(
+        len(items) == n
+        for items in (
+            loss_boxes,
+            loss_areas,
+            visibility_valid,
+            box_context_scales,
+            box_jitter_scales,
+            box_jitter_shifts,
+        )
+    ):
+        raise ValueError("PoseRecord auxiliary fields must match the box count.")
+
     records.append(
         PoseRecord(
             image_path=image_path,
             width=width,
             height=height,
             boxes_xyxy=normalize_boxes(boxes, width, height),
+            loss_boxes_xyxy=normalize_boxes(loss_boxes, width, height, clamp=False),
+            loss_areas=normalize_areas(loss_areas, width, height),
             keypoints=torch.stack(keypoints, dim=0),
             keypoint_valid=torch.stack(valid, dim=0),
+            visibility_valid=torch.stack(visibility_valid, dim=0),
+            box_context_scale=torch.tensor(box_context_scales, dtype=torch.float32),
+            box_jitter_scale=torch.tensor(box_jitter_scales, dtype=torch.float32),
+            box_jitter_shift=torch.tensor(box_jitter_shifts, dtype=torch.float32),
             schema=schema,
             task=task,
             prompt=prompt,
@@ -417,7 +541,7 @@ def aic_to_union(
     flat_keypoints: list[float] | list[int],
     image_width: float,
     image_height: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert AIC14 keypoints while keeping visible vs occluded states.
 
     In the local AIC annotations:
@@ -433,6 +557,7 @@ def aic_to_union(
     spec = get_schema("AIC14")
     keypoints = torch.zeros(len(UNION_KEYPOINTS), 3, dtype=torch.float32)
     valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
+    visibility_valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
     if len(flat_keypoints) != len(spec.keypoints) * 3:
         raise ValueError(f"AIC14 expects {len(spec.keypoints) * 3} values, got {len(flat_keypoints)}")
     width = max(float(image_width), 1.0)
@@ -446,7 +571,8 @@ def aic_to_union(
         keypoints[union_idx, 1] = float(y) / height
         keypoints[union_idx, 2] = 1.0 if int(round(visibility)) == 1 else 0.0
         valid[union_idx] = True
-    return keypoints.clamp_(0.0, 1.0), valid
+        visibility_valid[union_idx] = True
+    return keypoints.clamp_(0.0, 1.0), valid, visibility_valid
 
 
 def _source_signature(paths: list[Path]) -> list[dict[str, Any]]:
@@ -775,14 +901,17 @@ def load_coco_records(
     records: list[PoseRecord] = []
     for image_id, anns in anns_by_image.items():
         img = images[image_id]
-        boxes, kpts, masks = [], [], []
+        boxes, kpts, masks, visibility_masks = [], [], [], []
         for ann in anns:
-            kp, valid = coco_to_union(ann["keypoints"], img["width"], img["height"])
+            kp, valid, visibility_valid = coco_to_union(
+                ann["keypoints"], img["width"], img["height"]
+            )
             if valid.sum().item() == 0:
                 continue
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(ann["bbox"]), img["width"], img["height"]))
             kpts.append(kp)
             masks.append(valid)
+            visibility_masks.append(visibility_valid)
         _record_if_valid(
             records,
             image_root / img["file_name"],
@@ -793,10 +922,10 @@ def load_coco_records(
             masks,
             "COCO17",
             "ALL_POSE",
-            "Locate all the instances that match the following description: person. "
-            "Estimate the human pose for each located person using the COCO17 keypoint schema.",
+            ALL_POSE_PROMPT,
             "coco",
             str(image_id),
+            visibility_valid=visibility_masks,
         )
         if max_samples and len(records) >= max_samples:
             break
@@ -816,14 +945,17 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
     records: list[PoseRecord] = []
     for image_id, anns in anns_by_image.items():
         img = images[image_id]
-        boxes, kpts, masks = [], [], []
+        boxes, kpts, masks, visibility_masks = [], [], [], []
         for ann in anns:
-            kp, valid = crowdpose_to_union(ann["keypoints"], img["width"], img["height"])
+            kp, valid, visibility_valid = crowdpose_to_union(
+                ann["keypoints"], img["width"], img["height"]
+            )
             if valid.sum().item() == 0:
                 continue
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(ann["bbox"]), img["width"], img["height"]))
             kpts.append(kp)
             masks.append(valid)
+            visibility_masks.append(visibility_valid)
         _record_if_valid(
             records,
             image_root / img["file_name"],
@@ -834,11 +966,10 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
             masks,
             "CrowdPose14",
             "ALL_POSE",
-            "Locate all the instances that match the following description: person. "
-            "Estimate the human pose for each located person using the CrowdPose14 keypoint schema "
-            "with 14 keypoints: shoulders, elbows, wrists, hips, knees, ankles, head, and neck.",
+            ALL_POSE_PROMPT,
             "crowdpose",
             str(image_id),
+            visibility_valid=visibility_masks,
         )
         if max_samples and len(records) >= max_samples:
             break
@@ -890,16 +1021,19 @@ def load_aic_records(
                 size = tuple(int(v) for v in img.size)
             image_size_map[str(item["image_id"])] = size
         width, height = size
-        boxes, kpts, masks = [], [], []
+        boxes, kpts, masks, visibility_masks = [], [], [], []
         for human_id, box in item.get("human_annotations", {}).items():
             if human_id not in item.get("keypoint_annotations", {}):
                 continue
-            kp, valid = aic_to_union(item["keypoint_annotations"][human_id], width, height)
+            kp, valid, visibility_valid = aic_to_union(
+                item["keypoint_annotations"][human_id], width, height
+            )
             if valid.sum().item() == 0:
                 continue
             boxes.append(clamp_box_xyxy(box, width, height))
             kpts.append(kp)
             masks.append(valid)
+            visibility_masks.append(visibility_valid)
         _record_if_valid(
             records,
             image_path,
@@ -910,10 +1044,10 @@ def load_aic_records(
             masks,
             "AIC14",
             "ALL_POSE",
-            "Locate all the instances that match the following description: person. "
-            "Estimate the human pose for each located person using the AIC14 keypoint schema.",
+            ALL_POSE_PROMPT,
             "aic",
             str(item["image_id"]),
+            visibility_valid=visibility_masks,
         )
         if progress_bar is not None and index % 2000 == 0:
             elapsed = time.perf_counter() - started
@@ -946,25 +1080,26 @@ def load_mpii_records(root: Path, split: str = "train", max_samples: int | None 
             continue
         with Image.open(image_path) as img:
             width, height = img.size
-        boxes, kpts, masks = [], [], []
+        boxes, loss_boxes, loss_areas = [], [], []
+        kpts, masks, visibility_masks = [], [], []
         for ann in anns:
-            kp, valid = mpii_to_union(ann["joints"], ann["joints_vis"], width, height)
+            kp, valid, visibility_valid = mpii_to_union(
+                ann["joints"], ann["joints_vis"], width, height
+            )
             if valid.sum().item() == 0:
                 continue
-            box = mpii_box_from_center_scale(ann.get("center"), ann.get("scale", 0.0), width, height)
-            if box is None:
-                box_norm = box_from_keypoints(kp, valid)
-                if box_norm is None:
-                    continue
-                box = [
-                    box_norm[0] * width,
-                    box_norm[1] * height,
-                    box_norm[2] * width,
-                    box_norm[3] * height,
-                ]
-            boxes.append(box)
+            geometry = mpii_boxes_from_center_scale(
+                ann.get("center"), ann.get("scale", 0.0), width, height
+            )
+            if geometry is None:
+                continue
+            condition_box, loss_box, loss_area = geometry
+            boxes.append(condition_box)
+            loss_boxes.append(loss_box)
+            loss_areas.append(loss_area)
             kpts.append(kp)
             masks.append(valid)
+            visibility_masks.append(visibility_valid)
         _record_if_valid(
             records,
             image_path,
@@ -975,10 +1110,12 @@ def load_mpii_records(root: Path, split: str = "train", max_samples: int | None 
             masks,
             "MPII16",
             "ALL_POSE",
-            "Locate all the instances that match the following description: person. "
-            "Estimate the human pose for each located person using the MPII16 keypoint schema.",
+            ALL_POSE_PROMPT,
             "mpii",
             image_name,
+            loss_boxes=loss_boxes,
+            loss_areas=loss_areas,
+            visibility_valid=visibility_masks,
         )
         if max_samples and len(records) >= max_samples:
             break
@@ -1019,11 +1156,13 @@ def load_refhuman_records(
     for img, ann, target_key, caption in expression_rows:
         group_key = f"{img['file_name']}::{img.get('original_id', img.get('origin_id', img['file_name']))}"
         candidates = grouped_candidates[group_key]
-        boxes, kpts, masks = [], [], []
+        boxes, kpts, masks, visibility_masks = [], [], [], []
         ref_target = -1
         for idx, cand in enumerate(candidates):
             cand_ann = cand["ann"]
-            kp, valid = coco_to_union(cand_ann["keypoints"], img["width"], img["height"])
+            kp, valid, visibility_valid = coco_to_union(
+                cand_ann["keypoints"], img["width"], img["height"]
+            )
             if valid.sum().item() == 0:
                 continue
             if cand["candidate_key"] == target_key:
@@ -1031,12 +1170,13 @@ def load_refhuman_records(
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(cand_ann["bbox"]), img["width"], img["height"]))
             kpts.append(kp)
             masks.append(valid)
+            visibility_masks.append(visibility_valid)
         if ref_target < 0:
             continue
         prompt = (
             "Locate a single person that matches the following description: "
             f"\"{caption}\". "
-            "Estimate the human pose for the located person using the COCO17 keypoint schema."
+            "Estimate the human pose for the located person."
         )
         _record_if_valid(
             records,
@@ -1053,6 +1193,7 @@ def load_refhuman_records(
             f"{img.get('id')}",
             ref_text=caption,
             ref_target=ref_target,
+            visibility_valid=visibility_masks,
         )
         if max_samples and len(records) >= max_samples:
             break
@@ -1102,7 +1243,7 @@ def build_datasets(
     load_image_tensors: bool = True,
     split: str = "train",
     max_samples_per_dataset: int | None = None,
-    refhuman_max_captions_per_instance: int = 2,
+    refhuman_max_captions_per_instance: int = 1,
     mixing_strategy: str = "interleave",
     dataset_mix_weights: str | dict[str, int] | None = None,
     seed: int = 42,

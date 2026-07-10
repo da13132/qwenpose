@@ -429,8 +429,8 @@ DATASET_ROOT="${DATASET_ROOT:-datasets}"
 SPLIT="${SPLIT:-train}"
 # MIXING_STRATEGY：多数据集混合方式。interleave 会按数据集交错采样。
 MIXING_STRATEGY="${MIXING_STRATEGY:-interleave}"
-# DATASET_MIX_WEIGHTS：多数据集采样权重；auto/空值表示按数据量比例。
-# 例如 DATASET_MIX_WEIGHTS=coco:1,mpii:1,crowdpose:1 可避免 COCO 更新占比过高。
+# DATASET_MIX_WEIGHTS：多数据集采样权重；默认 auto，严格按各数据集 record 数量比例训练。
+# 仅做消融实验时才手动指定 name:weight；正式五数据集训练保持 auto。
 DATASET_MIX_WEIGHTS="${DATASET_MIX_WEIGHTS:-auto}"
 # MAX_INSTANCES：每张图最多保留/训练的人体实例数。
 MAX_INSTANCES="${MAX_INSTANCES:-80}"
@@ -500,12 +500,14 @@ POSE_DECODER_LAYERS="${POSE_DECODER_LAYERS:-3}"
 REFINEMENT_STEPS="${REFINEMENT_STEPS:-3}"
 # DECODER_HEADS：pose decoder attention head 数。
 DECODER_HEADS="${DECODER_HEADS:-8}"
-# BOX_CONDITION_SCALE：PoseHead 使用条件框前的放大比例，给关键点留上下文。
-BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
+# BOX_CONDITION_SCALE：全局二次放大比例。数据记录已携带 per-dataset context scale，固定为 1。
+BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.0}"
+# SCHEMA_JOINT_PRIORS_PATH：各 schema 在自身 box 协议下的关节点几何先验。
+SCHEMA_JOINT_PRIORS_PATH="${SCHEMA_JOINT_PRIORS_PATH:-${PROJECT_ROOT}/configs/schema_joint_priors.json}"
 # POSE_ROI_SIZE：每个 box 从 Locate feature map 上采样的 ROI 特征边长。
 POSE_ROI_SIZE="${POSE_ROI_SIZE:-32}"
 # SIMCC_BINS：SimCC 辅助头每个坐标轴的离散 bin 数；0 表示关闭。
-SIMCC_BINS="${SIMCC_BINS:-128}"
+SIMCC_BINS="${SIMCC_BINS:-256}"
 # DISABLE_REFINEMENT：是否关闭 keypoint refinement。
 DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
 
@@ -556,8 +558,10 @@ DISABLE_BATCH_TRACE="${DISABLE_BATCH_TRACE:-0}"
 
 # W_OKS：OKS loss 权重。
 W_OKS="${W_OKS:-0.5}"
-# W_COORD：归一化坐标回归 loss 权重。
+# W_COORD：按 dataset-native loss box 归一化的坐标回归权重。
 W_COORD="${W_COORD:-3.0}"
+# W_IMAGE_COORD：整图归一化坐标回归权重，不依赖各数据集 box 协议。
+W_IMAGE_COORD="${W_IMAGE_COORD:-5.0}"
 # W_VIS：关键点可见性 BCE loss 权重。
 W_VIS="${W_VIS:-0.05}"
 # W_HARD_JOINT：hard-joint mining loss 权重，默认关闭。
@@ -611,16 +615,15 @@ STAGE1_OUTPUT_DIR="${STAGE1_OUTPUT_DIR:-${OUTPUT_DIR}/stage1_freeze_locate_gt_bo
 STAGE2_OUTPUT_DIR="${STAGE2_OUTPUT_DIR:-${OUTPUT_DIR}/stage2_locate_box_closed_loop}"
 # STAGE2_INIT_WEIGHTS_DIR：stage2 weight-only 初始化 checkpoint 临时目录。
 STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_weights}"
-# STAGE1_TRAIN_DATASETS：stage1 训练数据集。 #coco,mpii,crowdpose,refhuman,aic
-STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose}"
-# STAGE2_TRAIN_DATASETS：stage2 训练数据集。
-STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
+# STAGE1_TRAIN_DATASETS / STAGE2_TRAIN_DATASETS：正式五数据集训练配置。
+STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose,aic,refhuman}"
+STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,aic,refhuman}"
 # STAGE1_EPOCHS：stage1 epoch 数。
 STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
 # STAGE2_EPOCHS：stage2 epoch 数。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 # STAGE1_BATCH_SIZE：stage1 每卡 micro batch size；Locate vision 走 flash_attention_2 full-batch forward。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-8}"
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-12}"
 # STAGE2_BATCH_SIZE：stage2 每卡 micro batch size；locate_generate 逐图生成，默认 1。
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-1}"
 # STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。
@@ -643,10 +646,10 @@ STAGE2_FREEZE_LOCATE="${STAGE2_FREEZE_LOCATE:-0}"
 STAGE1_BOX_SOURCE="${STAGE1_BOX_SOURCE:-gt}"
 # STAGE2_BOX_SOURCE：stage2 条件框来源，默认 LocateAnything 生成框。
 STAGE2_BOX_SOURCE="${STAGE2_BOX_SOURCE:-locate_generate}"
-# STAGE1_BOX_JITTER_SCALE：stage1 条件框缩放扰动。
-STAGE1_BOX_JITTER_SCALE="${STAGE1_BOX_JITTER_SCALE:-0.1}"
-# STAGE1_BOX_JITTER_SHIFT：stage1 条件框中心平移扰动。
-STAGE1_BOX_JITTER_SHIFT="${STAGE1_BOX_JITTER_SHIFT:-0.1}"
+# STAGE1_BOX_JITTER_SCALE / SHIFT：无 dataset metadata 时的 fallback。
+# 正式训练由每条 record 携带 per-dataset jitter，故全局 fallback 固定为 0。
+STAGE1_BOX_JITTER_SCALE="${STAGE1_BOX_JITTER_SCALE:-0.0}"
+STAGE1_BOX_JITTER_SHIFT="${STAGE1_BOX_JITTER_SHIFT:-0.0}"
 # STAGE2_BOX_JITTER_SCALE：stage2 生成框不再额外 jitter。
 STAGE2_BOX_JITTER_SCALE="${STAGE2_BOX_JITTER_SCALE:-0.0}"
 # STAGE2_BOX_JITTER_SHIFT：stage2 生成框不再额外 jitter。
@@ -907,12 +910,13 @@ common_args() {
   a+=(--locate_vision_lora_r "${LOCATE_VISION_LORA_R}" --locate_vision_lora_alpha "${LOCATE_VISION_LORA_ALPHA}" --locate_vision_lora_dropout "${LOCATE_VISION_LORA_DROPOUT}")
   a+=(--hidden_dim "${HIDDEN_DIM}" --pose_decoder_layers "${POSE_DECODER_LAYERS}" --refinement_steps "${REFINEMENT_STEPS}" --decoder_heads "${DECODER_HEADS}")
   a+=(--box_condition_scale "${BOX_CONDITION_SCALE}" --pose_roi_size "${POSE_ROI_SIZE}" --simcc_bins "${SIMCC_BINS}")
+  a+=(--schema_joint_priors_path "${SCHEMA_JOINT_PRIORS_PATH}")
   a+=(--locate_vision_scale "${LOCATE_VISION_SCALE}")
   a+=(--locate_generation_mode "${LOCATE_GENERATION_MODE}" --locate_box_max_new_tokens "${LOCATE_BOX_MAX_NEW_TOKENS}")
   a+=(--box_match_iou_thresh "${BOX_MATCH_IOU_THRESH}" --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}")
   a+=(--weight_decay "${WEIGHT_DECAY}" --grad_clip "${GRAD_CLIP}" --warmup_steps "${WARMUP_STEPS}" --min_lr_ratio "${MIN_LR_RATIO}")
   a+=(--log_every "${LOG_EVERY}" --save_every "${SAVE_EVERY}" --save_total_limit "${SAVE_TOTAL_LIMIT}" --seed "${SEED}" --device "${DEVICE}")
-  a+=(--w_oks "${W_OKS}" --w_coord "${W_COORD}" --w_vis "${W_VIS}")
+  a+=(--w_oks "${W_OKS}" --w_coord "${W_COORD}" --w_image_coord "${W_IMAGE_COORD}" --w_vis "${W_VIS}")
   a+=(--w_hard_joint "${W_HARD_JOINT}" --hard_joint_fraction "${HARD_JOINT_FRACTION}")
   a+=(--w_coarse_coord "${W_COARSE_COORD}" --w_deform_coord "${W_DEFORM_COORD}" --w_refine_coords "${W_REFINE_COORDS}")
   a+=(--w_simcc_coarse "${W_SIMCC_COARSE}" --w_simcc_deform "${W_SIMCC_DEFORM}" --w_simcc_refine "${W_SIMCC_REFINE}" --simcc_sigma "${SIMCC_SIGMA}")

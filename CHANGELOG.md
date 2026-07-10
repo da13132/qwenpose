@@ -2,6 +2,15 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v1.4 - 2026-07-10
+
+- Expanded the maintained LocatePose recipe to the five-dataset `coco,mpii,crowdpose,aic,refhuman` schedule with size-proportional homogeneous-source batches, shared ALL_POSE semantics, RefHuman-only text conditioning, and schema-specific geometric priors.
+- Reworked dataset geometry and supervision metadata: MPII now follows the MMPose center/scale convention, AIC uses `human_annotations` boxes, CrowdPose keeps its head joint separate from MPII/AIC `head_top`, and records carry native loss boxes, areas, visibility masks, context scales, and jitter policies.
+- Made multi-dataset pose losses comparable by averaging valid joints per person, adding full-image coordinate supervision, excluding unavailable MPII visibility targets, and normalizing SimCC cross entropy by `log(bins)`; the default SimCC resolution is now 256 bins.
+- Added schema-prior generation/configuration, per-dataset training diagnostics, corrected generated-box conditioning, checkpoint-persistent priors, and regression tests for geometry, loss normalization, sampling, text gating, visualization edges, and checkpoint reload behavior.
+- Updated LocatePose inference, metrics, visualizations, documentation, and launch defaults to match the new data contracts; existing PoseHead checkpoints from the previous 22-joint union are not compatible with the new 23-joint union.
+- Bumped the repository snapshot version to `v1.4` through `VERSION`, `qwenpose.__version__`, dependency headers, README release notes, and the Git tag convention used for public releases.
+
 ## v1.3 - 2026-07-09
 
 - Updated the LocatePose public defaults to the current multi-dataset stage-1 recipe, four-GPU launch layout, larger pose ROI, and configurable dataset mixing weights in `scripts/locatepose.sh`.

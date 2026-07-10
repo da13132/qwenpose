@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v1.3`
+Release: `v1.4`
 
 English | [中文说明](README_zh.md)
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v1.3` snapshot was validated with:
+This `v1.4` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -329,26 +329,26 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `coco,mpii,crowdpose` | `100` |
-| stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA and vision LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
+| stage 1 | `stage1_freeze_locate_gt_box` | freeze LocateAnything | `gt` | `coco,mpii,crowdpose,aic,refhuman` | `100` |
+| stage 2 | `stage2_locate_box_closed_loop` | unfreeze Locate LoRA and vision LoRA | `locate_generate` | `coco,mpii,crowdpose,aic,refhuman` | `5` |
 
 Additional default knobs:
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=8`
+- `STAGE1_BATCH_SIZE=12`
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
 - `STAGE1_LR=2e-4`
 - `STAGE2_LR=5e-5`
-- `STAGE1_BOX_JITTER_SCALE=0.1`
-- `STAGE1_BOX_JITTER_SHIFT=0.1`
-- `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use values such as `coco:1,mpii:1,crowdpose:1` for balanced sampling
+- `STAGE1_BOX_JITTER_SCALE=0.0` and `STAGE1_BOX_JITTER_SHIFT=0.0` as global fallbacks; each dataset record carries its own default jitter policy
+- `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use values such as `coco:1,mpii:1,crowdpose:1,aic:1,refhuman:1` only for balanced ablations
 - `W_OKS=0.5`
 - `W_COORD=3.0`
+- `W_IMAGE_COORD=5.0`
 - `POSE_ROI_SIZE=32`
-- `SIMCC_BINS=128`
+- `SIMCC_BINS=256`
 - `W_COARSE_COORD=0.5`
 - `W_DEFORM_COORD=0.75`
 - `W_REFINE_COORDS=0.75,1.0,1.25`
@@ -373,7 +373,7 @@ bash scripts/locatepose.sh
 Example with explicit run name and the current 4-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v1_3 \
+RUN_NAME=locatepose_v1_4 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -401,7 +401,9 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists
 - `STAGE1_BOX_JITTER_SCALE`, `STAGE1_BOX_JITTER_SHIFT`: stage-1 GT-box perturbation knobs
 - `LOCATE_ATTN_IMPLEMENTATION`: LocateAnything attention backend used during training, default `flash_attention_2`
-- `SIMCC_BINS`: auxiliary SimCC bins per axis, use `0` to disable SimCC entirely
+- `SIMCC_BINS`: auxiliary SimCC bins per axis, default `256`; use `0` to disable SimCC entirely
+- `SCHEMA_JOINT_PRIORS_PATH`: JSON file containing schema-specific box-relative joint priors
+- `W_IMAGE_COORD`: full-image normalized coordinate loss weight
 - `W_COARSE_COORD`, `W_DEFORM_COORD`, `W_REFINE_COORDS`: coordinate deep-supervision weights for the coarse, deformable, and refinement stages
 - `W_SIMCC_COARSE`, `W_SIMCC_DEFORM`, `W_SIMCC_REFINE`, `SIMCC_SIGMA`: SimCC auxiliary supervision weights and Gaussian target width
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
@@ -613,6 +615,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v1.3`
+- Git tags such as `v1.4`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

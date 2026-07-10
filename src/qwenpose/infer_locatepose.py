@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - tqdm is optional for minimal envs.
     tqdm = None
 
 from qwenpose.data import (
+    ALL_POSE_PROMPT,
     PoseRecord,
     PoseRecordDataset,
     load_refhuman_records,
@@ -32,6 +33,8 @@ from qwenpose.schemas import SCHEMA_INDICES, SCHEMA_KEYPOINTS, SCHEMA_TO_ID, UNI
 from qwenpose.train_pose import (
     LocatePoseUnifiedConfig,
     LocatePoseUnifiedRuntime,
+    _context_scale_for_indices,
+    expand_boxes_xyxy_per_box,
     move_batch_to_device,
     nms_boxes_xyxy,
     parse_locate_bbox_response,
@@ -350,24 +353,9 @@ def prompt_for_format(format_name: str, caption: str = "") -> tuple[str, str, st
             "REF_POSE",
             schema,
             "Locate a single person that matches the following description: "
-            f"\"{text}\". Estimate the human pose for the located person using the COCO17 keypoint schema.",
+            f"\"{text}\". Estimate the human pose for the located person.",
         )
-    if format_name == "coco":
-        schema_text = "COCO17 keypoint schema"
-    elif format_name == "mpii":
-        schema_text = "MPII16 keypoint schema"
-    elif format_name == "crowdpose":
-        schema_text = "CrowdPose14 keypoint schema"
-    elif format_name == "aic":
-        schema_text = "AIC14 keypoint schema"
-    else:
-        schema_text = "available keypoint schema"
-    return (
-        "ALL_POSE",
-        schema,
-        "Locate all the instances that match the following description: person. "
-        f"Estimate the human pose for each located person using the {schema_text}.",
-    )
+    return ("ALL_POSE", schema, ALL_POSE_PROMPT)
 
 
 def empty_target_tensors() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -397,8 +385,14 @@ def make_arbitrary_records(image_paths: list[Path], args: argparse.Namespace) ->
                     width=int(width),
                     height=int(height),
                     boxes_xyxy=boxes,
+                    loss_boxes_xyxy=boxes.clone(),
+                    loss_areas=torch.zeros(0, dtype=torch.float32),
                     keypoints=keypoints,
                     keypoint_valid=valid,
+                    visibility_valid=valid.clone(),
+                    box_context_scale=torch.zeros(0, dtype=torch.float32),
+                    box_jitter_scale=torch.zeros(0, dtype=torch.float32),
+                    box_jitter_shift=torch.zeros(0, dtype=torch.float32),
                     schema=schema,
                     task=task,
                     prompt=prompt,
@@ -999,6 +993,7 @@ def condition_inference_from_locate_responses(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, list[list[list[float]]]]:
     selected_boxes: list[torch.Tensor] = []
+    raw_locate_boxes_abs: list[list[list[float]]] = []
     for sample_idx, response in enumerate(responses):
         task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
         boxes = parse_locate_bbox_response(response, max_instances=config.max_instances)
@@ -1009,7 +1004,22 @@ def condition_inference_from_locate_responses(
         )
         if task_id == 1 and boxes.shape[0] > 1:
             boxes = boxes[:1]
-        selected_boxes.append(boxes)
+        target = batch["targets"][sample_idx]
+        width = float(target["width"])
+        height = float(target["height"])
+        raw_locate_boxes_abs.append(
+            [
+                [
+                    float(box[0]) * width,
+                    float(box[1]) * height,
+                    float(box[2]) * width,
+                    float(box[3]) * height,
+                ]
+                for box in boxes.detach().cpu().tolist()
+            ]
+        )
+        context_scale = _context_scale_for_indices(target, [], int(boxes.shape[0]))
+        selected_boxes.append(expand_boxes_xyxy_per_box(boxes, context_scale))
 
     max_boxes = max([int(boxes.shape[0]) for boxes in selected_boxes] + [1])
     box_tensor = torch.zeros(len(selected_boxes), max_boxes, 4, dtype=torch.float32, device=device)
@@ -1020,8 +1030,7 @@ def condition_inference_from_locate_responses(
             continue
         box_tensor[sample_idx, :n] = boxes.to(device=device, dtype=torch.float32)
         box_mask[sample_idx, :n] = True
-    locate_boxes_abs = target_boxes_to_abs_lists(box_tensor, box_mask, batch)
-    return box_tensor, box_mask, locate_boxes_abs
+    return box_tensor, box_mask, raw_locate_boxes_abs
 
 
 def maybe_precompute_locate_responses(

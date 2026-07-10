@@ -1,4 +1,4 @@
-# Exact tested installation target for LocatePose + QwenPose v1.3.
+# Exact tested installation target for LocatePose + QwenPose v1.4.
 # This file is for Linux + Python 3.11 + CUDA 12.6 reproduction.
 #
 # Install with:

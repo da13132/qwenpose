@@ -140,6 +140,12 @@ def targets_to_gt_instances(
         width = float(target.get("width", 0.0))
         height = float(target.get("height", 0.0))
         boxes = _as_numpy(target.get("boxes"), dtype=np.float64)
+        loss_areas_value = target.get("loss_areas")
+        loss_areas = (
+            _as_numpy(loss_areas_value, dtype=np.float64)
+            if loss_areas_value is not None
+            else None
+        )
         keypoints = _as_numpy(target.get("keypoints"), dtype=np.float64)
         valid = _as_numpy(target.get("keypoint_valid"), dtype=bool)
         if boxes.ndim != 2 or keypoints.ndim != 3 or valid.ndim != 2:
@@ -159,7 +165,14 @@ def targets_to_gt_instances(
             kpts = keypoints[inst_idx, schema_indices, :3].astype(np.float64)
             kpts[:, 0] *= width
             kpts[:, 1] *= height
-            area = max((bbox_xyxy[2] - bbox_xyxy[0]) * (bbox_xyxy[3] - bbox_xyxy[1]), 1.0)
+            if loss_areas is not None and inst_idx < int(loss_areas.shape[0]):
+                area = max(float(loss_areas[inst_idx]) * width * height, 1.0)
+            else:
+                area = max(
+                    (bbox_xyxy[2] - bbox_xyxy[0])
+                    * (bbox_xyxy[3] - bbox_xyxy[1]),
+                    1.0,
+                )
             crowd_index = (crowd_index_by_image or {}).get(image_id)
             instances.append(
                 GTInstance(
@@ -465,11 +478,14 @@ def _mpii_bbox_from_center_scale(
     *,
     scale_multiplier: float = 1.25,
 ) -> list[float] | None:
+    """MMPose-compatible MPII padded bbox for metric instance matching."""
     if center is None or len(center) < 2:
         return None
     try:
-        cx, cy = float(center[0]), float(center[1])
-        side = float(scale) * 200.0 * float(scale_multiplier)
+        scale_value = float(scale)
+        cx = float(center[0]) - 1.0
+        cy = float(center[1]) - 1.0 + 15.0 * scale_value
+        side = scale_value * 200.0 * float(scale_multiplier)
     except Exception:
         return None
     if not math.isfinite(cx) or not math.isfinite(cy) or not math.isfinite(side) or side <= 1.0:
@@ -500,7 +516,11 @@ def _load_mpii_gt(ann_path: Path, wanted_image_ids: set[str] | None) -> list[GTI
             xs = joints[valid, 0]
             ys = joints[valid, 1]
             bbox = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
-        area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 1.0)
+        try:
+            base_side = float(ann.get("scale")) * 200.0
+            area = max(base_side * base_side * 0.53, 1.0)
+        except Exception:
+            area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 1.0)
         instances.append(
             GTInstance(
                 dataset="mpii",

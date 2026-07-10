@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
+import warnings
 
 import torch
 import torch.nn as nn
@@ -10,7 +13,7 @@ try:
 except Exception:  # pragma: no cover - torchvision may be unavailable in minimal envs.
     torchvision_roi_align = None
 
-from .schemas import SCHEMA_INDICES, SCHEMA_NAMES, UNION_KEYPOINTS
+from .schemas import SCHEMA_INDICES, SCHEMA_NAMES, UNION_KEYPOINTS, UNION_TO_ID
 
 
 class MLP(nn.Module):
@@ -169,32 +172,75 @@ class ConvNormAct(nn.Module):
 
 
 def canonical_joint_priors() -> torch.Tensor:
-    """Canonical joint locations inside a normalized person box."""
+    """Fallback joint locations inside a normalized person box.
+
+    ``left`` and ``right`` follow anatomical person coordinates. In the common
+    front-facing image convention, the person's left side lies on the image's
+    right, so left-joint x priors are greater than their right-joint partners.
+    Dataset-specific priors loaded by :func:`build_schema_joint_priors` override
+    these values when available.
+    """
     priors = {
         "nose": (0.50, 0.16),
-        "left_eye": (0.44, 0.13),
-        "right_eye": (0.56, 0.13),
-        "left_ear": (0.38, 0.16),
-        "right_ear": (0.62, 0.16),
-        "left_shoulder": (0.36, 0.32),
-        "right_shoulder": (0.64, 0.32),
-        "left_elbow": (0.30, 0.48),
-        "right_elbow": (0.70, 0.48),
-        "left_wrist": (0.26, 0.64),
-        "right_wrist": (0.74, 0.64),
-        "left_hip": (0.42, 0.58),
-        "right_hip": (0.58, 0.58),
-        "left_knee": (0.40, 0.76),
-        "right_knee": (0.60, 0.76),
-        "left_ankle": (0.39, 0.92),
-        "right_ankle": (0.61, 0.92),
+        "left_eye": (0.56, 0.13),
+        "right_eye": (0.44, 0.13),
+        "left_ear": (0.62, 0.16),
+        "right_ear": (0.38, 0.16),
+        "left_shoulder": (0.64, 0.32),
+        "right_shoulder": (0.36, 0.32),
+        "left_elbow": (0.70, 0.48),
+        "right_elbow": (0.30, 0.48),
+        "left_wrist": (0.74, 0.64),
+        "right_wrist": (0.26, 0.64),
+        "left_hip": (0.58, 0.58),
+        "right_hip": (0.42, 0.58),
+        "left_knee": (0.60, 0.76),
+        "right_knee": (0.40, 0.76),
+        "left_ankle": (0.61, 0.92),
+        "right_ankle": (0.39, 0.92),
         "neck": (0.50, 0.28),
         "head_top": (0.50, 0.06),
         "pelvis": (0.50, 0.60),
         "thorax": (0.50, 0.38),
         "upper_neck": (0.50, 0.24),
+        "crowdpose_head": (0.50, 0.12),
     }
     return torch.tensor([priors[name] for name in UNION_KEYPOINTS], dtype=torch.float32)
+
+
+def build_schema_joint_priors(path: str | None) -> torch.Tensor:
+    """Build ``[schema, union_joint, xy]`` priors from an optional JSON file."""
+    fallback = canonical_joint_priors()
+    priors = fallback.unsqueeze(0).repeat(len(SCHEMA_NAMES), 1, 1)
+    if not path:
+        return priors
+
+    prior_path = Path(path)
+    if not prior_path.is_file():
+        warnings.warn(
+            f"Schema joint prior file does not exist: {prior_path}; using fallback priors. "
+            "A checkpoint load may overwrite this persistent buffer.",
+            stacklevel=2,
+        )
+        return priors
+    with prior_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("Schema joint prior file must contain a JSON object.")
+
+    for schema_idx, schema_name in enumerate(SCHEMA_NAMES):
+        schema_payload = payload.get(schema_name, {})
+        if not isinstance(schema_payload, dict):
+            raise ValueError(f"Prior entry for {schema_name} must be an object.")
+        for joint_name, xy in schema_payload.items():
+            if joint_name not in UNION_TO_ID:
+                raise KeyError(f"Unknown joint {joint_name!r} in prior file for {schema_name}.")
+            if not isinstance(xy, (list, tuple)) or len(xy) != 2:
+                raise ValueError(f"Prior for {schema_name}/{joint_name} must be [x, y].")
+            priors[schema_idx, UNION_TO_ID[joint_name]] = torch.tensor(
+                [float(xy[0]), float(xy[1])], dtype=torch.float32
+            ).clamp(0.02, 0.98)
+    return priors
 
 
 def box_fourier_pe(boxes: torch.Tensor, hidden_dim: int) -> torch.Tensor:
@@ -305,10 +351,11 @@ class QwenPoseConfig:
     box_condition_scale: float = 1.2
     pose_roi_size: int = 16
     use_refinement: bool = True
-    simcc_bins: int = 128
+    simcc_bins: int = 256
     rgb_low_gate_expand_ratio: float = 0.10
     rgb_refine_gate_expand_ratio: float = 0.15
     rgb_gate_background: float = 0.05
+    schema_joint_priors_path: str | None = "configs/schema_joint_priors.json"
 
 
 class QwenPoseModel(nn.Module):
@@ -350,10 +397,19 @@ class QwenPoseModel(nn.Module):
         self._zero_init_last_conv(self.rgb_refine_fuse)
         self.pos_encoding = SinePositionEncoding(c)
 
+        # Schema identity controls only the active joint set and geometric prior.
+        # Keeping a learnable schema embedding here would let shared joints route
+        # into separate dataset-specific predictors, weakening cross-dataset transfer.
         self.schema_embed = nn.Embedding(len(SCHEMA_NAMES), c)
+        nn.init.zeros_(self.schema_embed.weight)
+        self.schema_embed.weight.requires_grad_(False)
         self.task_embed = nn.Embedding(2, c)
         self.joint_embed = nn.Embedding(len(UNION_KEYPOINTS), c)
-        self.register_buffer("union_joint_priors", canonical_joint_priors(), persistent=False)
+        self.register_buffer(
+            "schema_joint_priors",
+            build_schema_joint_priors(config.schema_joint_priors_path),
+            persistent=True,
+        )
         self.box_query_proj = nn.Sequential(
             nn.LayerNorm(c),
             MLP(c, c, c, depth=2),
@@ -506,6 +562,7 @@ class QwenPoseModel(nn.Module):
         text_dtype = next(self.external_text_proj.parameters()).dtype
         text_embed = self.external_text_proj(external_text_embed.to(dtype=text_dtype))
         b, c, h, w = feature_map.shape
+        ref_task_gate = task_ids.eq(1).to(device=text_embed.device, dtype=text_embed.dtype)
 
         input_boxes = target_boxes.to(dtype=feature_map.dtype)
         boxes = pose_boxes.to(dtype=feature_map.dtype)
@@ -517,8 +574,9 @@ class QwenPoseModel(nn.Module):
         roi_features = roi_features * box_mask.view(b, num_boxes, 1, 1, 1).to(dtype=roi_features.dtype)
         roi_pooled = roi_features.mean(dim=(-2, -1))
         roi_embed = self.roi_pool_proj(roi_pooled)
+        instance_text = 0.2 * ref_task_gate[:, None, None] * text_embed[:, None, :]
         instance = self.instance_query_norm(
-            box_embed + roi_embed + image_embed[:, None, :] + 0.2 * text_embed[:, None, :]
+            box_embed + roi_embed + image_embed[:, None, :] + instance_text
         )
         person_logits = torch.where(
             box_mask,
@@ -539,15 +597,29 @@ class QwenPoseModel(nn.Module):
             dtype=feature_map.dtype,
         )
         joint_base = self.joint_embed(schema_joint_indices).view(b, 1, active_k, c)
-        joint_prior = self.union_joint_priors.to(device=feature_map.device, dtype=feature_map.dtype)
-        joint_prior = joint_prior[schema_joint_indices]
+        schema_prior_all = self.schema_joint_priors.to(
+            device=feature_map.device, dtype=feature_map.dtype
+        )[schema_ids]
+        joint_prior = torch.gather(
+            schema_prior_all,
+            dim=1,
+            index=schema_joint_indices[..., None].expand(-1, -1, 2),
+        )
         joint_prior_pe = point_fourier_pe(joint_prior, c).view(b, 1, active_k, c)
-        schema = self.schema_embed(schema_ids).view(b, 1, 1, c)
         task = self.task_embed(task_ids).view(b, 1, 1, c)
         box_pe = box_embed.view(b, num_boxes, 1, c)
-        text = text_embed.view(b, 1, 1, c)
+        text_condition = (
+            0.2
+            * ref_task_gate.view(b, 1, 1, 1)
+            * text_embed.view(b, 1, 1, c)
+        )
         pose_tokens = self.pose_query_norm(
-            instance[:, :, None, :] + joint_base + joint_prior_pe + schema + task + box_pe + 0.2 * text
+            instance[:, :, None, :]
+            + joint_base
+            + joint_prior_pe
+            + task
+            + box_pe
+            + text_condition
         )
         pose_valid = schema_joint_valid[:, None, :].expand(b, num_boxes, active_k) & box_mask[:, :, None]
         same_joint_tokens = pose_tokens.permute(0, 2, 1, 3).reshape(b * active_k, num_boxes, c)

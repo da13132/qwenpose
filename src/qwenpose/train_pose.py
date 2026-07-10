@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from qwenpose.data import build_datasets, pose_collate
+from qwenpose.data import DATASET_BOX_CONTEXT_SCALE, build_datasets, pose_collate
 from qwenpose.losses import LossWeights, compute_pose_losses
 from qwenpose.model import QwenPoseConfig, QwenPoseModel, count_trainable_parameters
 from qwenpose.qwen_lora import (
@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         type=str,
-        default="coco,mpii,crowdpose,refhuman",
+        default="coco,mpii,crowdpose,aic,refhuman",
         help="Comma-separated datasets. RefHuman contributes REF_POSE; others contribute ALL_POSE.",
     )
     parser.add_argument("--max_instances", type=int, default=80)
@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--refhuman_max_captions_per_instance",
         type=int,
-        default=2,
+        default=1,
         help="Maximum captions kept for each RefHuman person instance. Captions are randomly sampled once at startup according to --seed. Use 0 to keep all captions.",
     )
     parser.add_argument("--num_workers", type=int, default=2)
@@ -187,9 +187,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose_decoder_layers", type=int, default=1)
     parser.add_argument("--refinement_steps", type=int, default=3)
     parser.add_argument("--decoder_heads", type=int, default=8)
-    parser.add_argument("--box_condition_scale", type=float, default=1.2)
+    parser.add_argument("--box_condition_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--schema_joint_priors_path",
+        type=str,
+        default="configs/schema_joint_priors.json",
+        help="JSON file containing per-schema box-relative joint priors.",
+    )
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--simcc_bins", type=int, default=128)
+    parser.add_argument("--simcc_bins", type=int, default=256)
     parser.add_argument("--disable_refinement", action="store_true")
 
     # ---------------------------------------------------------------------
@@ -241,6 +247,7 @@ def parse_args() -> argparse.Namespace:
     # ---------------------------------------------------------------------
     parser.add_argument("--w_oks", type=float, default=0.5)
     parser.add_argument("--w_coord", type=float, default=3.0)
+    parser.add_argument("--w_image_coord", type=float, default=5.0)
     parser.add_argument("--w_vis", type=float, default=0.05)
     parser.add_argument("--w_lm", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
@@ -252,8 +259,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_simcc_deform", type=float, default=0.15)
     parser.add_argument("--w_simcc_refine", type=str, default="0.15,0.2,0.25")
     parser.add_argument("--simcc_sigma", type=float, default=2.0)
-    parser.add_argument("--box_jitter_scale", type=float, default=0.1)
-    parser.add_argument("--box_jitter_shift", type=float, default=0.1)
+    parser.add_argument(
+        "--box_jitter_scale",
+        type=float,
+        default=0.0,
+        help="Fallback jitter for records without per-dataset jitter metadata.",
+    )
+    parser.add_argument(
+        "--box_jitter_shift",
+        type=float,
+        default=0.0,
+        help="Fallback shift jitter for records without per-dataset metadata.",
+    )
     parser.add_argument(
         "--box_source",
         choices=["gt", "qwen_generate", "locate_generate"],
@@ -608,6 +625,68 @@ def build_locate_grounding_responses(
     return box_responses, point_responses
 
 
+def _select_target_instances(
+    target: dict[str, torch.Tensor],
+    indices: list[int],
+    *,
+    task_id: int,
+) -> dict[str, torch.Tensor]:
+    index_tensor = torch.as_tensor(indices, dtype=torch.long)
+    selected = dict(target)
+    instance_fields = (
+        "boxes",
+        "loss_boxes",
+        "loss_areas",
+        "keypoints",
+        "keypoint_valid",
+        "visibility_valid",
+        "box_context_scale",
+        "box_jitter_scale",
+        "box_jitter_shift",
+    )
+    for key in instance_fields:
+        if key not in target:
+            continue
+        selected[key] = target[key][index_tensor].clone() if indices else target[key][:0].clone()
+    selected["ref_target"] = torch.tensor(0 if task_id == 1 and indices else -1, dtype=torch.long)
+    return selected
+
+
+def expand_boxes_xyxy_per_box(
+    boxes: torch.Tensor,
+    scale: float | torch.Tensor,
+) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes
+    scale_tensor = torch.as_tensor(scale, device=boxes.device, dtype=boxes.dtype)
+    if scale_tensor.ndim == 0:
+        scale_tensor = scale_tensor.expand(boxes.shape[0])
+    scale_tensor = scale_tensor.reshape(-1, 1).clamp(min=1e-4)
+    if int(scale_tensor.shape[0]) != int(boxes.shape[0]):
+        raise ValueError("Per-box context scale must match the number of boxes.")
+    center = (boxes[:, :2] + boxes[:, 2:]) * 0.5
+    wh = (boxes[:, 2:] - boxes[:, :2]).clamp(min=1e-4) * scale_tensor
+    return torch.cat([center - wh * 0.5, center + wh * 0.5], dim=-1).clamp(0.0, 1.0)
+
+
+def _context_scale_for_indices(
+    target: dict[str, torch.Tensor],
+    indices: list[int],
+    count: int,
+) -> torch.Tensor:
+    if count <= 0:
+        return torch.zeros(0, dtype=torch.float32)
+    values = target.get("box_context_scale")
+    if values is None or int(values.numel()) == 0:
+        dataset_name = str(target.get("dataset", "")).lower()
+        fallback = DATASET_BOX_CONTEXT_SCALE.get(dataset_name, 1.0)
+        return torch.full((count,), float(fallback), dtype=torch.float32)
+    if indices:
+        index_tensor = torch.as_tensor(indices, dtype=torch.long)
+        return values[index_tensor].clone().float()
+    return torch.full((count,), float(values.flatten()[0].item()), dtype=torch.float32)
+
+
 def prepare_box_conditioning(
     targets: list[dict[str, torch.Tensor]],
     task_ids: torch.Tensor,
@@ -628,24 +707,29 @@ def prepare_box_conditioning(
         else:
             limit = num_boxes if max_instances is None else min(num_boxes, int(max_instances))
             indices = list(range(limit))
-        index_tensor = torch.as_tensor(indices, dtype=torch.long)
-        selected = dict(target)
-        selected["boxes"] = target["boxes"][index_tensor].clone() if indices else target["boxes"][:0].clone()
-        selected["keypoints"] = (
-            target["keypoints"][index_tensor].clone() if indices else target["keypoints"][:0].clone()
-        )
-        selected["keypoint_valid"] = (
-            target["keypoint_valid"][index_tensor].clone() if indices else target["keypoint_valid"][:0].clone()
-        )
-        selected["ref_target"] = torch.tensor(0 if task_id == 1 and indices else -1, dtype=torch.long)
+
+        selected = _select_target_instances(target, indices, task_id=task_id)
         selected_targets.append(selected)
         condition_boxes = selected["boxes"]
-        if condition_boxes.numel() > 0 and (box_jitter_scale > 0.0 or box_jitter_shift > 0.0):
+        if condition_boxes.numel() > 0:
+            scale_jitter = selected.get(
+                "box_jitter_scale",
+                torch.full((condition_boxes.shape[0],), float(box_jitter_scale)),
+            )
+            shift_jitter = selected.get(
+                "box_jitter_shift",
+                torch.full((condition_boxes.shape[0],), float(box_jitter_shift)),
+            )
             condition_boxes = jitter_boxes_xyxy(
                 condition_boxes,
-                scale_jitter=box_jitter_scale,
-                shift_jitter=box_jitter_shift,
+                scale_jitter=scale_jitter,
+                shift_jitter=shift_jitter,
             )
+            context_scale = selected.get(
+                "box_context_scale",
+                torch.ones(condition_boxes.shape[0], dtype=condition_boxes.dtype),
+            )
+            condition_boxes = expand_boxes_xyxy_per_box(condition_boxes, context_scale)
         selected_boxes.append(condition_boxes)
 
     max_boxes = max([int(boxes.shape[0]) for boxes in selected_boxes] + [1])
@@ -662,8 +746,8 @@ def prepare_box_conditioning(
 
 def jitter_boxes_xyxy(
     boxes: torch.Tensor,
-    scale_jitter: float = 0.0,
-    shift_jitter: float = 0.0,
+    scale_jitter: float | torch.Tensor = 0.0,
+    shift_jitter: float | torch.Tensor = 0.0,
 ) -> torch.Tensor:
     if boxes.numel() == 0:
         return boxes
@@ -672,11 +756,30 @@ def jitter_boxes_xyxy(
     xy2 = boxes[:, 2:]
     wh = (xy2 - xy1).clamp(min=1e-4)
     center = (xy1 + xy2) * 0.5
-    if shift_jitter > 0.0:
-        center = center + (torch.rand_like(center) * 2.0 - 1.0) * wh * float(shift_jitter)
-    if scale_jitter > 0.0:
-        scale = 1.0 + (torch.rand(boxes.shape[0], 1, device=boxes.device) * 2.0 - 1.0) * float(scale_jitter)
-        wh = wh * scale.clamp(min=0.5)
+
+    scale_jitter_tensor = torch.as_tensor(
+        scale_jitter, device=boxes.device, dtype=boxes.dtype
+    )
+    shift_jitter_tensor = torch.as_tensor(
+        shift_jitter, device=boxes.device, dtype=boxes.dtype
+    )
+    if scale_jitter_tensor.ndim == 0:
+        scale_jitter_tensor = scale_jitter_tensor.expand(boxes.shape[0])
+    if shift_jitter_tensor.ndim == 0:
+        shift_jitter_tensor = shift_jitter_tensor.expand(boxes.shape[0])
+    scale_jitter_tensor = scale_jitter_tensor.reshape(-1, 1).clamp(min=0.0)
+    shift_jitter_tensor = shift_jitter_tensor.reshape(-1, 1).clamp(min=0.0)
+    if (
+        int(scale_jitter_tensor.shape[0]) != int(boxes.shape[0])
+        or int(shift_jitter_tensor.shape[0]) != int(boxes.shape[0])
+    ):
+        raise ValueError("Per-box jitter tensors must match the number of boxes.")
+
+    center = center + (torch.rand_like(center) * 2.0 - 1.0) * wh * shift_jitter_tensor
+    random_scale = 1.0 + (
+        torch.rand(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype) * 2.0 - 1.0
+    ) * scale_jitter_tensor
+    wh = wh * random_scale.clamp(min=0.5)
     jittered = torch.cat([center - wh * 0.5, center + wh * 0.5], dim=-1)
     return jittered.clamp(0.0, 1.0)
 
@@ -977,36 +1080,57 @@ def prepare_qwen_generated_box_conditioning(
         pred_index_tensor = torch.as_tensor(pred_match_indices, dtype=torch.long)
         matched_gt_index_tensor = torch.as_tensor(gt_match_indices, dtype=torch.long)
 
-        selected = dict(target)
         if matches:
+            matched_original_indices = gt_index_tensor[matched_gt_index_tensor].tolist()
+            selected = _select_target_instances(
+                target, matched_original_indices, task_id=task_id
+            )
             matched_pred_boxes = pred_boxes[pred_index_tensor].clone()
-            matched_gt_boxes = gt_boxes[matched_gt_index_tensor].clone()
-            matched_keypoints = target["keypoints"][gt_index_tensor[matched_gt_index_tensor]].clone()
-            matched_keypoint_valid = target["keypoint_valid"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            matched_context = selected.get(
+                "box_context_scale",
+                torch.ones(matched_pred_boxes.shape[0], dtype=matched_pred_boxes.dtype),
+            )
+            matched_pred_boxes = expand_boxes_xyxy_per_box(
+                matched_pred_boxes, matched_context
+            )
             if keep_unmatched_predictions:
                 matched_pred_set = set(pred_match_indices)
-                unmatched_pred_indices = [idx for idx in range(int(pred_boxes.shape[0])) if idx not in matched_pred_set]
+                unmatched_pred_indices = [
+                    idx
+                    for idx in range(int(pred_boxes.shape[0]))
+                    if idx not in matched_pred_set
+                ]
                 if unmatched_pred_indices:
-                    unmatched_index_tensor = torch.as_tensor(unmatched_pred_indices, dtype=torch.long)
-                    condition_boxes = torch.cat([matched_pred_boxes, pred_boxes[unmatched_index_tensor].clone()], dim=0)
+                    unmatched_index_tensor = torch.as_tensor(
+                        unmatched_pred_indices, dtype=torch.long
+                    )
+                    unmatched_boxes = pred_boxes[unmatched_index_tensor].clone()
+                    unmatched_context = _context_scale_for_indices(
+                        target, [], int(unmatched_boxes.shape[0])
+                    )
+                    unmatched_boxes = expand_boxes_xyxy_per_box(
+                        unmatched_boxes, unmatched_context
+                    )
+                    condition_boxes = torch.cat(
+                        [matched_pred_boxes, unmatched_boxes], dim=0
+                    )
                 else:
                     condition_boxes = matched_pred_boxes
             else:
                 condition_boxes = matched_pred_boxes
             selected_condition_boxes.append(condition_boxes[:max_instances].clone())
-            selected["boxes"] = matched_gt_boxes
-            selected["keypoints"] = matched_keypoints
-            selected["keypoint_valid"] = matched_keypoint_valid
-            selected["ref_target"] = torch.tensor(0 if task_id == 1 else -1, dtype=torch.long)
         else:
+            selected = _select_target_instances(target, [], task_id=task_id)
             if keep_unmatched_predictions and pred_boxes.numel() > 0:
-                selected_condition_boxes.append(pred_boxes[:max_instances].clone())
+                unmatched_boxes = pred_boxes[:max_instances].clone()
+                unmatched_context = _context_scale_for_indices(
+                    target, [], int(unmatched_boxes.shape[0])
+                )
+                selected_condition_boxes.append(
+                    expand_boxes_xyxy_per_box(unmatched_boxes, unmatched_context)
+                )
             else:
                 selected_condition_boxes.append(gt_boxes_all[:0].clone())
-            selected["boxes"] = gt_boxes_all[:0].clone()
-            selected["keypoints"] = target["keypoints"][:0].clone()
-            selected["keypoint_valid"] = target["keypoint_valid"][:0].clone()
-            selected["ref_target"] = torch.tensor(-1, dtype=torch.long)
         selected_targets.append(selected)
 
     max_boxes = max([int(boxes.shape[0]) for boxes in selected_condition_boxes] + [1])
@@ -1216,23 +1340,23 @@ def prepare_locate_generated_box_conditioning_from_responses(
         pred_index_tensor = torch.as_tensor(pred_match_indices, dtype=torch.long)
         matched_gt_index_tensor = torch.as_tensor(gt_match_indices, dtype=torch.long)
 
-        selected = dict(target)
         if matches:
+            matched_original_indices = gt_index_tensor[matched_gt_index_tensor].tolist()
+            selected = _select_target_instances(
+                target, matched_original_indices, task_id=task_id
+            )
             condition_boxes = pred_boxes[pred_index_tensor].clone()
-            matched_gt_boxes = gt_boxes[matched_gt_index_tensor].clone()
-            matched_keypoints = target["keypoints"][gt_index_tensor[matched_gt_index_tensor]].clone()
-            matched_keypoint_valid = target["keypoint_valid"][gt_index_tensor[matched_gt_index_tensor]].clone()
+            context_scale = selected.get(
+                "box_context_scale",
+                torch.ones(condition_boxes.shape[0], dtype=condition_boxes.dtype),
+            )
+            condition_boxes = expand_boxes_xyxy_per_box(
+                condition_boxes, context_scale
+            )
             selected_condition_boxes.append(condition_boxes[:max_instances].clone())
-            selected["boxes"] = matched_gt_boxes
-            selected["keypoints"] = matched_keypoints
-            selected["keypoint_valid"] = matched_keypoint_valid
-            selected["ref_target"] = torch.tensor(0 if task_id == 1 else -1, dtype=torch.long)
         else:
+            selected = _select_target_instances(target, [], task_id=task_id)
             selected_condition_boxes.append(gt_boxes_all[:0].clone())
-            selected["boxes"] = gt_boxes_all[:0].clone()
-            selected["keypoints"] = target["keypoints"][:0].clone()
-            selected["keypoint_valid"] = target["keypoint_valid"][:0].clone()
-            selected["ref_target"] = torch.tensor(-1, dtype=torch.long)
         selected_targets.append(selected)
 
     max_boxes = max([int(boxes.shape[0]) for boxes in selected_condition_boxes] + [1])
@@ -1600,7 +1724,6 @@ class LocatePoseUnifiedRuntime:
             )
             if task_id == 1 and boxes.shape[0] > 1:
                 boxes = boxes[:1]
-            selected_boxes.append(boxes)
 
             target = batch["targets"][sample_idx]
             width = float(target["width"])
@@ -1615,6 +1738,12 @@ class LocatePoseUnifiedRuntime:
                     ]
                     for box in boxes.detach().cpu().tolist()
                 ]
+            )
+            context_scale = _context_scale_for_indices(
+                target, [], int(boxes.shape[0])
+            )
+            selected_boxes.append(
+                expand_boxes_xyxy_per_box(boxes, context_scale)
             )
 
         max_boxes = max([int(boxes.shape[0]) for boxes in selected_boxes] + [1])
@@ -2003,6 +2132,153 @@ class HomogeneousDatasetBatchSampler:
         return len(self._cached_batches)
 
 
+def compute_pose_diagnostics(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    task_ids: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute dataset-comparable diagnostics without affecting gradients."""
+    device = outputs["keypoints"].device
+    box_mask = outputs["box_mask"].to(device).bool()
+    image_error_sum = torch.zeros((), device=device)
+    box_error_sum = torch.zeros((), device=device)
+    valid_joint_count = torch.zeros((), device=device)
+    clipped_joint_count = torch.zeros((), device=device)
+    mpii_area_ratio_sum = torch.zeros((), device=device)
+    mpii_area_ratio_count = 0
+    ref_total = 0
+    ref_matched = 0
+
+    with torch.no_grad():
+        for sample_idx, target in enumerate(targets):
+            valid_queries = torch.nonzero(
+                box_mask[sample_idx], as_tuple=False
+            ).flatten()
+            target_count = int(target["boxes"].shape[0])
+            n = min(int(valid_queries.numel()), target_count)
+            is_ref = int(task_ids[sample_idx].detach().cpu().item()) == 1
+            if is_ref:
+                ref_total += 1
+                ref_matched += int(n > 0)
+            if n <= 0:
+                continue
+
+            queries = valid_queries[:n]
+            pred = outputs["keypoints"][sample_idx, queries, :, :2]
+            gt = target["keypoints"].to(device)[:n, :, :2]
+            valid = target["keypoint_valid"].to(device)[:n].bool()
+            valid_f = valid.float()
+            joint_count = valid_f.sum()
+            if joint_count <= 0:
+                continue
+
+            image_joint_error = (pred - gt).abs().mean(dim=-1)
+            image_error_sum = image_error_sum + (image_joint_error * valid_f).sum()
+
+            loss_boxes = target.get("loss_boxes", target["boxes"]).to(device)[:n]
+            loss_wh = (loss_boxes[:, 2:] - loss_boxes[:, :2]).clamp(min=1e-4)
+            box_joint_error = (
+                (pred - gt).abs() / loss_wh[:, None, :]
+            ).mean(dim=-1)
+            box_error_sum = box_error_sum + (box_joint_error * valid_f).sum()
+
+            pose_boxes = outputs["pose_boxes"][sample_idx, queries]
+            pose_wh = (pose_boxes[:, 2:] - pose_boxes[:, :2]).clamp(min=1e-4)
+            relative_gt = (
+                gt - pose_boxes[:, None, :2]
+            ) / pose_wh[:, None, :]
+            clipped = (
+                (relative_gt < 0.0) | (relative_gt > 1.0)
+            ).any(dim=-1) & valid
+            clipped_joint_count = clipped_joint_count + clipped.float().sum()
+            valid_joint_count = valid_joint_count + joint_count
+
+            if str(target.get("dataset", "")).lower() == "mpii":
+                condition_boxes = target["boxes"].to(device)[:n]
+                condition_wh = (
+                    condition_boxes[:, 2:] - condition_boxes[:, :2]
+                ).clamp(min=0.0)
+                loss_wh_area = (
+                    loss_boxes[:, 2:] - loss_boxes[:, :2]
+                ).clamp(min=1e-6)
+                ratio = (
+                    condition_wh[:, 0] * condition_wh[:, 1]
+                ) / (loss_wh_area[:, 0] * loss_wh_area[:, 1]).clamp(min=1e-8)
+                mpii_area_ratio_sum = mpii_area_ratio_sum + ratio.sum()
+                mpii_area_ratio_count += int(ratio.numel())
+
+    denom = valid_joint_count.clamp(min=1.0)
+    diagnostics = {
+        "metric_image_mae": image_error_sum / denom,
+        "metric_box_relative_mae": box_error_sum / denom,
+        "metric_simcc_clipped_ratio": clipped_joint_count / denom,
+        "metric_valid_joint_count": valid_joint_count,
+    }
+    if mpii_area_ratio_count > 0:
+        diagnostics["metric_mpii_condition_base_area_ratio"] = (
+            mpii_area_ratio_sum / mpii_area_ratio_count
+        )
+    if ref_total > 0:
+        diagnostics["metric_refhuman_match_rate"] = torch.tensor(
+            ref_matched / ref_total, device=device, dtype=torch.float32
+        )
+    return diagnostics
+
+
+def update_dataset_metric_ema(
+    state: dict[str, dict[str, float]],
+    dataset_name: str,
+    metrics: dict[str, float],
+    *,
+    decay: float = 0.95,
+) -> None:
+    dataset_state = state.setdefault(dataset_name, {})
+    tracked_keys = (
+        "loss_total",
+        "loss_coord",
+        "loss_image_coord",
+        "loss_oks",
+        "loss_vis",
+        "metric_image_mae",
+        "metric_box_relative_mae",
+        "metric_simcc_clipped_ratio",
+        "metric_valid_joint_count",
+        "metric_mpii_condition_base_area_ratio",
+        "metric_refhuman_match_rate",
+    )
+    for key in tracked_keys:
+        if key not in metrics or not math.isfinite(float(metrics[key])):
+            continue
+        value = float(metrics[key])
+        if key not in dataset_state:
+            dataset_state[key] = value
+        else:
+            dataset_state[key] = decay * dataset_state[key] + (1.0 - decay) * value
+
+
+def format_dataset_metric_ema(
+    state: dict[str, dict[str, float]],
+) -> list[str]:
+    messages: list[str] = []
+    for dataset_name in sorted(state):
+        metrics = state[dataset_name]
+        fields = []
+        for key, label in (
+            ("loss_total", "loss"),
+            ("loss_coord", "coord"),
+            ("loss_image_coord", "img_loss"),
+            ("metric_image_mae", "img_mae"),
+            ("metric_box_relative_mae", "box_mae"),
+            ("metric_simcc_clipped_ratio", "clip"),
+            ("metric_refhuman_match_rate", "match"),
+            ("metric_mpii_condition_base_area_ratio", "area_ratio"),
+        ):
+            if key in metrics:
+                fields.append(f"{label}={metrics[key]:.4f}")
+        messages.append(f"dataset_ema dataset={dataset_name} " + " ".join(fields))
+    return messages
+
+
 def build_progress_loss_postfix(
     loss_metrics: dict[str, float],
     weights: LossWeights,
@@ -2037,6 +2313,7 @@ def _weighted_loss_items(
 
     add("pose", "oks", "loss_oks", weights.oks)
     add("pose", "coord", "loss_coord", weights.coord)
+    add("pose", "img", "loss_image_coord", weights.image_coord)
     add("pose", "hard", "loss_hard_joint", weights.hard_joint)
     add("pose", "vis", "loss_vis", weights.vis)
     add("coord_aux", "coarse", "loss_coord_coarse", weights.coarse_coord)
@@ -2102,13 +2379,14 @@ def format_loss_weights(weights: LossWeights) -> str:
         "Loss weights: "
         f"oks={_format_loss_weight(weights.oks)} "
         f"coord={_format_loss_weight(weights.coord)} "
+        f"image_coord={_format_loss_weight(weights.image_coord)} "
         f"vis={_format_loss_weight(weights.vis)} "
         f"hard={_format_loss_weight(weights.hard_joint)} "
         f"coord_aux(coarse={_format_loss_weight(weights.coarse_coord)},"
         f"deform={_format_loss_weight(weights.deform_coord)},refine={coord_refine}) "
         f"simcc(coarse={_format_loss_weight(weights.simcc_coarse)},"
         f"deform={_format_loss_weight(weights.simcc_deform)},refine={simcc_refine},"
-        f"sigma={_format_loss_weight(weights.simcc_sigma)}) "
+        f"sigma={_format_loss_weight(weights.simcc_sigma)},norm=ce/log_bins) "
         f"lm={_format_loss_weight(weights.lm)}"
     )
 
@@ -2180,7 +2458,7 @@ SCHEMA_POSE_EDGES: dict[str, list[tuple[str, str]]] = {
         ("right_knee", "right_ankle"),
     ],
     "CrowdPose14": [
-        ("head_top", "neck"),
+        ("crowdpose_head", "neck"),
         ("neck", "left_shoulder"),
         ("neck", "right_shoulder"),
         ("left_shoulder", "right_shoulder"),
@@ -2986,6 +3264,10 @@ def main() -> None:
         raise ValueError("--refhuman_max_captions_per_instance must be >= 0.")
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
+    if args.schema_joint_priors_path and not Path(args.schema_joint_priors_path).is_file():
+        raise FileNotFoundError(
+            f"--schema_joint_priors_path does not exist: {args.schema_joint_priors_path}"
+        )
     if args.pose_roi_size <= 1:
         raise ValueError("--pose_roi_size must be greater than 1.")
     if args.simcc_bins < 0 or args.simcc_bins == 1:
@@ -3139,9 +3421,21 @@ def main() -> None:
     if batch_sampler is not None:
         batch_sampler.set_epoch(0)
         if is_main_process():
+            source_batch_counts = [
+                math.ceil(len(inner_dataset) / max(int(args.batch_size), 1))
+                for inner_dataset in getattr(dataset, "datasets", [])
+            ]
+            total_source_batches = max(sum(source_batch_counts), 1)
+            source_batch_desc = ",".join(
+                f"{name}:{count}({count / total_source_batches:.1%})"
+                for name, count in zip(
+                    getattr(dataset, "names", []), source_batch_counts
+                )
+            )
             print(
                 "Homogeneous dataset batches enabled: "
-                f"one source per batch, batches_per_rank={len(batch_sampler)}"
+                f"one source per batch, batches_per_rank={len(batch_sampler)}, "
+                f"global_source_batches=[{source_batch_desc}]"
             )
     if sampler is not None:
         sampler.set_epoch(0)
@@ -3251,6 +3545,11 @@ def main() -> None:
             pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
             simcc_bins=int(saved_pose_config.get("simcc_bins", args.simcc_bins)),
+            schema_joint_priors_path=str(
+                saved_pose_config.get(
+                    "schema_joint_priors_path", args.schema_joint_priors_path
+                )
+            ),
         )
     else:
         model_config = QwenPoseConfig(
@@ -3263,6 +3562,7 @@ def main() -> None:
             pose_roi_size=args.pose_roi_size,
             use_refinement=not args.disable_refinement,
             simcc_bins=args.simcc_bins,
+            schema_joint_priors_path=args.schema_joint_priors_path,
         )
     model = QwenPoseModel(model_config).to(device)
     trainable, total = count_trainable_parameters(model)
@@ -3417,6 +3717,7 @@ def main() -> None:
     weights = LossWeights(
         oks=args.w_oks,
         coord=args.w_coord,
+        image_coord=args.w_image_coord,
         vis=args.w_vis,
         lm=args.w_lm,
         hard_joint=args.w_hard_joint,
@@ -3440,6 +3741,7 @@ def main() -> None:
     resume_state_inferred = False
     loss_ema: float | None = None
     loss_ema_decay: float = 0.98
+    dataset_metric_ema: dict[str, dict[str, float]] = {}
     loss_spike_threshold: float = 10.0   # skip if loss > threshold * ema
     loss_spike_count: int = 0
     loss_spike_max: int = 50             # abort after this many consecutive spikes
@@ -3723,6 +4025,9 @@ def main() -> None:
                         images=batch.get("images"),
                     )
                     loss, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
+                    loss_dict.update(
+                        compute_pose_diagnostics(outputs, pose_targets, batch["task_ids"])
+                    )
                     if "lm_loss" in outputs:
                         lm_loss = outputs["lm_loss"].float()
                         lm_weight = weights.lm
@@ -3786,6 +4091,14 @@ def main() -> None:
                 sync_cuda_for_timing(args.sync_timing, device)
                 step_time = time.perf_counter() - step_started
                 loss_metrics_for_trace = {k: float(v.detach().cpu()) for k, v in loss_dict.items()}
+                if is_main_process():
+                    source_names = batch.get("source_datasets", [])
+                    dataset_name = str(source_names[0] if source_names else "unknown").lower()
+                    update_dataset_metric_ema(
+                        dataset_metric_ema,
+                        dataset_name,
+                        loss_metrics_for_trace,
+                    )
             except Exception as exc:
                 error_stage = "oom" if "out of memory" in str(exc).lower() else "error"
                 append_batch_trace(
@@ -3902,6 +4215,8 @@ def main() -> None:
                         + timing_message,
                     )
                     progress_write(progress_bar, "  " + build_detailed_loss_message(loss_metrics, weights))
+                    for dataset_message in format_dataset_metric_ema(dataset_metric_ema):
+                        progress_write(progress_bar, "  " + dataset_message)
                     timing_sums = {"data": 0.0, "prep": 0.0, "fwd": 0.0, "bwd": 0.0, "micro": 0}
 
                 if is_main_process() and args.visualize_every > 0 and (

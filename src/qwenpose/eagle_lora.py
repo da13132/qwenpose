@@ -11,12 +11,14 @@ Key interface details from modeling_locateanything.py:
   - mlp1(vit_embeds) -> (num_merged_tokens, 2048)
   - image_token_index = 151665
   - forward() replaces image token embeddings with projected vision features
-  - Processor returns: pixel_values, image_grid_hws (numpy), input_ids, attention_mask
+  - Multimodal processor returns pixel_values, image_grid_hws, input_ids, attention_mask
+  - Vision-only Stage 1 uses AutoImageProcessor and returns only pixel_values/image_grid_hws
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import json
 from pathlib import Path
 import types
 
@@ -91,6 +93,153 @@ def _set_eagle_vision_attention(model: nn.Module, attn_impl: str) -> None:
             module.attn_implementation = attn_impl
 
 
+class EagleVisionOnlyBackbone(nn.Module):
+    """Minimal LocateAnything Stage-1 backbone without a language model."""
+
+    def __init__(self, config, vision_model: nn.Module, mlp1: nn.Module) -> None:
+        super().__init__()
+        self.config = config
+        self.vision_model = vision_model
+        self.mlp1 = mlp1
+        self.is_vision_only_backbone = True
+
+    def extract_feature(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_hws: torch.Tensor | np.ndarray | None,
+    ) -> list[torch.Tensor] | torch.Tensor:
+        return self.vision_model(pixel_values=pixel_values, grid_hws=image_grid_hws)
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_hws: torch.Tensor | np.ndarray | None = None,
+        **_: object,
+    ) -> list[torch.Tensor] | torch.Tensor:
+        return self.extract_feature(pixel_values, image_grid_hws)
+
+
+def _load_eagle_vision_projector_weights(
+    model_path: str | Path,
+    vision_model: nn.Module,
+    mlp1: nn.Module,
+) -> None:
+    """Load only ``vision_model.*`` and ``mlp1.*`` tensors from sharded weights."""
+    from safetensors import safe_open
+
+    root = Path(model_path).expanduser()
+    index_path = root / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            "Vision-only Locate loading requires a local sharded safetensors checkpoint with "
+            f"model.safetensors.index.json, but it was not found under {root}."
+        )
+    with index_path.open("r", encoding="utf-8") as f:
+        weight_map = json.load(f).get("weight_map", {})
+    if not isinstance(weight_map, dict):
+        raise TypeError(f"Invalid weight_map in {index_path}")
+
+    module_specs = {
+        "vision_model.": vision_model,
+        "mlp1.": mlp1,
+    }
+    for prefix, module in module_specs.items():
+        selected = {
+            str(key): str(shard)
+            for key, shard in weight_map.items()
+            if str(key).startswith(prefix)
+        }
+        if not selected:
+            raise KeyError(f"No {prefix} tensors were found in {index_path}")
+        by_shard: dict[str, list[str]] = {}
+        for key, shard in selected.items():
+            by_shard.setdefault(shard, []).append(key)
+        state: dict[str, torch.Tensor] = {}
+        for shard, keys in by_shard.items():
+            shard_path = root / shard
+            if not shard_path.is_file():
+                raise FileNotFoundError(f"Missing LocateAnything weight shard: {shard_path}")
+            with safe_open(shard_path, framework="pt", device="cpu") as tensors:
+                for key in keys:
+                    state[key[len(prefix):]] = tensors.get_tensor(key)
+        incompatible = module.load_state_dict(state, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"Failed to load {prefix} selectively: missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+
+
+def load_eagle_vision_only_with_lora(config: EagleLoRAConfig):
+    """Load only MoonViT + ``mlp1`` and attach vision LoRA for Stage 1.
+
+    The 3.4B-parameter language model is never instantiated and its checkpoint
+    tensors are never read. Adapter parameter names intentionally match the
+    full LocateAnything PEFT model so Stage-1 vision LoRA can be injected into
+    Stage 2 with a normal ``load_state_dict(..., strict=False)`` call.
+    """
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoConfig, AutoImageProcessor
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    model_path = str(Path(config.model_path).expanduser())
+    requested_attn_impl = str(config.attn_implementation or "flash_attention_2")
+    if requested_attn_impl not in ("flash_attention_2", "sdpa", "eager"):
+        requested_attn_impl = "flash_attention_2"
+
+    eagle_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    eagle_config.vision_config._attn_implementation = requested_attn_impl
+    vision_cls = get_class_from_dynamic_module(
+        "modeling_vit.MoonVitPretrainedModel",
+        model_path,
+    )
+    dtype = _dtype_from_name(config.dtype)
+    vision_model = vision_cls(eagle_config.vision_config).to(dtype=dtype)
+    vision_hidden = int(eagle_config.vision_config.hidden_size)
+    output_hidden = int(eagle_config.text_config.hidden_size)
+    mlp1 = nn.Sequential(
+        nn.LayerNorm(vision_hidden * 4),
+        nn.Linear(vision_hidden * 4, output_hidden),
+        nn.GELU(),
+        nn.Linear(output_hidden, output_hidden),
+    ).to(dtype=dtype)
+    _load_eagle_vision_projector_weights(model_path, vision_model, mlp1)
+
+    wrapper = EagleVisionOnlyBackbone(eagle_config, vision_model, mlp1)
+    _set_eagle_vision_attention(wrapper, requested_attn_impl)
+    for param in wrapper.parameters():
+        param.requires_grad = False
+
+    targets, _, _ = find_eagle_lora_targets(wrapper)
+    targets = [name for name in targets if "vision_model" in name]
+    if not targets:
+        raise RuntimeError("No MoonViT LoRA target modules were found in the vision-only backbone.")
+    lora_config = LoraConfig(
+        r=config.vision_lora_r,
+        lora_alpha=config.vision_lora_alpha,
+        lora_dropout=config.vision_lora_dropout,
+        target_modules=targets,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    model = get_peft_model(wrapper, lora_config)
+    _set_eagle_vision_attention(model, requested_attn_impl)
+    processor = AutoImageProcessor.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        use_fast=False,
+    )
+    setattr(processor, "_qwenpose_vision_only", True)
+    if config.gradient_checkpointing:
+        enable_fn = getattr(get_eagle_base_model(model).vision_model, "gradient_checkpointing_enable", None)
+        if enable_fn is not None:
+            try:
+                enable_fn(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                enable_fn()
+    return model, processor
+
+
 def load_eagle_with_lora(config: EagleLoRAConfig):
     """Load LocateAnything-3B with LoRA on LLM and vision encoder.
 
@@ -99,7 +248,7 @@ def load_eagle_with_lora(config: EagleLoRAConfig):
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoConfig, AutoModel, AutoProcessor
 
-    model_path = str(Path(config.model_path))
+    model_path = str(Path(config.model_path).expanduser())
 
     # LocateAnything's Qwen2 decoder has custom block-mask preparation that is
     # stable with sdpa here, while MoonViT can use flash_attention_2 for packed
@@ -210,8 +359,8 @@ def _locate_image_token_limit(
 ) -> int | None:
     if image_token_limit is not None and int(image_token_limit) > 0:
         return int(image_token_limit)
-    image_processor = getattr(processor, "image_processor", None)
-    patch_size = int(getattr(image_processor, "patch_size", 14)) if image_processor is not None else 14
+    image_processor = getattr(processor, "image_processor", processor)
+    patch_size = int(getattr(image_processor, "patch_size", 14))
     if max_pixels is not None and int(max_pixels) > 0:
         return max(int(max_pixels) // max(patch_size * patch_size, 1), 1)
     return None
@@ -225,11 +374,13 @@ def build_eagle_inputs(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     image_token_limit: int | None = None,
+    batch_token_limit: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build LocateAnything processor inputs from image paths and task prompts.
 
-    Returns dict with: pixel_values, image_grid_hws, input_ids, attention_mask.
-    The Eagle processor handles dynamic resolution internally.
+    Vision-only processors return ``pixel_values`` and ``image_grid_hws`` only.
+    Multimodal processors additionally return ``input_ids`` and ``attention_mask``.
+    The Eagle image processor handles dynamic resolution internally.
 
     Args:
         min_pixels: kept only for API compatibility; LocateAnythingProcessor
@@ -238,40 +389,59 @@ def build_eagle_inputs(
             MoonViT patch-token limit when image_token_limit is not set.
         image_token_limit: LocateAnything native raw MoonViT patch-token budget
             per image. This controls processor.image_processor.in_token_limit.
+        batch_token_limit: Optional raw patch-token budget for the complete local
+            micro batch. It is converted to a conservative per-image limit so a
+            rank cannot receive several maximum-resolution images simultaneously.
     """
     images = []
-    texts = []
-    for image_path, prompt in zip(image_paths, prompts):
+    for image_path in image_paths:
         with Image.open(image_path) as image:
             images.append(image.convert("RGB").copy())
-        # Build chat-style text with image placeholder
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-        texts.append(
-            processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        )
 
-    image_processor = getattr(processor, "image_processor", None)
+    is_vision_only = bool(getattr(processor, "_qwenpose_vision_only", False))
+    image_processor = getattr(processor, "image_processor", processor)
     token_limit = _locate_image_token_limit(processor, max_pixels=max_pixels, image_token_limit=image_token_limit)
+    if batch_token_limit is not None and int(batch_token_limit) > 0 and images:
+        # LocateAnything pads both dimensions to 2x2 patch multiples after the
+        # area cap. Keep 12.5% headroom for that rounding so the final packed
+        # token count remains close to the requested local-batch budget.
+        per_image_batch_limit = max(int(int(batch_token_limit) / len(images) * 0.875), 64)
+        token_limit = (
+            per_image_batch_limit
+            if token_limit is None
+            else min(int(token_limit), per_image_batch_limit)
+        )
     old_token_limit = getattr(image_processor, "in_token_limit", None) if image_processor is not None else None
     if image_processor is not None and token_limit is not None:
         image_processor.in_token_limit = int(token_limit)
     try:
-        # LocateAnythingProcessor does not accept Qwen-style min_pixels/max_pixels
-        # kwargs. Its real control knob is image_processor.in_token_limit, which
-        # limits raw MoonViT patch tokens before the 2x2 merger.
-        inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
+        # Stage 1 uses AutoImageProcessor directly, so it never loads or invokes
+        # the tokenizer. Multimodal Stage 2 keeps the original chat processor.
+        if is_vision_only:
+            inputs = image_processor(images=images, return_tensors="pt")
+        else:
+            texts = []
+            for prompt in prompts:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ]
+                texts.append(
+                    processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                )
+            # LocateAnythingProcessor does not accept Qwen-style
+            # min_pixels/max_pixels kwargs. Its real control knob is
+            # image_processor.in_token_limit.
+            inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
     finally:
         if image_processor is not None and old_token_limit is not None:
             image_processor.in_token_limit = old_token_limit
@@ -297,6 +467,11 @@ def build_eagle_lm_inputs(
     max_pixels=None,
     image_token_limit=None,
 ):
+    if bool(getattr(processor, "_qwenpose_vision_only", False)):
+        raise RuntimeError(
+            "Locate grounding LM supervision is unavailable in vision-only Stage 1 "
+            "because no tokenizer or language model is loaded."
+        )
     mixed_prompts = [p + " " + str(r) for p, r in zip(prompts, responses)]
     inputs = build_eagle_inputs(
         processor,
@@ -407,9 +582,9 @@ class EagleFeatureExtractor(nn.Module):
     def _prepare_locate_inputs(
         self,
         eagle_inputs: dict[str, torch.Tensor],
-    ) -> tuple[nn.Module, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[nn.Module, torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
         base = get_eagle_base_model(self.eagle_model)
-        input_ids = eagle_inputs["input_ids"]
+        input_ids = eagle_inputs.get("input_ids")
         attention_mask = eagle_inputs.get("attention_mask")
         pixel_values = eagle_inputs["pixel_values"]
         image_grid_hws = eagle_inputs.get("image_grid_hws")
@@ -848,7 +1023,8 @@ class EagleFeatureExtractor(nn.Module):
             _, projected_vit_list, _ = self.run_vision_tokens(pixel_values, image_grid_hws)
             raw_maps = self.build_raw_feature_maps(image_grid_hws, projected_vit_list)
             hidden_size = int(raw_maps.shape[1])
-            text_embed = raw_maps.new_zeros((int(input_ids.shape[0]), hidden_size))
+            batch_size = len(projected_vit_list)
+            text_embed = raw_maps.new_zeros((batch_size, hidden_size))
             return raw_maps, text_embed
 
         if freeze_backbone:
@@ -863,6 +1039,8 @@ class EagleFeatureExtractor(nn.Module):
         freeze_backbone: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         _, input_ids, attention_mask, pixel_values, image_grid_hws = self._prepare_locate_inputs(eagle_inputs)
+        if input_ids is None:
+            raise ValueError("Multimodal Locate feature extraction requires input_ids.")
         if freeze_backbone:
             with torch.no_grad():
                 _, projected_vit_list, projected_vit = self.run_vision_tokens(pixel_values, image_grid_hws)

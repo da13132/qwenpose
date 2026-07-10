@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import tempfile
 import unittest
 import warnings
@@ -10,14 +11,20 @@ from PIL import Image
 import torch
 
 from qwenpose.data import ALL_POSE_PROMPT, InterleavedPoseDataset, aic_to_union, mpii_boxes_from_center_scale
-from qwenpose.eagle_lora import EagleFeatureExtractor
+from qwenpose.eagle_lora import (
+    EagleFeatureExtractor,
+    _load_eagle_vision_projector_weights,
+    build_eagle_inputs,
+)
 from qwenpose.losses import LossWeights, compute_pose_losses, simcc_box_loss
 from qwenpose.metrics import _mpii_bbox_from_center_scale, targets_to_gt_instances
 from qwenpose.model import QwenPoseConfig, QwenPoseModel, build_schema_joint_priors
 from qwenpose.qwen_lora import QwenFeatureRefiner
 from qwenpose.train_pose import (
     SCHEMA_POSE_EDGE_INDICES,
+    HomogeneousDatasetBatchSampler,
     configure_backbone_train_scope,
+    estimate_locate_vision_tokens,
     save_pose_visualization,
 )
 from qwenpose.schemas import (
@@ -73,7 +80,171 @@ class _TinyEagle(torch.nn.Module):
         return [self.vision_model.proj(sample) for sample in pixel_values]
 
 
+class _VisionOnlyImageProcessor:
+    _qwenpose_vision_only = True
+    patch_size = 14
+
+    def __init__(self) -> None:
+        self.in_token_limit = 25600
+        self.calls = 0
+        self.seen_limits: list[int] = []
+
+    def __call__(self, *, images, return_tensors: str):
+        self.calls += 1
+        self.seen_limits.append(int(self.in_token_limit))
+        if return_tensors != "pt":
+            raise AssertionError(return_tensors)
+        batch = len(images)
+        return {
+            "pixel_values": torch.ones(batch, 3, 14, 14),
+            "image_grid_hws": torch.full((batch, 2), 2, dtype=torch.long),
+        }
+
+
+class _CostDataset(torch.utils.data.Dataset):
+    def __init__(self, sizes: list[tuple[int, int]]) -> None:
+        self.records = [
+            SimpleNamespace(
+                width=width,
+                height=height,
+                boxes_xyxy=torch.zeros((1, 4)),
+            )
+            for width, height in sizes
+        ]
+        self.max_instances = 80
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int):
+        record = self.records[index]
+        return {
+            "record_index": index,
+            "estimated_cost": estimate_locate_vision_tokens(
+                record.width,
+                record.height,
+                4096,
+            ) + 32,
+        }
+
+
 class MultiDatasetPoseTests(unittest.TestCase):
+    def test_selective_loader_reads_only_vision_and_projector_tensors(self) -> None:
+        from safetensors.torch import save_file
+
+        vision = torch.nn.Linear(3, 2)
+        projector = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        expected = {
+            "vision_model.weight": torch.randn_like(vision.weight),
+            "vision_model.bias": torch.randn_like(vision.bias),
+            "mlp1.0.weight": torch.randn_like(projector[0].weight),
+            "mlp1.0.bias": torch.randn_like(projector[0].bias),
+            "language_model.unused": torch.randn(5),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shard = "model-00001-of-00001.safetensors"
+            save_file(expected, root / shard)
+            weight_map = {key: shard for key in expected}
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {}, "weight_map": weight_map}),
+                encoding="utf-8",
+            )
+            _load_eagle_vision_projector_weights(root, vision, projector)
+
+        self.assertTrue(torch.equal(vision.weight, expected["vision_model.weight"]))
+        self.assertTrue(torch.equal(vision.bias, expected["vision_model.bias"]))
+        self.assertTrue(torch.equal(projector[0].weight, expected["mlp1.0.weight"]))
+        self.assertTrue(torch.equal(projector[0].bias, expected["mlp1.0.bias"]))
+
+    def test_batch_token_limit_caps_per_image_processor_budget(self) -> None:
+        processor = _VisionOnlyImageProcessor()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for index in range(2):
+                path = Path(tmpdir) / f"budget-{index}.png"
+                Image.new("RGB", (32, 32), (0, index * 20, 0)).save(path)
+                paths.append(str(path))
+            build_eagle_inputs(
+                processor,
+                paths,
+                ["ignored", "ignored"],
+                torch.device("cpu"),
+                image_token_limit=4096,
+                batch_token_limit=800,
+            )
+        self.assertEqual(processor.seen_limits, [350])
+        self.assertEqual(processor.in_token_limit, 25600)
+
+    def test_cross_rank_sampler_balances_vision_token_cost(self) -> None:
+        sizes = [
+            (224, 224), (280, 280), (336, 336), (392, 392),
+            (448, 448), (504, 504), (560, 560), (616, 616),
+            (672, 672), (728, 728), (784, 784), (840, 840),
+            (896, 896), (952, 952), (1008, 1008), (1064, 1064),
+        ]
+        mixed = InterleavedPoseDataset([("pose", _CostDataset(sizes))], weights=None, seed=7)
+        def collect(balance: bool) -> list[list[list[int]]]:
+            result = []
+            for rank in range(4):
+                sampler = HomogeneousDatasetBatchSampler(
+                    mixed,
+                    batch_size=2,
+                    seed=19,
+                    rank=rank,
+                    world_size=4,
+                    shuffle=False,
+                    fill_last=True,
+                    balance_vision_tokens=balance,
+                    vision_token_limit=4096,
+                )
+                result.append(list(sampler))
+            return result
+
+        balanced = collect(True)
+        unbalanced = collect(False)
+        self.assertTrue(all(len(batches) == len(balanced[0]) for batches in balanced))
+        balanced_spreads = []
+        unbalanced_spreads = []
+        for step in range(len(balanced[0])):
+            balanced_costs = [
+                sum(int(mixed[index]["estimated_cost"]) for index in balanced[rank][step])
+                for rank in range(4)
+            ]
+            unbalanced_costs = [
+                sum(int(mixed[index]["estimated_cost"]) for index in unbalanced[rank][step])
+                for rank in range(4)
+            ]
+            balanced_spreads.append(max(balanced_costs) - min(balanced_costs))
+            unbalanced_spreads.append(max(unbalanced_costs) - min(unbalanced_costs))
+            self.assertLessEqual(
+                (max(balanced_costs) - min(balanced_costs)) / max(balanced_costs),
+                0.20,
+            )
+        self.assertLess(max(balanced_spreads), max(unbalanced_spreads))
+
+    def test_vision_only_processor_builds_no_language_inputs(self) -> None:
+        processor = _VisionOnlyImageProcessor()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for index in range(2):
+                path = Path(tmpdir) / f"image-{index}.png"
+                Image.new("RGB", (32, 32), (index * 20, 0, 0)).save(path)
+                paths.append(str(path))
+            inputs = build_eagle_inputs(
+                processor,
+                paths,
+                ["prompt must be ignored", "another prompt"],
+                torch.device("cpu"),
+                image_token_limit=128,
+            )
+        self.assertEqual(processor.calls, 1)
+        self.assertEqual(processor.in_token_limit, 25600)
+        self.assertNotIn("input_ids", inputs)
+        self.assertNotIn("attention_mask", inputs)
+        self.assertEqual(tuple(inputs["pixel_values"].shape), (2, 3, 14, 14))
+        self.assertEqual(tuple(inputs["image_grid_hws"].shape), (2, 2))
+
     def test_vision_only_extractor_skips_language_model_and_backpropagates(self) -> None:
         backbone = _TinyEagle()
         extractor = EagleFeatureExtractor(
@@ -91,8 +262,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
 
         extractor.run_language_hidden = fail_language  # type: ignore[method-assign]
         inputs = {
-            "input_ids": torch.zeros(2, 3, dtype=torch.long),
-            "attention_mask": torch.ones(2, 3, dtype=torch.long),
             "pixel_values": torch.randn(2, 4, 8),
             "image_grid_hws": torch.tensor([[4, 4], [4, 4]]),
         }

@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v2.1 - 2026-07-10
+
+- Changed LocatePose vision-only Stage 1 to instantiate and load only MoonViT, the frozen `mlp1` projector, and vision LoRA. The Qwen2.5 language model and tokenizer are no longer constructed or read from checkpoint shards during Stage 1.
+- Added selective safetensors loading, an image-processor-only input path, checkpoint metadata for the backbone load mode, and exact Stage-1-to-Stage-2 vision-LoRA namespace compatibility tests.
+- Added cross-rank vision-token cost bucketing and stage-specific local micro-batch token budgets, preventing one rank from receiving several maximum-resolution images and exhausting memory while the other ranks remain underutilized.
+- Raised the current Stage 1 default to batch 8 per GPU (global batch 32 on four GPUs) with an automatically scaled 24,576-token local micro-batch budget.
+
 ## v2.0 - 2026-07-10
 
 - Reworked Stage 1 into a fast pose warmup: skip the 3B language model, use MoonViT visual features directly, train only vision LoRA plus pose adapters, keep RefHuman for multimodal Stage 2, and use a 60,000-step schedule with a default four-GPU global batch of 12.

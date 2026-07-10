@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v2.0`
+Release: `v2.1`
 
 English | [中文说明](README_zh.md)
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v2.0` snapshot was validated with:
+This `v2.1` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -332,11 +332,13 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 | stage 1 | `stage1_freeze_locate_gt_box` | MoonViT only; train vision LoRA | `gt` | `coco,mpii,crowdpose` | `20` with a `60,000`-step cap |
 | stage 2 | `stage2_locate_box_closed_loop` | full multimodal Locate; train all LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
+In vision-only Stage 1, the loader instantiates only MoonViT, the frozen `mlp1` visual projector, and vision LoRA. It does not instantiate the Qwen2.5 language model or load any `language_model.*` checkpoint tensors, and it uses `AutoImageProcessor` without loading a tokenizer. Stage 2 loads the complete LocateAnything model and injects the Stage-1 vision LoRA through the identical `base_model.model.vision_model.*` parameter namespace.
+
 Additional default knobs:
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=3` (global batch `12` on four GPUs)
+- `STAGE1_BATCH_SIZE=8` (global batch `32` on four GPUs)
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
@@ -367,6 +369,9 @@ Additional default knobs:
 - `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072` (default `24576` for batch 8)
+- `STAGE2_LOCATE_BATCH_TOKEN_LIMIT=STAGE2_BATCH_SIZE*4096` (default `4096`)
+- cross-rank vision-token cost balancing is enabled by default
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
 - `STAGE2_W_LOCATE_BOX_LM=0.04`
@@ -383,7 +388,7 @@ bash scripts/locatepose.sh
 Example with explicit run name and the current 4-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v2_0 \
+RUN_NAME=locatepose_v2_1 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -420,6 +425,8 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `W_COARSE_COORD`, `W_DEFORM_COORD`, `W_REFINE_COORDS`: coordinate deep-supervision weights for the coarse, deformable, and refinement stages
 - `W_SIMCC_COARSE`, `W_SIMCC_DEFORM`, `W_SIMCC_REFINE`, `SIMCC_SIGMA`: SimCC auxiliary supervision weights and Gaussian target width
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT`, `STAGE2_LOCATE_BATCH_TOKEN_LIMIT`: local micro-batch token budgets; defaults scale with each stage's batch size
+- `DISABLE_VISION_TOKEN_BALANCING`: set to `1` only to disable cross-rank cost-balanced batching
 - `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
 - `LOCATE_VISION_SCALE`: learning-rate multiplier for Locate vision LoRA parameters
 - `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
@@ -628,6 +635,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v2.0`
+- Git tags such as `v2.1`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

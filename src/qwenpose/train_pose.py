@@ -53,6 +53,7 @@ from qwenpose.eagle_lora import (
     build_eagle_inputs,
     count_eagle_lora_parameters,
     get_eagle_base_model,
+    load_eagle_vision_only_with_lora,
     load_eagle_with_lora,
     eagle_hidden_size,
 )
@@ -127,6 +128,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable one-dataset-per-batch sampling for interleaved multi-dataset training.",
     )
+    parser.add_argument(
+        "--disable_vision_token_balancing",
+        action="store_true",
+        help="Disable cross-rank batching by estimated LocateAnything vision-token cost.",
+    )
 
     # ---------------------------------------------------------------------
     # Model section: Qwen3-VL provides image/text features with LoRA, and all
@@ -172,6 +178,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="LocateAnything raw MoonViT patch-token limit per image. Overrides --locate_max_pixels when set.",
+    )
+    parser.add_argument(
+        "--locate_batch_token_limit",
+        "--eagle_batch_token_limit",
+        dest="eagle_batch_token_limit",
+        type=int,
+        default=None,
+        help="Maximum raw MoonViT patch-token budget for one local micro batch.",
     )
     parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=32)
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
@@ -1628,6 +1642,7 @@ class LocatePoseUnifiedConfig:
     eagle_min_pixels: int | None = None
     eagle_max_pixels: int | None = None
     eagle_image_token_limit: int | None = None
+    eagle_batch_token_limit: int | None = None
     single_pass_prompt: str = "locate"
     use_single_pass_features: bool = False
     keep_unmatched_predictions: bool = False
@@ -1654,6 +1669,7 @@ class LocatePoseUnifiedConfig:
             eagle_min_pixels=getattr(args, "eagle_min_pixels", None),
             eagle_max_pixels=getattr(args, "eagle_max_pixels", None),
             eagle_image_token_limit=getattr(args, "eagle_image_token_limit", None),
+            eagle_batch_token_limit=getattr(args, "eagle_batch_token_limit", None),
             single_pass_prompt=str(getattr(args, "single_pass_prompt", "locate")),
             use_single_pass_features=(
                 bool(getattr(args, "use_single_pass_features", False))
@@ -1719,6 +1735,7 @@ class LocatePoseUnifiedRuntime:
                 min_pixels=config.eagle_min_pixels,
                 max_pixels=config.eagle_max_pixels,
                 image_token_limit=config.eagle_image_token_limit,
+                batch_token_limit=config.eagle_batch_token_limit,
             )
         return build_qwen_inputs(
             self.processor,
@@ -2060,6 +2077,32 @@ def _format_loss_weight(value: float) -> str:
     return f"{value:.4g}"
 
 
+def estimate_locate_vision_tokens(
+    width: int,
+    height: int,
+    image_token_limit: int | None,
+    *,
+    patch_size: int = 14,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+) -> int:
+    """Match LocateAnything image preprocessing closely enough for bucketing."""
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    patch_size = max(int(patch_size), 1)
+    raw_w = max(width // patch_size, 1)
+    raw_h = max(height // patch_size, 1)
+    raw_tokens = raw_w * raw_h
+    if image_token_limit is not None and int(image_token_limit) > 0 and raw_tokens > int(image_token_limit):
+        scale = math.sqrt(float(image_token_limit) / float(raw_tokens))
+        width = max(int(width * scale), 1)
+        height = max(int(height * scale), 1)
+    pad_h = max(int(merge_kernel_size[0]), 1) * patch_size
+    pad_w = max(int(merge_kernel_size[1]), 1) * patch_size
+    target_w = math.ceil(width / pad_w) * pad_w
+    target_h = math.ceil(height / pad_h) * pad_h
+    return max((target_w // patch_size) * (target_h // patch_size), 1)
+
+
 class HomogeneousDatasetBatchSampler:
     """Yield one-dataset-only batches for InterleavedPoseDataset.
 
@@ -2080,6 +2123,8 @@ class HomogeneousDatasetBatchSampler:
         world_size: int = 1,
         shuffle: bool = True,
         fill_last: bool = True,
+        balance_vision_tokens: bool = False,
+        vision_token_limit: int | None = None,
     ) -> None:
         required = ("datasets", "names", "global_index_for_dataset_linear")
         if not all(hasattr(dataset, attr) for attr in required):
@@ -2091,6 +2136,8 @@ class HomogeneousDatasetBatchSampler:
         self.world_size = max(int(world_size), 1)
         self.shuffle = bool(shuffle)
         self.fill_last = bool(fill_last)
+        self.balance_vision_tokens = bool(balance_vision_tokens)
+        self.vision_token_limit = None if vision_token_limit is None else int(vision_token_limit)
         self.epoch = 0
         self._cached_batches: list[list[int]] | None = None
 
@@ -2119,39 +2166,125 @@ class HomogeneousDatasetBatchSampler:
         self.epoch = int(epoch)
         self._cached_batches = None
 
+    def _sample_cost(self, dataset_idx: int, local_linear: int) -> int:
+        """Estimate activation cost without opening the image file."""
+        inner_datasets = list(getattr(self.dataset, "datasets"))
+        inner_dataset = inner_datasets[dataset_idx]
+        records = getattr(inner_dataset, "records", None)
+        offsets = getattr(self.dataset, "offsets", None)
+        strides = getattr(self.dataset, "strides", None)
+        if records is None or offsets is None or strides is None or not records:
+            return 1
+        local_index = (
+            int(offsets[dataset_idx]) + int(local_linear) * int(strides[dataset_idx])
+        ) % len(records)
+        record = records[local_index]
+        token_cost = estimate_locate_vision_tokens(
+            int(getattr(record, "width", 1)),
+            int(getattr(record, "height", 1)),
+            self.vision_token_limit,
+        )
+        boxes = getattr(record, "boxes_xyxy", None)
+        instance_count = 0 if boxes is None else min(
+            int(boxes.shape[0]),
+            int(getattr(inner_dataset, "max_instances", 80)),
+        )
+        # Pose queries matter, but traces show vision tokens dominate peak memory.
+        return int(token_cost + instance_count * 32)
+
     def _build_batches(self) -> list[list[int]]:
         rng = random.Random(self.seed + self.epoch * 1009)
         per_dataset_batches: list[list[list[int]]] = []
         batch_counts: list[int] = []
         inner_datasets = list(getattr(self.dataset, "datasets"))
+        global_batch_size = self.batch_size * self.world_size
         for dataset_idx, inner_dataset in enumerate(inner_datasets):
             n = len(inner_dataset)
             if n <= 0:
                 per_dataset_batches.append([])
                 batch_counts.append(0)
                 continue
+
             local_linear = list(range(n))
-            if self.shuffle:
-                random.Random(self.seed + self.epoch * 1009 + dataset_idx * 9176).shuffle(local_linear)
-            num_batches = math.ceil(n / self.batch_size)
-            target_count = num_batches * self.batch_size if self.fill_last else n
+            dataset_rng = random.Random(self.seed + self.epoch * 1009 + dataset_idx * 9176)
+            sample_costs: dict[int, int] = {}
+            if self.balance_vision_tokens:
+                sample_costs = {
+                    value: self._sample_cost(dataset_idx, value)
+                    for value in local_linear
+                }
+                # Random tie-breaking changes neighboring samples each epoch while
+                # retaining length bucketing by the dominant vision-token cost.
+                decorated = [
+                    (sample_costs[value], dataset_rng.random(), value)
+                    for value in local_linear
+                ]
+                decorated.sort(key=lambda item: (item[0], item[1]))
+                local_linear = [item[2] for item in decorated]
+            elif self.shuffle:
+                dataset_rng.shuffle(local_linear)
+
+            num_global_batches = math.ceil(n / global_batch_size)
+            target_count = num_global_batches * global_batch_size if self.fill_last else n
             if self.fill_last and len(local_linear) < target_count:
                 pad_source = local_linear or [0]
-                extra = [pad_source[i % len(pad_source)] for i in range(target_count - len(local_linear))]
-                local_linear = local_linear + extra
-            batches = []
-            for start in range(0, len(local_linear), self.batch_size):
-                chunk = local_linear[start : start + self.batch_size]
-                if not chunk:
+                local_linear.extend(
+                    pad_source[i % len(pad_source)]
+                    for i in range(target_count - len(local_linear))
+                )
+
+            rank_batches: list[list[int]] = []
+            for start in range(0, len(local_linear), global_batch_size):
+                global_chunk = local_linear[start : start + global_batch_size]
+                if not global_chunk:
                     continue
-                if len(chunk) < self.batch_size and self.fill_last:
-                    chunk = chunk + [chunk[i % len(chunk)] for i in range(self.batch_size - len(chunk))]
-                batches.append([
+                if len(global_chunk) < global_batch_size and self.fill_last:
+                    global_chunk = global_chunk + [
+                        global_chunk[i % len(global_chunk)]
+                        for i in range(global_batch_size - len(global_chunk))
+                    ]
+
+                if self.balance_vision_tokens:
+                    assignments = [[] for _ in range(self.world_size)]
+                    assignment_costs = [0 for _ in range(self.world_size)]
+                    ordered = sorted(
+                        global_chunk,
+                        key=lambda value: sample_costs[value],
+                        reverse=True,
+                    )
+                    for value in ordered:
+                        candidates = [
+                            rank_idx
+                            for rank_idx in range(self.world_size)
+                            if len(assignments[rank_idx]) < self.batch_size
+                        ]
+                        rank_idx = min(
+                            candidates,
+                            key=lambda idx: (assignment_costs[idx], len(assignments[idx]), idx),
+                        )
+                        assignments[rank_idx].append(value)
+                        assignment_costs[rank_idx] += sample_costs[value]
+                else:
+                    assignments = [
+                        global_chunk[
+                            rank_idx * self.batch_size : (rank_idx + 1) * self.batch_size
+                        ]
+                        for rank_idx in range(self.world_size)
+                    ]
+
+                local_batch = assignments[self.rank]
+                if len(local_batch) < self.batch_size and not self.fill_last:
+                    continue
+                rank_batches.append([
                     self.dataset.global_index_for_dataset_linear(dataset_idx, value)
-                    for value in chunk
+                    for value in local_batch
                 ])
-            per_dataset_batches.append(batches)
-            batch_counts.append(len(batches))
+
+            if self.shuffle and rank_batches:
+                dataset_rng.shuffle(rank_batches)
+            per_dataset_batches.append(rank_batches)
+            batch_counts.append(len(rank_batches))
+
         schedule = self._weighted_schedule(batch_counts)
         cursors = [0 for _ in batch_counts]
         all_batches: list[list[int]] = []
@@ -2159,8 +2292,8 @@ class HomogeneousDatasetBatchSampler:
             all_batches.append(per_dataset_batches[dataset_idx][cursors[dataset_idx]])
             cursors[dataset_idx] += 1
         if self.shuffle and all_batches:
-            # Keep source proportions from the schedule, but jitter local neighbors
-            # slightly so every epoch is not the same deterministic source order.
+            # Every rank uses the same deterministic block permutation, so source
+            # datasets and cost buckets stay aligned at each distributed step.
             window = max(1, min(8, len(all_batches)))
             jittered: list[list[int]] = []
             for start in range(0, len(all_batches), window):
@@ -2168,13 +2301,6 @@ class HomogeneousDatasetBatchSampler:
                 rng.shuffle(block)
                 jittered.extend(block)
             all_batches = jittered
-        if self.world_size > 1 and all_batches:
-            remainder = len(all_batches) % self.world_size
-            if remainder:
-                needed = self.world_size - remainder
-                pad_batches = [all_batches[i % len(all_batches)] for i in range(needed)]
-                all_batches.extend(pad_batches)
-            all_batches = all_batches[self.rank :: self.world_size]
         return all_batches
 
     def __iter__(self):
@@ -2924,10 +3050,20 @@ def save_checkpoint(
         payload["backbone_trainable"] = backbone_state
         payload["qwen_trainable"] = backbone_state
     if module.qwen_extractor is not None:
+        backbone_base = (
+            get_eagle_base_model(module.qwen_model)
+            if str(getattr(module, "backbone_name", "")) == "eagle" and module.qwen_model is not None
+            else None
+        )
         feature_config = {
             "output_size": int(module.qwen_extractor.output_size),
             "feature_source": str(getattr(module.qwen_extractor, "feature_source", "multimodal")),
             "backbone_train_scope": str(getattr(module, "backbone_train_scope", "all_lora")),
+            "backbone_load_mode": (
+                "vision_tower_only"
+                if bool(getattr(backbone_base, "is_vision_only_backbone", False))
+                else "full_multimodal"
+            ),
         }
         payload["backbone_feature_config"] = feature_config
         payload["qwen_feature_config"] = feature_config
@@ -3380,6 +3516,8 @@ def main() -> None:
         raise ValueError("--eagle_max_pixels must be positive when set.")
     if args.eagle_image_token_limit is not None and args.eagle_image_token_limit <= 0:
         raise ValueError("--locate_image_token_limit/--eagle_image_token_limit must be positive when set.")
+    if args.eagle_batch_token_limit is not None and args.eagle_batch_token_limit <= 0:
+        raise ValueError("--locate_batch_token_limit/--eagle_batch_token_limit must be positive when set.")
     if (
         args.eagle_min_pixels is not None
         and args.eagle_max_pixels is not None
@@ -3450,6 +3588,21 @@ def main() -> None:
     sampler = None
     batch_sampler = None
     if use_homogeneous_batches:
+        balance_vision_tokens = (
+            args.backbone in {"eagle", "locatepose"}
+            and not args.disable_vision_token_balancing
+        )
+        sampler_token_limit = args.eagle_image_token_limit
+        if args.eagle_batch_token_limit is not None and int(args.eagle_batch_token_limit) > 0:
+            per_image_limit = max(
+                int(int(args.eagle_batch_token_limit) / max(int(args.batch_size), 1) * 0.875),
+                64,
+            )
+            sampler_token_limit = (
+                per_image_limit
+                if sampler_token_limit is None
+                else min(int(sampler_token_limit), per_image_limit)
+            )
         batch_sampler = HomogeneousDatasetBatchSampler(
             dataset,
             args.batch_size,
@@ -3458,6 +3611,8 @@ def main() -> None:
             world_size=world_size,
             shuffle=True,
             fill_last=True,
+            balance_vision_tokens=balance_vision_tokens,
+            vision_token_limit=sampler_token_limit,
         )
     else:
         use_shuffle_sampler = world_size > 1 or args.mixing_strategy == "concat_shuffle"
@@ -3501,7 +3656,10 @@ def main() -> None:
         batch_sampler.set_epoch(0)
         if is_main_process():
             source_batch_counts = [
-                math.ceil(len(inner_dataset) / max(int(args.batch_size), 1))
+                math.ceil(
+                    len(inner_dataset)
+                    / max(int(args.batch_size) * max(int(world_size), 1), 1)
+                )
                 for inner_dataset in getattr(dataset, "datasets", [])
             ]
             total_source_batches = max(sum(source_batch_counts), 1)
@@ -3514,6 +3672,8 @@ def main() -> None:
             print(
                 "Homogeneous dataset batches enabled: "
                 f"one source per batch, batches_per_rank={len(batch_sampler)}, "
+                f"vision_token_balancing={batch_sampler.balance_vision_tokens}, "
+                f"sampler_token_limit={batch_sampler.vision_token_limit}, "
                 f"global_source_batches=[{source_batch_desc}]"
             )
     if sampler is not None:
@@ -3542,7 +3702,12 @@ def main() -> None:
     qwenpose_init_payload: dict[str, object] | None = None
 
     if backbone_name == "eagle":
-        backbone_model, backbone_processor = load_eagle_with_lora(
+        eagle_loader = (
+            load_eagle_vision_only_with_lora
+            if args.locate_feature_source == "vision_only"
+            else load_eagle_with_lora
+        )
+        backbone_model, backbone_processor = eagle_loader(
             EagleLoRAConfig(
                 model_path=args.eagle_model_path,
                 lora_r=args.eagle_lora_r,
@@ -3561,6 +3726,13 @@ def main() -> None:
         external_dim = eagle_hidden_size(backbone_model)
         bb_trainable, bb_total = count_eagle_lora_parameters(backbone_model)
         if is_main_process():
+            eagle_base = get_eagle_base_model(backbone_model)
+            load_mode = (
+                "vision_tower_only"
+                if bool(getattr(eagle_base, "is_vision_only_backbone", False))
+                else "full_multimodal"
+            )
+            print(f"Eagle load mode: {load_mode}")
             print(f"Eagle LoRA parameters available before stage scope: {bb_trainable:,} / {bb_total:,}")
     else:
         qwen_init_source = detect_qwen_initialization_source(args.qwen_model_path)
@@ -3715,7 +3887,8 @@ def main() -> None:
                 "Locate image budget: "
                 f"min_pixels={args.eagle_min_pixels}, "
                 f"max_pixels={args.eagle_max_pixels}, "
-                f"image_token_limit={args.eagle_image_token_limit}"
+                f"image_token_limit={args.eagle_image_token_limit}, "
+                f"batch_token_limit={args.eagle_batch_token_limit}"
             )
         print(f"Backbone train scope: {training_model.backbone_train_scope}")
         print(f"Backbone trainable counts: {training_model.backbone_trainable_counts}")
@@ -4025,6 +4198,7 @@ def main() -> None:
                         min_pixels=args.eagle_min_pixels,
                         max_pixels=args.eagle_max_pixels,
                         image_token_limit=args.eagle_image_token_limit,
+                        batch_token_limit=args.eagle_batch_token_limit,
                     )
                     locate_aux_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
                     use_lm_loss = (

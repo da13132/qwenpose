@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v2.0`
+版本：`v2.1`
 
 [English](README.md) | 中文
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v2.0` 快照在以下环境中完成验证：
+这个 `v2.1` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -332,11 +332,13 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 | stage 1 | `stage1_freeze_locate_gt_box` | 仅用 MoonViT，训练 vision LoRA | `gt` | `coco,mpii,crowdpose` | `20`，并限制最多 `60,000` step |
 | stage 2 | `stage2_locate_box_closed_loop` | 恢复完整多模态 Locate，训练全部 LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
+vision-only 的 Stage 1 现在只实例化 MoonViT、冻结的 `mlp1` 视觉 projector 和 vision LoRA；不会实例化 Qwen2.5 语言模型，也不会从权重分片读取任何 `language_model.*` tensor，并且只使用 `AutoImageProcessor`，不加载 tokenizer。Stage 2 再加载完整 LocateAnything，并通过完全一致的 `base_model.model.vision_model.*` 参数命名空间注入 Stage 1 的 vision LoRA。
+
 其他关键默认值：
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=3`（4 卡全局 batch 为 `12`）
+- `STAGE1_BATCH_SIZE=8`（4 卡全局 batch 为 `32`）
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
@@ -367,6 +369,9 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 - `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072`（batch 8 时默认 `24576`）
+- `STAGE2_LOCATE_BATCH_TOKEN_LIMIT=STAGE2_BATCH_SIZE*4096`（默认 `4096`）
+- 默认启用跨 rank 视觉 token 成本均衡
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
 - `STAGE2_W_LOCATE_BOX_LM=0.04`
@@ -383,7 +388,7 @@ bash scripts/locatepose.sh
 按当前默认 4 卡布局启动的示例：
 
 ```bash
-RUN_NAME=locatepose_v2_0 \
+RUN_NAME=locatepose_v2_1 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -420,6 +425,8 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `W_COARSE_COORD`、`W_DEFORM_COORD`、`W_REFINE_COORDS`：coarse、deformable 和 refinement 各阶段的坐标深监督权重
 - `W_SIMCC_COARSE`、`W_SIMCC_DEFORM`、`W_SIMCC_REFINE`、`SIMCC_SIGMA`：SimCC 辅助监督权重与高斯 soft-label 宽度
 - `LOCATE_IMAGE_TOKEN_LIMIT`：每张图的 raw MoonViT token 上限
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT`、`STAGE2_LOCATE_BATCH_TOKEN_LIMIT`：单卡 micro batch token 总预算，默认随各阶段 batch size 自动缩放
+- `DISABLE_VISION_TOKEN_BALANCING`：仅在需要关闭跨 rank 成本均衡时设为 `1`
 - `LOCATE_GENERATION_MODE`：LocateAnything 生成模式，可选 `fast`、`slow`、`hybrid`
 - `LOCATE_VISION_SCALE`：Locate vision LoRA 参数的学习率倍率
 - `BOX_MATCH_IOU_THRESH`、`BOX_NMS_IOU_THRESH`：生成框匹配与 NMS 阈值
@@ -628,6 +635,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v2.0`
+- Git tag，例如 `v2.1`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

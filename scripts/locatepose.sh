@@ -21,7 +21,7 @@ fi
 # 目标模型：LocateAnything-3B + QwenPose PoseHead。
 #
 # Stage 1 / GT-box pose warmup：
-#   跳过语言模型，只使用 MoonViT 视觉特征；训练 vision LoRA、PoseHead 和特征适配器；
+#   只加载 MoonViT 与 mlp1，不实例化语言模型；训练 vision LoRA、PoseHead 和特征适配器；
 #   PoseHead 输入 GT box，按固定 optimizer step 快速收敛。
 #
 # Stage 2 / closed-loop Locate-box training：
@@ -448,6 +448,8 @@ NUM_WORKERS="${NUM_WORKERS:-0}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 # DISABLE_HOMOGENEOUS_BATCHES：是否关闭同数据集 batch 采样。0 表示启用同源 batch。
 DISABLE_HOMOGENEOUS_BATCHES="${DISABLE_HOMOGENEOUS_BATCHES:-0}"
+# DISABLE_VISION_TOKEN_BALANCING：是否关闭跨 rank 视觉 token 成本均衡。默认启用。
+DISABLE_VISION_TOKEN_BALANCING="${DISABLE_VISION_TOKEN_BALANCING:-0}"
 
 ###############################################################################
 # LocateAnything backbone 参数
@@ -465,8 +467,10 @@ LOCATE_GRADIENT_CHECKPOINTING="${LOCATE_GRADIENT_CHECKPOINTING:-1}"
 LOCATE_MIN_PIXELS="${LOCATE_MIN_PIXELS:-}"
 # LOCATE_MAX_PIXELS：兼容参数；默认不使用它作为核心控制。
 LOCATE_MAX_PIXELS="${LOCATE_MAX_PIXELS:-}"
-# LOCATE_IMAGE_TOKEN_LIMIT：每张图 raw MoonViT patch token 上限；默认不压当前常规样本，只挡极端大图。
+# LOCATE_IMAGE_TOKEN_LIMIT：每张图 raw MoonViT patch token 上限。
 LOCATE_IMAGE_TOKEN_LIMIT="${LOCATE_IMAGE_TOKEN_LIMIT:-4096}"
+# LOCATE_BATCH_TOKEN_LIMIT：可选的两阶段全局覆盖值；留空时按各阶段 batch size 自动计算。
+LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-}"
 # LOCATE_FEATURE_SIZE：从 LocateAnything token 特征投影出的空间特征图边长。
 LOCATE_FEATURE_SIZE="${LOCATE_FEATURE_SIZE:-64}"
 # LOCATE_FEATURE_REFINER_LAYERS：Locate 特征 refiner 层数。
@@ -625,9 +629,13 @@ STAGE1_EPOCHS="${STAGE1_EPOCHS:-20}"
 # STAGE2_EPOCHS：stage2 epoch 数。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
 # STAGE1_BATCH_SIZE：stage1 每卡 micro batch size；Locate vision 走 flash_attention_2 full-batch forward。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-3}"
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-6}"
 # STAGE2_BATCH_SIZE：stage2 每卡 micro batch size；locate_generate 逐图生成，默认 1。
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-1}"
+# Stage 1 每图保留约 3072 raw patch tokens；Stage 2 单图保持 4096。
+# 也可用 LOCATE_BATCH_TOKEN_LIMIT 同时覆盖两阶段，或分别覆盖下面两个变量。
+STAGE1_LOCATE_BATCH_TOKEN_LIMIT="${STAGE1_LOCATE_BATCH_TOKEN_LIMIT:-${LOCATE_BATCH_TOKEN_LIMIT:-$((STAGE1_BATCH_SIZE * 3072))}}"
+STAGE2_LOCATE_BATCH_TOKEN_LIMIT="${STAGE2_LOCATE_BATCH_TOKEN_LIMIT:-${LOCATE_BATCH_TOKEN_LIMIT:-$((STAGE2_BATCH_SIZE * 4096))}}"
 # STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。
 STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
 # STAGE2_GRAD_ACCUM_STEPS：stage2 梯度累积步数。
@@ -736,7 +744,7 @@ for spec in \
   RUN_STAGE1 RUN_STAGE2 STAGE1_FREEZE_LOCATE STAGE2_FREEZE_LOCATE STAGE2_INIT_FROM_STAGE1 \
   STAGE1_LOCATE_GRADIENT_CHECKPOINTING STAGE2_LOCATE_GRADIENT_CHECKPOINTING \
   MERGE_FINAL_WEIGHTS LOCATE_GRADIENT_CHECKPOINTING AMP DRY_RUN_DATA PROGRESS_BAR SYNC_TIMING \
-  DISABLE_BATCH_TRACE DISABLE_HOMOGENEOUS_BATCHES DISABLE_REFINEMENT DISABLE_LOCATE_GROUNDING_AUX \
+  DISABLE_BATCH_TRACE DISABLE_HOMOGENEOUS_BATCHES DISABLE_VISION_TOKEN_BALANCING DISABLE_REFINEMENT DISABLE_LOCATE_GROUNDING_AUX \
   DISABLE_RECORD_CACHE; do
   require_bool "${spec}" "${!spec}"
 done
@@ -789,6 +797,9 @@ fi
 if [[ -n "${LOCATE_MIN_PIXELS}" ]]; then require_positive_int LOCATE_MIN_PIXELS "${LOCATE_MIN_PIXELS}"; fi
 if [[ -n "${LOCATE_MAX_PIXELS}" ]]; then require_positive_int LOCATE_MAX_PIXELS "${LOCATE_MAX_PIXELS}"; fi
 if [[ -n "${LOCATE_IMAGE_TOKEN_LIMIT}" ]]; then require_positive_int LOCATE_IMAGE_TOKEN_LIMIT "${LOCATE_IMAGE_TOKEN_LIMIT}"; fi
+if [[ -n "${LOCATE_BATCH_TOKEN_LIMIT}" ]]; then require_positive_int LOCATE_BATCH_TOKEN_LIMIT "${LOCATE_BATCH_TOKEN_LIMIT}"; fi
+require_positive_int STAGE1_LOCATE_BATCH_TOKEN_LIMIT "${STAGE1_LOCATE_BATCH_TOKEN_LIMIT}"
+require_positive_int STAGE2_LOCATE_BATCH_TOKEN_LIMIT "${STAGE2_LOCATE_BATCH_TOKEN_LIMIT}"
 if [[ -n "${LOCATE_MIN_PIXELS}" && -n "${LOCATE_MAX_PIXELS}" ]] && (( LOCATE_MAX_PIXELS < LOCATE_MIN_PIXELS )); then
   echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS} must be >= LOCATE_MIN_PIXELS=${LOCATE_MIN_PIXELS}." >&2
   exit 1
@@ -958,6 +969,7 @@ common_args() {
   [[ "${DRY_RUN_DATA}" == "1" ]] && a+=(--dry_run_data)
   [[ "${DISABLE_BATCH_TRACE}" == "1" ]] && a+=(--disable_batch_trace)
   [[ "${DISABLE_HOMOGENEOUS_BATCHES}" == "1" ]] && a+=(--disable_homogeneous_batches)
+  [[ "${DISABLE_VISION_TOKEN_BALANCING}" == "1" ]] && a+=(--disable_vision_token_balancing)
   [[ "${DISABLE_REFINEMENT}" == "1" ]] && a+=(--disable_refinement)
   [[ "${DISABLE_LOCATE_GROUNDING_AUX}" == "1" ]] && a+=(--disable_locate_grounding_aux)
   return 0
@@ -982,11 +994,13 @@ run_stage() {
   local locate_feature_source="${16}"
   local locate_train_scope="${17}"
   local locate_gradient_checkpointing="${18}"
+  local locate_batch_token_limit="${19}"
 
   local effective_batch=$((NPROC_PER_NODE * batch_size * grad_accum_steps))
   mkdir -p "${output_dir}" "${output_dir}/logs"
   local args=()
   common_args args
+  add_opt args --locate_batch_token_limit "${locate_batch_token_limit}"
   args+=(--datasets "${datasets}" --output_dir "${output_dir}")
   args+=(--locate_feature_source "${locate_feature_source}" --locate_train_scope "${locate_train_scope}")
   [[ "${locate_gradient_checkpointing}" == "1" ]] && args+=(--locate_gradient_checkpointing)
@@ -1016,6 +1030,7 @@ run_stage() {
   echo "LOCATE_ATTN_IMPLEMENTATION=${LOCATE_ATTN_IMPLEMENTATION}"
   echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS}"
   echo "LOCATE_IMAGE_TOKEN_LIMIT=${LOCATE_IMAGE_TOKEN_LIMIT}"
+  echo "LOCATE_BATCH_TOKEN_LIMIT=${locate_batch_token_limit}"
   echo "BOX_SOURCE=${box_source}"
   echo "POSE_DROPOUT=${POSE_DROPOUT}"
   echo "SIMCC_BINS=${SIMCC_BINS}"
@@ -1091,7 +1106,8 @@ if [[ "${RUN_STAGE1}" == "1" ]]; then
     "${stage1_resume_arg}" \
     "${STAGE1_LOCATE_FEATURE_SOURCE}" \
     "${STAGE1_LOCATE_TRAIN_SCOPE}" \
-    "${STAGE1_LOCATE_GRADIENT_CHECKPOINTING}"
+    "${STAGE1_LOCATE_GRADIENT_CHECKPOINTING}" \
+    "${STAGE1_LOCATE_BATCH_TOKEN_LIMIT}"
   last_stage_output="${STAGE1_OUTPUT_DIR}"
 else
   echo "Skipping stage 1 because RUN_STAGE1=0"
@@ -1134,7 +1150,8 @@ if [[ "${RUN_STAGE2}" == "1" ]]; then
     "${stage2_resume_arg}" \
     "${STAGE2_LOCATE_FEATURE_SOURCE}" \
     "${STAGE2_LOCATE_TRAIN_SCOPE}" \
-    "${STAGE2_LOCATE_GRADIENT_CHECKPOINTING}"
+    "${STAGE2_LOCATE_GRADIENT_CHECKPOINTING}" \
+    "${STAGE2_LOCATE_BATCH_TOKEN_LIMIT}"
   last_stage_output="${STAGE2_OUTPUT_DIR}"
 else
   echo "Skipping stage 2 because RUN_STAGE2=0"

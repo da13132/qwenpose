@@ -27,7 +27,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from qwenpose.data import DATASET_BOX_CONTEXT_SCALE, build_datasets, pose_collate
+from qwenpose.data import (
+    DATASET_BOX_CONTEXT_SCALE,
+    PoseAugmentConfig,
+    build_datasets,
+    pose_collate,
+)
 from qwenpose.losses import LossWeights, compute_pose_losses
 from qwenpose.model import QwenPoseConfig, QwenPoseModel, count_trainable_parameters
 from qwenpose.qwen_lora import (
@@ -133,6 +138,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable cross-rank batching by estimated LocateAnything vision-token cost.",
     )
+    parser.add_argument("--pose_augment", action="store_true", help="Enable synchronized image/box/keypoint augmentation.")
+    parser.add_argument("--augment_flip_prob", type=float, default=0.5)
+    parser.add_argument("--augment_affine_prob", type=float, default=0.8)
+    parser.add_argument("--augment_rotate_degrees", type=float, default=15.0)
+    parser.add_argument("--augment_scale_min", type=float, default=0.85)
+    parser.add_argument("--augment_scale_max", type=float, default=1.15)
+    parser.add_argument("--augment_translate_fraction", type=float, default=0.08)
+    parser.add_argument("--augment_color_prob", type=float, default=0.8)
+    parser.add_argument("--augment_brightness", type=float, default=0.20)
+    parser.add_argument("--augment_contrast", type=float, default=0.20)
+    parser.add_argument("--augment_saturation", type=float, default=0.20)
+    parser.add_argument("--augment_hue", type=float, default=0.05)
+    parser.add_argument("--augment_grayscale_prob", type=float, default=0.05)
+    parser.add_argument("--augment_blur_prob", type=float, default=0.10)
+    parser.add_argument("--augment_blur_sigma_min", type=float, default=0.10)
+    parser.add_argument("--augment_blur_sigma_max", type=float, default=1.50)
+    parser.add_argument("--augment_erase_prob", type=float, default=0.15)
+    parser.add_argument("--augment_erase_area_min", type=float, default=0.02)
+    parser.add_argument("--augment_erase_area_max", type=float, default=0.10)
 
     # ---------------------------------------------------------------------
     # Model section: Qwen3-VL provides image/text features with LoRA, and all
@@ -1269,7 +1293,8 @@ def generate_locate_bbox_responses(
     responses: list[str] = []
     try:
         with torch.inference_mode():
-            for image_path, prompt in zip(batch["image_paths"], prompts):
+            vision_images = batch.get("vision_images")
+            for sample_idx, (image_path, prompt) in enumerate(zip(batch["image_paths"], prompts)):
                 inputs = build_eagle_inputs(
                     processor,
                     [image_path],
@@ -1278,6 +1303,7 @@ def generate_locate_bbox_responses(
                     min_pixels=min_pixels,
                     max_pixels=max_pixels,
                     image_token_limit=image_token_limit,
+                    image_tensors=None if vision_images is None else [vision_images[sample_idx]],
                 )
                 response = locate_model.generate(
                     pixel_values=inputs["pixel_values"],
@@ -1435,7 +1461,8 @@ def generate_locate_bbox_responses_with_features(
     feature_maps: list[torch.Tensor] = []
     text_embeds: list[torch.Tensor] = []
     try:
-        for image_path, prompt in zip(batch["image_paths"], prompts):
+        vision_images = batch.get("vision_images")
+        for sample_idx, (image_path, prompt) in enumerate(zip(batch["image_paths"], prompts)):
             inputs = build_eagle_inputs(
                 processor,
                 [image_path],
@@ -1444,6 +1471,7 @@ def generate_locate_bbox_responses_with_features(
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 image_token_limit=image_token_limit,
+                image_tensors=None if vision_images is None else [vision_images[sample_idx]],
             )
             response, feature_map, text_embed = module.backbone_extractor.generate_response_with_cached_features(
                 inputs,
@@ -1727,15 +1755,17 @@ class LocatePoseUnifiedRuntime:
         if self.processor is None:
             return None
         if self.backbone_name == "eagle":
+            vision_only = bool(getattr(self.processor, "_qwenpose_vision_only", False))
             return build_eagle_inputs(
                 self.processor,
                 batch["image_paths"],
-                batch["prompts"],
+                None if vision_only else batch["prompts"],
                 self.device,
                 min_pixels=config.eagle_min_pixels,
                 max_pixels=config.eagle_max_pixels,
                 image_token_limit=config.eagle_image_token_limit,
                 batch_token_limit=config.eagle_batch_token_limit,
+                image_tensors=batch.get("vision_images"),
             )
         return build_qwen_inputs(
             self.processor,
@@ -2713,9 +2743,19 @@ def save_pose_visualization(
     draw_all_schema_keypoints: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image_path = batch["image_paths"][sample_idx]
-    with Image.open(image_path) as image:
-        canvas = image.convert("RGB")
+    vision_images = batch.get("vision_images")
+    if vision_images is not None and sample_idx < len(vision_images):
+        tensor = vision_images[sample_idx].detach().cpu()
+        if tensor.dtype != torch.uint8:
+            tensor = tensor.clamp(0, 255).to(torch.uint8)
+        canvas = Image.fromarray(
+            tensor.permute(1, 2, 0).contiguous().numpy(),
+            mode="RGB",
+        )
+    else:
+        image_path = batch["image_paths"][sample_idx]
+        with Image.open(image_path) as image:
+            canvas = image.convert("RGB")
     draw = ImageDraw.Draw(canvas)
     width, height = canvas.size
 
@@ -3518,6 +3558,29 @@ def main() -> None:
         raise ValueError("--locate_image_token_limit/--eagle_image_token_limit must be positive when set.")
     if args.eagle_batch_token_limit is not None and args.eagle_batch_token_limit <= 0:
         raise ValueError("--locate_batch_token_limit/--eagle_batch_token_limit must be positive when set.")
+    probability_args = {
+        "augment_flip_prob": args.augment_flip_prob,
+        "augment_affine_prob": args.augment_affine_prob,
+        "augment_color_prob": args.augment_color_prob,
+        "augment_grayscale_prob": args.augment_grayscale_prob,
+        "augment_blur_prob": args.augment_blur_prob,
+        "augment_erase_prob": args.augment_erase_prob,
+    }
+    for name, value in probability_args.items():
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"--{name} must be in [0, 1].")
+    if args.augment_scale_min <= 0.0 or args.augment_scale_max < args.augment_scale_min:
+        raise ValueError("--augment_scale_min/max must satisfy 0 < min <= max.")
+    if args.augment_rotate_degrees < 0.0 or args.augment_translate_fraction < 0.0:
+        raise ValueError("--augment_rotate_degrees and --augment_translate_fraction must be non-negative.")
+    if min(args.augment_brightness, args.augment_contrast, args.augment_saturation, args.augment_hue) < 0.0:
+        raise ValueError("Color augmentation magnitudes must be non-negative.")
+    if args.augment_hue > 0.5:
+        raise ValueError("--augment_hue must not exceed 0.5.")
+    if args.augment_blur_sigma_min < 0.0 or args.augment_blur_sigma_max < args.augment_blur_sigma_min:
+        raise ValueError("--augment_blur_sigma_min/max must satisfy 0 <= min <= max.")
+    if not 0.0 <= args.augment_erase_area_min <= args.augment_erase_area_max <= 1.0:
+        raise ValueError("--augment_erase_area_min/max must satisfy 0 <= min <= max <= 1.")
     if (
         args.eagle_min_pixels is not None
         and args.eagle_max_pixels is not None
@@ -3563,12 +3626,55 @@ def main() -> None:
             "--locate_feature_source=vision_only cannot train RefHuman text conditioning. "
             "Use pose-only datasets in Stage 1 and add RefHuman in multimodal Stage 2."
         )
+    if args.locate_feature_source == "vision_only" and args.box_source == "locate_generate":
+        raise ValueError(
+            "--locate_feature_source=vision_only requires --box_source=gt because no tokenizer "
+            "or language model is loaded for Locate generation."
+        )
+    if args.locate_feature_source == "vision_only" and (
+        float(args.w_locate_box_lm) > 0.0 or float(args.w_locate_point_lm) > 0.0
+    ):
+        raise ValueError(
+            "Locate grounding LM auxiliary losses must be zero in vision-only Stage 1."
+        )
+    if args.pose_augment and args.locate_feature_source != "vision_only":
+        raise ValueError(
+            "--pose_augment is restricted to vision-only Stage 1 so geometric transforms "
+            "cannot contradict RefHuman left/right language in multimodal Stage 2."
+        )
+    augment_config = PoseAugmentConfig(
+        enabled=bool(args.pose_augment),
+        horizontal_flip_prob=float(args.augment_flip_prob),
+        affine_prob=float(args.augment_affine_prob),
+        rotate_degrees=float(args.augment_rotate_degrees),
+        scale_min=float(args.augment_scale_min),
+        scale_max=float(args.augment_scale_max),
+        translate_fraction=float(args.augment_translate_fraction),
+        color_prob=float(args.augment_color_prob),
+        brightness=float(args.augment_brightness),
+        contrast=float(args.augment_contrast),
+        saturation=float(args.augment_saturation),
+        hue=float(args.augment_hue),
+        grayscale_prob=float(args.augment_grayscale_prob),
+        blur_prob=float(args.augment_blur_prob),
+        blur_sigma_min=float(args.augment_blur_sigma_min),
+        blur_sigma_max=float(args.augment_blur_sigma_max),
+        erase_prob=float(args.augment_erase_prob),
+        erase_area_min=float(args.augment_erase_area_min),
+        erase_area_max=float(args.augment_erase_area_max),
+    )
     dataset = build_datasets(
         dataset_root=args.dataset_root,
         names=dataset_names,
         max_instances=args.max_instances,
         image_size=args.image_size,
         load_image_tensors=not args.disable_image_tensors,
+        # Only materialize and transfer a full-resolution image tensor when
+        # augmentation changes the pixels. Without augmentation, reopening the
+        # path in the main process is faster and avoids large worker IPC payloads.
+        load_vision_images=args.backbone == "eagle" and bool(args.pose_augment),
+        augment_config=augment_config,
+        use_prompts=args.locate_feature_source != "vision_only",
         split=args.split,
         max_samples_per_dataset=args.max_samples_per_dataset,
         refhuman_max_captions_per_instance=args.refhuman_max_captions_per_instance,
@@ -3629,10 +3735,9 @@ def main() -> None:
         )
     loader_kwargs = {
         "num_workers": args.num_workers,
-        # The collated batch only contains small CPU tensors plus image paths.
-        # Images are opened later in the main process when building Qwen inputs,
-        # so pinning here brings little benefit and has caused sporadic multi-rank
-        # stalls in practice.
+        # Augmented Locate batches may contain original-resolution uint8 tensors;
+        # pinning those variable-size tensors brings little benefit and has caused
+        # sporadic multi-rank stalls in practice.
         "pin_memory": False,
         "collate_fn": pose_collate,
     }
@@ -3895,6 +4000,13 @@ def main() -> None:
         if backbone_name == "eagle":
             print(f"Locate feature source: {args.locate_feature_source}")
         print(f"Pose dropout: {model_config.dropout}")
+        print(
+            "Pose augmentation: "
+            f"enabled={args.pose_augment}, flip={args.augment_flip_prob}, "
+            f"affine={args.augment_affine_prob}, rotate=±{args.augment_rotate_degrees}, "
+            f"scale=[{args.augment_scale_min},{args.augment_scale_max}], "
+            f"translate=±{args.augment_translate_fraction}"
+        )
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
         print(f"SimCC bins: {model_config.simcc_bins}, sigma={args.simcc_sigma}")
@@ -4193,12 +4305,13 @@ def main() -> None:
                     qwen_inputs = build_eagle_inputs(
                         backbone_processor,
                         batch["image_paths"],
-                        batch["prompts"],
+                        None if args.locate_feature_source == "vision_only" else batch["prompts"],
                         device,
                         min_pixels=args.eagle_min_pixels,
                         max_pixels=args.eagle_max_pixels,
                         image_token_limit=args.eagle_image_token_limit,
                         batch_token_limit=args.eagle_batch_token_limit,
+                        image_tensors=batch.get("vision_images"),
                     )
                     locate_aux_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
                     use_lm_loss = (
@@ -4231,6 +4344,7 @@ def main() -> None:
                             min_pixels=args.eagle_min_pixels,
                             max_pixels=args.eagle_max_pixels,
                             image_token_limit=args.eagle_image_token_limit,
+                            image_tensors=batch.get("vision_images"),
                         )
                     trace_qwen_inputs = qwen_lm_inputs if qwen_lm_inputs is not None else qwen_inputs
                 else:

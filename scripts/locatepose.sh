@@ -442,14 +442,36 @@ REFHUMAN_MAX_CAPTIONS_PER_INSTANCE="${REFHUMAN_MAX_CAPTIONS_PER_INSTANCE:-1}"
 RECORD_CACHE_DIR="${RECORD_CACHE_DIR:-.cache/qwenpose_records}"
 # DISABLE_RECORD_CACHE：是否禁用 record 缓存。1 表示每次重新解析数据集。
 DISABLE_RECORD_CACHE="${DISABLE_RECORD_CACHE:-0}"
-# NUM_WORKERS：DataLoader worker 数。默认 0 更稳，避免多进程 PIL/IO 问题。
-NUM_WORKERS="${NUM_WORKERS:-0}"
+# NUM_WORKERS：每个训练 rank 的 DataLoader worker 数。增强在原图上执行，默认 2 以便与 GPU 计算重叠。
+NUM_WORKERS="${NUM_WORKERS:-2}"
 # PREFETCH_FACTOR：DataLoader prefetch factor，仅 NUM_WORKERS>0 时生效。
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 # DISABLE_HOMOGENEOUS_BATCHES：是否关闭同数据集 batch 采样。0 表示启用同源 batch。
 DISABLE_HOMOGENEOUS_BATCHES="${DISABLE_HOMOGENEOUS_BATCHES:-0}"
 # DISABLE_VISION_TOKEN_BALANCING：是否关闭跨 rank 视觉 token 成本均衡。默认启用。
 DISABLE_VISION_TOKEN_BALANCING="${DISABLE_VISION_TOKEN_BALANCING:-0}"
+
+# Stage 1 默认启用同步姿态增强；Stage 2 默认关闭，避免改变 RefHuman 左右语义。
+STAGE1_POSE_AUGMENT="${STAGE1_POSE_AUGMENT:-1}"
+STAGE2_POSE_AUGMENT="${STAGE2_POSE_AUGMENT:-0}"
+AUGMENT_FLIP_PROB="${AUGMENT_FLIP_PROB:-0.5}"
+AUGMENT_AFFINE_PROB="${AUGMENT_AFFINE_PROB:-0.8}"
+AUGMENT_ROTATE_DEGREES="${AUGMENT_ROTATE_DEGREES:-15.0}"
+AUGMENT_SCALE_MIN="${AUGMENT_SCALE_MIN:-0.85}"
+AUGMENT_SCALE_MAX="${AUGMENT_SCALE_MAX:-1.15}"
+AUGMENT_TRANSLATE_FRACTION="${AUGMENT_TRANSLATE_FRACTION:-0.08}"
+AUGMENT_COLOR_PROB="${AUGMENT_COLOR_PROB:-0.8}"
+AUGMENT_BRIGHTNESS="${AUGMENT_BRIGHTNESS:-0.20}"
+AUGMENT_CONTRAST="${AUGMENT_CONTRAST:-0.20}"
+AUGMENT_SATURATION="${AUGMENT_SATURATION:-0.20}"
+AUGMENT_HUE="${AUGMENT_HUE:-0.05}"
+AUGMENT_GRAYSCALE_PROB="${AUGMENT_GRAYSCALE_PROB:-0.05}"
+AUGMENT_BLUR_PROB="${AUGMENT_BLUR_PROB:-0.10}"
+AUGMENT_BLUR_SIGMA_MIN="${AUGMENT_BLUR_SIGMA_MIN:-0.10}"
+AUGMENT_BLUR_SIGMA_MAX="${AUGMENT_BLUR_SIGMA_MAX:-1.50}"
+AUGMENT_ERASE_PROB="${AUGMENT_ERASE_PROB:-0.15}"
+AUGMENT_ERASE_AREA_MIN="${AUGMENT_ERASE_AREA_MIN:-0.02}"
+AUGMENT_ERASE_AREA_MAX="${AUGMENT_ERASE_AREA_MAX:-0.10}"
 
 ###############################################################################
 # LocateAnything backbone 参数
@@ -745,7 +767,7 @@ for spec in \
   STAGE1_LOCATE_GRADIENT_CHECKPOINTING STAGE2_LOCATE_GRADIENT_CHECKPOINTING \
   MERGE_FINAL_WEIGHTS LOCATE_GRADIENT_CHECKPOINTING AMP DRY_RUN_DATA PROGRESS_BAR SYNC_TIMING \
   DISABLE_BATCH_TRACE DISABLE_HOMOGENEOUS_BATCHES DISABLE_VISION_TOKEN_BALANCING DISABLE_REFINEMENT DISABLE_LOCATE_GROUNDING_AUX \
-  DISABLE_RECORD_CACHE; do
+  STAGE1_POSE_AUGMENT STAGE2_POSE_AUGMENT DISABLE_RECORD_CACHE; do
   require_bool "${spec}" "${!spec}"
 done
 
@@ -938,6 +960,13 @@ common_args() {
   a+=(--refhuman_max_captions_per_instance "${REFHUMAN_MAX_CAPTIONS_PER_INSTANCE}")
   a+=(--num_workers "${NUM_WORKERS}" --prefetch_factor "${PREFETCH_FACTOR}")
   a+=(--mixing_strategy "${MIXING_STRATEGY}" --record_cache_dir "${RECORD_CACHE_DIR}")
+  a+=(--augment_flip_prob "${AUGMENT_FLIP_PROB}" --augment_affine_prob "${AUGMENT_AFFINE_PROB}")
+  a+=(--augment_rotate_degrees "${AUGMENT_ROTATE_DEGREES}" --augment_scale_min "${AUGMENT_SCALE_MIN}" --augment_scale_max "${AUGMENT_SCALE_MAX}")
+  a+=(--augment_translate_fraction "${AUGMENT_TRANSLATE_FRACTION}" --augment_color_prob "${AUGMENT_COLOR_PROB}")
+  a+=(--augment_brightness "${AUGMENT_BRIGHTNESS}" --augment_contrast "${AUGMENT_CONTRAST}" --augment_saturation "${AUGMENT_SATURATION}" --augment_hue "${AUGMENT_HUE}")
+  a+=(--augment_grayscale_prob "${AUGMENT_GRAYSCALE_PROB}" --augment_blur_prob "${AUGMENT_BLUR_PROB}")
+  a+=(--augment_blur_sigma_min "${AUGMENT_BLUR_SIGMA_MIN}" --augment_blur_sigma_max "${AUGMENT_BLUR_SIGMA_MAX}")
+  a+=(--augment_erase_prob "${AUGMENT_ERASE_PROB}" --augment_erase_area_min "${AUGMENT_ERASE_AREA_MIN}" --augment_erase_area_max "${AUGMENT_ERASE_AREA_MAX}")
   add_opt a --dataset_mix_weights "${DATASET_MIX_WEIGHTS}"
   a+=(--locate_model_path "${LOCATE_MODEL_PATH}" --locate_dtype "${LOCATE_DTYPE}" --locate_attn_implementation "${LOCATE_ATTN_IMPLEMENTATION}")
   add_opt a --locate_min_pixels "${LOCATE_MIN_PIXELS}"
@@ -995,6 +1024,7 @@ run_stage() {
   local locate_train_scope="${17}"
   local locate_gradient_checkpointing="${18}"
   local locate_batch_token_limit="${19}"
+  local pose_augment="${20}"
 
   local effective_batch=$((NPROC_PER_NODE * batch_size * grad_accum_steps))
   mkdir -p "${output_dir}" "${output_dir}/logs"
@@ -1004,6 +1034,7 @@ run_stage() {
   args+=(--datasets "${datasets}" --output_dir "${output_dir}")
   args+=(--locate_feature_source "${locate_feature_source}" --locate_train_scope "${locate_train_scope}")
   [[ "${locate_gradient_checkpointing}" == "1" ]] && args+=(--locate_gradient_checkpointing)
+  [[ "${pose_augment}" == "1" ]] && args+=(--pose_augment)
   args+=(--epochs "${epochs}" --batch_size "${batch_size}" --grad_accum_steps "${grad_accum_steps}" --lr "${lr}" --max_steps "${max_steps}")
   args+=(--box_source "${box_source}" --box_jitter_scale "${jitter_scale}" --box_jitter_shift "${jitter_shift}")
   args+=(--w_locate_box_lm "${w_box_lm}" --w_locate_point_lm "${w_point_lm}" --locate_lm_loss_every "${LOCATE_LM_LOSS_EVERY}")
@@ -1031,6 +1062,7 @@ run_stage() {
   echo "LOCATE_MAX_PIXELS=${LOCATE_MAX_PIXELS}"
   echo "LOCATE_IMAGE_TOKEN_LIMIT=${LOCATE_IMAGE_TOKEN_LIMIT}"
   echo "LOCATE_BATCH_TOKEN_LIMIT=${locate_batch_token_limit}"
+  echo "POSE_AUGMENT=${pose_augment}"
   echo "BOX_SOURCE=${box_source}"
   echo "POSE_DROPOUT=${POSE_DROPOUT}"
   echo "SIMCC_BINS=${SIMCC_BINS}"
@@ -1107,7 +1139,8 @@ if [[ "${RUN_STAGE1}" == "1" ]]; then
     "${STAGE1_LOCATE_FEATURE_SOURCE}" \
     "${STAGE1_LOCATE_TRAIN_SCOPE}" \
     "${STAGE1_LOCATE_GRADIENT_CHECKPOINTING}" \
-    "${STAGE1_LOCATE_BATCH_TOKEN_LIMIT}"
+    "${STAGE1_LOCATE_BATCH_TOKEN_LIMIT}" \
+    "${STAGE1_POSE_AUGMENT}"
   last_stage_output="${STAGE1_OUTPUT_DIR}"
 else
   echo "Skipping stage 1 because RUN_STAGE1=0"
@@ -1151,7 +1184,8 @@ if [[ "${RUN_STAGE2}" == "1" ]]; then
     "${STAGE2_LOCATE_FEATURE_SOURCE}" \
     "${STAGE2_LOCATE_TRAIN_SCOPE}" \
     "${STAGE2_LOCATE_GRADIENT_CHECKPOINTING}" \
-    "${STAGE2_LOCATE_BATCH_TOKEN_LIMIT}"
+    "${STAGE2_LOCATE_BATCH_TOKEN_LIMIT}" \
+    "${STAGE2_POSE_AUGMENT}"
   last_stage_output="${STAGE2_OUTPUT_DIR}"
 else
   echo "Skipping stage 2 because RUN_STAGE2=0"

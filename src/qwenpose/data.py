@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from torch.utils.data import ConcatDataset, Dataset
 
 try:
@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - tqdm is optional for minimal envs.
 from .schemas import (
     SCHEMA_TO_ID,
     UNION_KEYPOINTS,
+    UNION_TO_ID,
     coco_to_union,
     crowdpose_to_union,
     get_schema,
@@ -55,6 +56,61 @@ DATASET_BOX_JITTER = {
     "aic": (0.05, 0.03),
     "refhuman": (0.05, 0.03),
 }
+
+
+@dataclass(frozen=True)
+class PoseAugmentConfig:
+    enabled: bool = False
+    horizontal_flip_prob: float = 0.5
+    affine_prob: float = 0.8
+    rotate_degrees: float = 15.0
+    scale_min: float = 0.85
+    scale_max: float = 1.15
+    translate_fraction: float = 0.08
+    color_prob: float = 0.8
+    brightness: float = 0.20
+    contrast: float = 0.20
+    saturation: float = 0.20
+    hue: float = 0.05
+    grayscale_prob: float = 0.05
+    blur_prob: float = 0.10
+    blur_sigma_min: float = 0.10
+    blur_sigma_max: float = 1.50
+    erase_prob: float = 0.15
+    erase_area_min: float = 0.02
+    erase_area_max: float = 0.10
+
+
+@dataclass(frozen=True)
+class PoseAugmentSpec:
+    matrix: torch.Tensor
+    horizontal_flip: bool
+    brightness_factor: float = 1.0
+    contrast_factor: float = 1.0
+    saturation_factor: float = 1.0
+    hue_shift: float = 0.0
+    grayscale: bool = False
+    blur_sigma: float = 0.0
+    erase_rects: tuple[tuple[int, int, int, int], ...] = ()
+
+
+_LEFT_RIGHT_PAIRS = (
+    ("left_eye", "right_eye"),
+    ("left_ear", "right_ear"),
+    ("left_shoulder", "right_shoulder"),
+    ("left_elbow", "right_elbow"),
+    ("left_wrist", "right_wrist"),
+    ("left_hip", "right_hip"),
+    ("left_knee", "right_knee"),
+    ("left_ankle", "right_ankle"),
+)
+UNION_FLIP_PERMUTATION = list(range(len(UNION_KEYPOINTS)))
+for _left_name, _right_name in _LEFT_RIGHT_PAIRS:
+    _left_idx = UNION_TO_ID[_left_name]
+    _right_idx = UNION_TO_ID[_right_name]
+    UNION_FLIP_PERMUTATION[_left_idx] = _right_idx
+    UNION_FLIP_PERMUTATION[_right_idx] = _left_idx
+UNION_FLIP_PERMUTATION = torch.tensor(UNION_FLIP_PERMUTATION, dtype=torch.long)
 
 
 def _distributed_rank() -> int:
@@ -187,6 +243,209 @@ def box_from_keypoints(keypoints: torch.Tensor, valid: torch.Tensor) -> list[flo
     return [max(x1 - pad_x, 0.0), max(y1 - pad_y, 0.0), min(x2 + pad_x, 1.0), min(y2 + pad_y, 1.0)]
 
 
+def _translation_matrix(tx: float, ty: float) -> torch.Tensor:
+    return torch.tensor(
+        [[1.0, 0.0, float(tx)], [0.0, 1.0, float(ty)], [0.0, 0.0, 1.0]],
+        dtype=torch.float64,
+    )
+
+
+def sample_pose_augment_spec(
+    width: int,
+    height: int,
+    config: PoseAugmentConfig,
+    rng: random.Random | None = None,
+) -> PoseAugmentSpec:
+    rng = rng or random
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    matrix = torch.eye(3, dtype=torch.float64)
+    do_affine = config.enabled and rng.random() < float(config.affine_prob)
+    if do_affine:
+        angle = math.radians(rng.uniform(-float(config.rotate_degrees), float(config.rotate_degrees)))
+        scale = rng.uniform(float(config.scale_min), float(config.scale_max))
+        tx = rng.uniform(-float(config.translate_fraction), float(config.translate_fraction)) * width
+        ty = rng.uniform(-float(config.translate_fraction), float(config.translate_fraction)) * height
+        cos_a = math.cos(angle) * scale
+        sin_a = math.sin(angle) * scale
+        rotate_scale = torch.tensor(
+            [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        cx = width * 0.5
+        cy = height * 0.5
+        matrix = (
+            _translation_matrix(tx, ty)
+            @ _translation_matrix(cx, cy)
+            @ rotate_scale
+            @ _translation_matrix(-cx, -cy)
+        )
+
+    horizontal_flip = bool(config.enabled and rng.random() < float(config.horizontal_flip_prob))
+    if horizontal_flip:
+        flip = torch.tensor(
+            [[-1.0, 0.0, float(width)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        matrix = flip @ matrix
+
+    brightness_factor = contrast_factor = saturation_factor = 1.0
+    hue_shift = 0.0
+    if config.enabled and rng.random() < float(config.color_prob):
+        brightness_factor = rng.uniform(1.0 - float(config.brightness), 1.0 + float(config.brightness))
+        contrast_factor = rng.uniform(1.0 - float(config.contrast), 1.0 + float(config.contrast))
+        saturation_factor = rng.uniform(1.0 - float(config.saturation), 1.0 + float(config.saturation))
+        hue_shift = rng.uniform(-float(config.hue), float(config.hue))
+
+    grayscale = bool(config.enabled and rng.random() < float(config.grayscale_prob))
+    blur_sigma = 0.0
+    if config.enabled and rng.random() < float(config.blur_prob):
+        blur_sigma = rng.uniform(float(config.blur_sigma_min), float(config.blur_sigma_max))
+
+    erase_rects: list[tuple[int, int, int, int]] = []
+    if config.enabled and rng.random() < float(config.erase_prob):
+        count = 1 if rng.random() < 0.75 else 2
+        image_area = float(width * height)
+        for _ in range(count):
+            area = image_area * rng.uniform(float(config.erase_area_min), float(config.erase_area_max))
+            aspect = math.exp(rng.uniform(math.log(0.5), math.log(2.0)))
+            erase_w = min(max(int(round(math.sqrt(area * aspect))), 1), width)
+            erase_h = min(max(int(round(math.sqrt(area / aspect))), 1), height)
+            x1 = rng.randint(0, max(width - erase_w, 0))
+            y1 = rng.randint(0, max(height - erase_h, 0))
+            erase_rects.append((x1, y1, x1 + erase_w, y1 + erase_h))
+
+    return PoseAugmentSpec(
+        matrix=matrix,
+        horizontal_flip=horizontal_flip,
+        brightness_factor=brightness_factor,
+        contrast_factor=contrast_factor,
+        saturation_factor=saturation_factor,
+        hue_shift=hue_shift,
+        grayscale=grayscale,
+        blur_sigma=blur_sigma,
+        erase_rects=tuple(erase_rects),
+    )
+
+
+def _transform_xy(points: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    if points.numel() == 0:
+        return points.clone()
+    dtype = points.dtype
+    ones = torch.ones((*points.shape[:-1], 1), dtype=torch.float64, device=points.device)
+    homogeneous = torch.cat([points.to(torch.float64), ones], dim=-1)
+    transformed = homogeneous @ matrix.to(device=points.device, dtype=torch.float64).T
+    return transformed[..., :2].to(dtype=dtype)
+
+
+def transform_pose_boxes(
+    boxes: torch.Tensor,
+    matrix: torch.Tensor,
+    width: int,
+    height: int,
+    *,
+    clamp: bool,
+) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return boxes.clone()
+    scale = boxes.new_tensor([width, height, width, height])
+    pixel = boxes * scale
+    x1, y1, x2, y2 = pixel.unbind(dim=-1)
+    corners = torch.stack(
+        [
+            torch.stack([x1, y1], dim=-1),
+            torch.stack([x2, y1], dim=-1),
+            torch.stack([x2, y2], dim=-1),
+            torch.stack([x1, y2], dim=-1),
+        ],
+        dim=-2,
+    )
+    transformed = _transform_xy(corners, matrix)
+    mins = transformed.min(dim=-2).values
+    maxs = transformed.max(dim=-2).values
+    out = torch.cat([mins, maxs], dim=-1) / scale
+    return out.clamp_(0.0, 1.0) if clamp else out
+
+
+def transform_pose_keypoints(
+    keypoints: torch.Tensor,
+    valid: torch.Tensor,
+    visibility_valid: torch.Tensor,
+    matrix: torch.Tensor,
+    width: int,
+    height: int,
+    *,
+    horizontal_flip: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if keypoints.numel() == 0:
+        return keypoints.clone(), valid.clone(), visibility_valid.clone()
+    out = keypoints.clone()
+    pixel = out[..., :2] * out.new_tensor([width, height])
+    out[..., :2] = _transform_xy(pixel, matrix) / out.new_tensor([width, height])
+    if horizontal_flip:
+        permutation = UNION_FLIP_PERMUTATION.to(device=out.device)
+        out = out.index_select(1, permutation)
+        valid = valid.index_select(1, permutation)
+        visibility_valid = visibility_valid.index_select(1, permutation)
+    in_bounds = (
+        (out[..., 0] >= 0.0)
+        & (out[..., 0] <= 1.0)
+        & (out[..., 1] >= 0.0)
+        & (out[..., 1] <= 1.0)
+    )
+    valid = valid & in_bounds
+    visibility_valid = visibility_valid & in_bounds
+    out[~valid] = 0.0
+    return out, valid, visibility_valid
+
+
+def apply_pose_image_augmentation(image: Image.Image, spec: PoseAugmentSpec) -> Image.Image:
+    identity = torch.eye(3, dtype=spec.matrix.dtype, device=spec.matrix.device)
+    if not torch.allclose(spec.matrix, identity):
+        inverse = torch.linalg.inv(spec.matrix).cpu().numpy()
+        coefficients = tuple(float(v) for v in inverse[:2].reshape(-1))
+        transform_mode = getattr(Image, "Transform", Image).AFFINE
+        image = image.transform(
+            image.size,
+            transform_mode,
+            coefficients,
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=(127, 127, 127),
+        )
+    if spec.brightness_factor != 1.0:
+        image = ImageEnhance.Brightness(image).enhance(spec.brightness_factor)
+    if spec.contrast_factor != 1.0:
+        image = ImageEnhance.Contrast(image).enhance(spec.contrast_factor)
+    if spec.saturation_factor != 1.0:
+        image = ImageEnhance.Color(image).enhance(spec.saturation_factor)
+    if spec.hue_shift != 0.0:
+        hsv = np.asarray(image.convert("HSV"), dtype=np.uint8).copy()
+        shift = int(round(spec.hue_shift * 255.0))
+        hsv[..., 0] = (hsv[..., 0].astype(np.int16) + shift).astype(np.uint8)
+        image = Image.fromarray(hsv, mode="HSV").convert("RGB")
+    if spec.grayscale:
+        image = ImageOps.grayscale(image).convert("RGB")
+    if spec.blur_sigma > 0.0:
+        image = image.filter(ImageFilter.GaussianBlur(radius=float(spec.blur_sigma)))
+    if spec.erase_rects:
+        array = np.asarray(image, dtype=np.uint8).copy()
+        for x1, y1, x2, y2 in spec.erase_rects:
+            array[y1:y2, x1:x2] = 127
+        image = Image.fromarray(array, mode="RGB")
+    return image
+
+
+def pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:
+    array = np.asarray(image, dtype=np.uint8).copy()
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def pil_to_local_rgb_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
+    resized = image.resize((int(image_size), int(image_size)), Image.Resampling.BILINEAR)
+    array = np.asarray(resized, dtype=np.float32) / 255.0
+    return torch.from_numpy(array.copy()).permute(2, 0, 1).contiguous()
+
+
 def mpii_boxes_from_center_scale(
     center: list[float] | tuple[float, float],
     scale: float,
@@ -243,18 +502,11 @@ def mpii_boxes_from_center_scale(
 
 
 def read_image_tensor(path: Path, image_size: int) -> tuple[torch.Tensor, int, int]:
-    """Read an RGB image for the lightweight pose visual branch.
-
-    Qwen still reads the original image path separately; this tensor is a
-    fixed-size, normalized RGB view used only by QwenPoseModel's local visual
-    branch.
-    """
+    """Read one RGB image and create the fixed-size local visual tensor."""
     with Image.open(path) as img:
         img = img.convert("RGB")
         width, height = img.size
-        img = img.resize((image_size, image_size), Image.BILINEAR)
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        tensor = pil_to_local_rgb_tensor(img, image_size)
     return tensor, width, height
 
 
@@ -265,23 +517,23 @@ class PoseRecordDataset(Dataset):
         max_instances: int = 80,
         image_size: int = 256,
         load_image_tensors: bool = True,
+        load_vision_images: bool = False,
+        augment_config: PoseAugmentConfig | None = None,
+        use_prompts: bool = True,
     ) -> None:
         self.records = records
         self.max_instances = max_instances
         self.image_size = image_size
         self.load_image_tensors = load_image_tensors
+        self.load_vision_images = load_vision_images
+        self.augment_config = augment_config or PoseAugmentConfig(enabled=False)
+        self.use_prompts = bool(use_prompts)
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        if self.load_image_tensors:
-            image, _, _ = read_image_tensor(record.image_path, self.image_size)
-        else:
-            # Keep a tiny placeholder so the model can fall back to the pure-Qwen
-            # path without forcing a second PIL read in the DataLoader workers.
-            image = torch.zeros(3, 1, 1, dtype=torch.float32)
         n = min(record.boxes_xyxy.shape[0], self.max_instances)
         boxes = record.boxes_xyxy[:n].clone()
         loss_boxes = record.loss_boxes_xyxy[:n].clone()
@@ -292,12 +544,96 @@ class PoseRecordDataset(Dataset):
         box_context_scale = record.box_context_scale[:n].clone()
         box_jitter_scale = record.box_jitter_scale[:n].clone()
         box_jitter_shift = record.box_jitter_shift[:n].clone()
-        ref_target = record.ref_target
-        if ref_target >= n:
-            ref_target = -1
-        text = record.prompt
+        ref_target = record.ref_target if record.ref_target < n else -1
+
+        needs_image = self.load_image_tensors or self.load_vision_images
+        if needs_image:
+            with Image.open(record.image_path) as handle:
+                source_image = handle.convert("RGB").copy()
+            width, height = source_image.size
+            augment_rng = random.Random(
+                random.getrandbits(64) ^ (_distributed_rank() << 32)
+            )
+            spec = sample_pose_augment_spec(
+                width,
+                height,
+                self.augment_config,
+                rng=augment_rng,
+            )
+            if self.augment_config.enabled:
+                transformed_boxes = transform_pose_boxes(
+                    boxes, spec.matrix, width, height, clamp=True
+                )
+                transformed_loss_boxes = transform_pose_boxes(
+                    loss_boxes, spec.matrix, width, height, clamp=False
+                )
+                transformed_keypoints, transformed_valid, transformed_visibility_valid = (
+                    transform_pose_keypoints(
+                        keypoints,
+                        valid,
+                        visibility_valid,
+                        spec.matrix,
+                        width,
+                        height,
+                        horizontal_flip=spec.horizontal_flip,
+                    )
+                )
+                determinant = abs(float(torch.det(spec.matrix[:2, :2])))
+                transformed_loss_areas = loss_areas * max(determinant, 1e-8)
+                keep = (
+                    (transformed_boxes[:, 2] - transformed_boxes[:, 0] > 1e-4)
+                    & (transformed_boxes[:, 3] - transformed_boxes[:, 1] > 1e-4)
+                )
+                if n > 0 and bool(keep.any()):
+                    kept_indices = torch.nonzero(keep, as_tuple=False).flatten()
+                    boxes = transformed_boxes[keep]
+                    loss_boxes = transformed_loss_boxes[keep]
+                    loss_areas = transformed_loss_areas[keep]
+                    keypoints = transformed_keypoints[keep]
+                    valid = transformed_valid[keep]
+                    visibility_valid = transformed_visibility_valid[keep]
+                    box_context_scale = box_context_scale[keep]
+                    box_jitter_scale = box_jitter_scale[keep]
+                    box_jitter_shift = box_jitter_shift[keep]
+                    if ref_target >= 0:
+                        matches = torch.nonzero(kept_indices == ref_target, as_tuple=False).flatten()
+                        ref_target = int(matches[0]) if matches.numel() > 0 else -1
+                elif n > 0:
+                    # Do not produce an empty-supervision sample because of a rare
+                    # aggressive random affine. Keep photometric augmentation only.
+                    spec = PoseAugmentSpec(
+                        matrix=torch.eye(3, dtype=torch.float64),
+                        horizontal_flip=False,
+                        brightness_factor=spec.brightness_factor,
+                        contrast_factor=spec.contrast_factor,
+                        saturation_factor=spec.saturation_factor,
+                        hue_shift=spec.hue_shift,
+                        grayscale=spec.grayscale,
+                        blur_sigma=spec.blur_sigma,
+                        erase_rects=spec.erase_rects,
+                    )
+            augmented_image = apply_pose_image_augmentation(source_image, spec)
+            image = (
+                pil_to_local_rgb_tensor(augmented_image, self.image_size)
+                if self.load_image_tensors
+                else torch.zeros(3, 1, 1, dtype=torch.float32)
+            )
+            vision_image = (
+                pil_to_uint8_tensor(augmented_image)
+                if self.load_vision_images
+                else None
+            )
+            augmentation_matrix = spec.matrix.to(dtype=torch.float32)
+            augmented = bool(self.augment_config.enabled)
+        else:
+            image = torch.zeros(3, 1, 1, dtype=torch.float32)
+            vision_image = None
+            augmentation_matrix = torch.eye(3, dtype=torch.float32)
+            augmented = False
+
         return {
             "image": image,
+            "vision_image": vision_image,
             "image_path": str(record.image_path),
             "schema_id": torch.tensor(SCHEMA_TO_ID[record.schema], dtype=torch.long),
             "task_id": torch.tensor(TASK_TO_ID[record.task], dtype=torch.long),
@@ -317,9 +653,11 @@ class PoseRecordDataset(Dataset):
                 "schema": record.schema,
                 "width": record.width,
                 "height": record.height,
+                "augmentation_matrix": augmentation_matrix,
+                "augmented": augmented,
             },
-            "prompt": text,
-            "ref_text": record.ref_text,
+            "prompt": record.prompt if self.use_prompts else "",
+            "ref_text": record.ref_text if self.use_prompts else "",
         }
 
 
@@ -451,8 +789,14 @@ class InterleavedPoseDataset(Dataset):
 
 
 def pose_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    vision_images = [item["vision_image"] for item in batch]
+    if all(image is None for image in vision_images):
+        vision_images = None
+    elif any(image is None for image in vision_images):
+        raise ValueError("A batch cannot mix materialized and path-backed vision images.")
     return {
         "images": torch.stack([item["image"] for item in batch], dim=0),
+        "vision_images": vision_images,
         "schema_ids": torch.stack([item["schema_id"] for item in batch], dim=0),
         "task_ids": torch.stack([item["task_id"] for item in batch], dim=0),
         "targets": [item["target"] for item in batch],
@@ -1237,6 +1581,9 @@ def build_datasets(
     max_instances: int,
     image_size: int = 256,
     load_image_tensors: bool = True,
+    load_vision_images: bool = False,
+    augment_config: PoseAugmentConfig | None = None,
+    use_prompts: bool = True,
     split: str = "train",
     max_samples_per_dataset: int | None = None,
     refhuman_max_captions_per_instance: int = 1,
@@ -1372,6 +1719,9 @@ def build_datasets(
                     max_instances=max_instances,
                     image_size=image_size,
                     load_image_tensors=load_image_tensors,
+                    load_vision_images=load_vision_images,
+                    augment_config=augment_config,
+                    use_prompts=use_prompts,
                 ),
             )
         )

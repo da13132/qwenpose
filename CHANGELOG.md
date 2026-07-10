@@ -2,12 +2,19 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v2.1.1 - 2026-07-10
+
+- Added synchronized Stage-1 pose augmentation: horizontal flip with left/right joint remapping, affine rotation/scale/translation, color jitter, grayscale, blur, and random erasing. Boxes, loss boxes, loss areas, keypoints, validity masks, and visualization all follow the same transform.
+- Unified Stage-1 image loading so Dataset workers open augmented images once and share the same original-resolution uint8 result with MoonViT and the local RGB branch. The default two workers per rank overlap augmentation with GPU compute, while non-augmented runs stay path-backed to avoid large tensor IPC. Vision-only Stage 1 no longer constructs or forwards dataset prompts.
+- Kept Stage 2 augmentation disabled by default so RefHuman left/right descriptions remain semantically aligned, while retaining prompts for multimodal Locate generation and grounding losses.
+- Corrected the documented Stage 1 default to batch 6 per GPU, global batch 24 on four GPUs, with an 18,432-token local micro-batch budget.
+
 ## v2.1 - 2026-07-10
 
 - Changed LocatePose vision-only Stage 1 to instantiate and load only MoonViT, the frozen `mlp1` projector, and vision LoRA. The Qwen2.5 language model and tokenizer are no longer constructed or read from checkpoint shards during Stage 1.
 - Added selective safetensors loading, an image-processor-only input path, checkpoint metadata for the backbone load mode, and exact Stage-1-to-Stage-2 vision-LoRA namespace compatibility tests.
 - Added cross-rank vision-token cost bucketing and stage-specific local micro-batch token budgets, preventing one rank from receiving several maximum-resolution images and exhausting memory while the other ranks remain underutilized.
-- Raised the current Stage 1 default to batch 8 per GPU (global batch 32 on four GPUs) with an automatically scaled 24,576-token local micro-batch budget.
+- Used the Stage 1 default of batch 6 per GPU (global batch 24 on four GPUs) with an automatically scaled 18,432-token local micro-batch budget.
 
 ## v2.0 - 2026-07-10
 

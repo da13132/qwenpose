@@ -369,12 +369,13 @@ def _locate_image_token_limit(
 def build_eagle_inputs(
     processor,
     image_paths: list[str],
-    prompts: list[str],
+    prompts: list[str] | None,
     device: torch.device,
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     image_token_limit: int | None = None,
     batch_token_limit: int | None = None,
+    image_tensors: list[torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build LocateAnything processor inputs from image paths and task prompts.
 
@@ -392,11 +393,26 @@ def build_eagle_inputs(
         batch_token_limit: Optional raw patch-token budget for the complete local
             micro batch. It is converted to a conservative per-image limit so a
             rank cannot receive several maximum-resolution images simultaneously.
+        image_tensors: Optional original-resolution CHW uint8 tensors loaded by
+            the Dataset. When provided, no image file is opened here.
     """
     images = []
-    for image_path in image_paths:
-        with Image.open(image_path) as image:
-            images.append(image.convert("RGB").copy())
+    if image_tensors is not None:
+        if len(image_tensors) != len(image_paths):
+            raise ValueError(
+                f"image_tensors length {len(image_tensors)} does not match image_paths {len(image_paths)}"
+            )
+        for tensor in image_tensors:
+            if tensor.ndim != 3 or int(tensor.shape[0]) != 3:
+                raise ValueError(f"Expected CHW vision image tensor, got {tuple(tensor.shape)}")
+            array = tensor.detach().cpu()
+            if array.dtype != torch.uint8:
+                array = array.clamp(0, 255).to(torch.uint8)
+            images.append(Image.fromarray(array.permute(1, 2, 0).contiguous().numpy(), mode="RGB"))
+    else:
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                images.append(image.convert("RGB").copy())
 
     is_vision_only = bool(getattr(processor, "_qwenpose_vision_only", False))
     image_processor = getattr(processor, "image_processor", processor)
@@ -420,6 +436,8 @@ def build_eagle_inputs(
         if is_vision_only:
             inputs = image_processor(images=images, return_tensors="pt")
         else:
+            if prompts is None:
+                raise ValueError("Multimodal Locate input construction requires prompts.")
             texts = []
             for prompt in prompts:
                 messages = [
@@ -466,6 +484,7 @@ def build_eagle_lm_inputs(
     min_pixels=None,
     max_pixels=None,
     image_token_limit=None,
+    image_tensors=None,
 ):
     if bool(getattr(processor, "_qwenpose_vision_only", False)):
         raise RuntimeError(
@@ -481,6 +500,7 @@ def build_eagle_lm_inputs(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
         image_token_limit=image_token_limit,
+        image_tensors=image_tensors,
     )
     prompt_inputs = build_eagle_inputs(
         processor,
@@ -490,6 +510,7 @@ def build_eagle_lm_inputs(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
         image_token_limit=image_token_limit,
+        image_tensors=image_tensors,
     )
     labels = inputs["input_ids"].clone()
     prompt_mask = prompt_inputs.get("attention_mask")

@@ -5,12 +5,24 @@ from types import SimpleNamespace
 import json
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 
 from PIL import Image
 import torch
 
-from qwenpose.data import ALL_POSE_PROMPT, InterleavedPoseDataset, aic_to_union, mpii_boxes_from_center_scale
+from qwenpose.data import (
+    ALL_POSE_PROMPT,
+    InterleavedPoseDataset,
+    PoseAugmentConfig,
+    PoseRecord,
+    PoseRecordDataset,
+    aic_to_union,
+    mpii_boxes_from_center_scale,
+    pose_collate,
+    transform_pose_boxes,
+    transform_pose_keypoints,
+)
 from qwenpose.eagle_lora import (
     EagleFeatureExtractor,
     _load_eagle_vision_projector_weights,
@@ -129,6 +141,152 @@ class _CostDataset(torch.utils.data.Dataset):
 
 
 class MultiDatasetPoseTests(unittest.TestCase):
+    def test_horizontal_flip_maps_boxes_and_swaps_left_right_joints(self) -> None:
+        width, height = 100, 80
+        matrix = torch.tensor(
+            [[-1.0, 0.0, float(width)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        boxes = torch.tensor([[0.10, 0.20, 0.40, 0.60]])
+        flipped_boxes = transform_pose_boxes(boxes, matrix, width, height, clamp=True)
+        self.assertTrue(
+            torch.allclose(flipped_boxes, torch.tensor([[0.60, 0.20, 0.90, 0.60]]), atol=1e-6)
+        )
+
+        keypoints = torch.zeros(1, len(UNION_KEYPOINTS), 3)
+        valid = torch.zeros(1, len(UNION_KEYPOINTS), dtype=torch.bool)
+        visibility_valid = torch.zeros_like(valid)
+        left = UNION_TO_ID["left_wrist"]
+        right = UNION_TO_ID["right_wrist"]
+        keypoints[0, left] = torch.tensor([0.20, 0.30, 1.0])
+        keypoints[0, right] = torch.tensor([0.75, 0.65, 1.0])
+        valid[0, [left, right]] = True
+        visibility_valid[0, [left, right]] = True
+        mapped, mapped_valid, mapped_visibility = transform_pose_keypoints(
+            keypoints,
+            valid,
+            visibility_valid,
+            matrix,
+            width,
+            height,
+            horizontal_flip=True,
+        )
+        self.assertTrue(torch.allclose(mapped[0, left, :2], torch.tensor([0.25, 0.65]), atol=1e-6))
+        self.assertTrue(torch.allclose(mapped[0, right, :2], torch.tensor([0.80, 0.30]), atol=1e-6))
+        self.assertTrue(bool(mapped_valid[0, left] and mapped_valid[0, right]))
+        self.assertTrue(bool(mapped_visibility[0, left] and mapped_visibility[0, right]))
+
+    def test_affine_maps_keypoints_boxes_and_area_scale(self) -> None:
+        width, height = 100, 200
+        matrix = torch.tensor(
+            [[1.5, 0.0, 10.0], [0.0, 1.5, 20.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        boxes = torch.tensor([[0.10, 0.10, 0.30, 0.30]])
+        mapped_boxes = transform_pose_boxes(boxes, matrix, width, height, clamp=False)
+        expected_boxes = torch.tensor([[0.25, 0.25, 0.55, 0.55]])
+        self.assertTrue(torch.allclose(mapped_boxes, expected_boxes, atol=1e-6))
+
+        keypoints = torch.zeros(1, len(UNION_KEYPOINTS), 3)
+        valid = torch.zeros(1, len(UNION_KEYPOINTS), dtype=torch.bool)
+        visibility_valid = torch.zeros_like(valid)
+        wrist = UNION_TO_ID["left_wrist"]
+        keypoints[0, wrist] = torch.tensor([0.20, 0.20, 1.0])
+        valid[0, wrist] = True
+        visibility_valid[0, wrist] = True
+        mapped, _, _ = transform_pose_keypoints(
+            keypoints,
+            valid,
+            visibility_valid,
+            matrix,
+            width,
+            height,
+            horizontal_flip=False,
+        )
+        self.assertTrue(torch.allclose(mapped[0, wrist, :2], torch.tensor([0.40, 0.40]), atol=1e-6))
+        self.assertAlmostEqual(abs(float(torch.det(matrix[:2, :2]))), 2.25, places=6)
+
+    def test_dataset_reads_once_shares_augmented_image_and_drops_stage1_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "sample.png"
+            Image.new("RGB", (40, 30), (10, 20, 30)).save(image_path)
+            union = len(UNION_KEYPOINTS)
+            keypoints = torch.zeros(1, union, 3)
+            valid = torch.zeros(1, union, dtype=torch.bool)
+            visibility_valid = torch.zeros_like(valid)
+            keypoints[0, UNION_TO_ID["nose"]] = torch.tensor([0.5, 0.5, 1.0])
+            valid[0, UNION_TO_ID["nose"]] = True
+            visibility_valid[0, UNION_TO_ID["nose"]] = True
+            record = PoseRecord(
+                image_path=image_path,
+                width=40,
+                height=30,
+                boxes_xyxy=torch.tensor([[0.2, 0.2, 0.8, 0.8]]),
+                loss_boxes_xyxy=torch.tensor([[0.2, 0.2, 0.8, 0.8]]),
+                loss_areas=torch.tensor([0.36]),
+                keypoints=keypoints,
+                keypoint_valid=valid,
+                visibility_valid=visibility_valid,
+                box_context_scale=torch.ones(1),
+                box_jitter_scale=torch.zeros(1),
+                box_jitter_shift=torch.zeros(1),
+                schema="COCO17",
+                task="ALL_POSE",
+                prompt=ALL_POSE_PROMPT,
+                dataset_name="coco",
+                image_id="sample",
+            )
+            dataset = PoseRecordDataset(
+                [record],
+                image_size=16,
+                load_image_tensors=True,
+                load_vision_images=True,
+                augment_config=PoseAugmentConfig(enabled=False),
+                use_prompts=False,
+            )
+            real_open = Image.open
+            with mock.patch("qwenpose.data.Image.open", wraps=real_open) as open_mock:
+                item = dataset[0]
+            self.assertEqual(open_mock.call_count, 1)
+            self.assertEqual(item["prompt"], "")
+            self.assertEqual(tuple(item["image"].shape), (3, 16, 16))
+            self.assertEqual(tuple(item["vision_image"].shape), (3, 30, 40))
+
+            processor = _VisionOnlyImageProcessor()
+            with mock.patch("qwenpose.eagle_lora.Image.open", side_effect=AssertionError("second read")):
+                inputs = build_eagle_inputs(
+                    processor,
+                    [str(image_path)],
+                    None,
+                    torch.device("cpu"),
+                    image_tensors=[item["vision_image"]],
+                )
+            self.assertIn("pixel_values", inputs)
+            self.assertNotIn("input_ids", inputs)
+
+            path_backed_dataset = PoseRecordDataset(
+                [record],
+                image_size=16,
+                load_image_tensors=True,
+                load_vision_images=False,
+                augment_config=PoseAugmentConfig(enabled=False),
+                use_prompts=False,
+            )
+            path_backed_item = path_backed_dataset[0]
+            self.assertIsNone(path_backed_item["vision_image"])
+            path_backed_batch = pose_collate([path_backed_item])
+            self.assertIsNone(path_backed_batch["vision_images"])
+            with mock.patch("qwenpose.eagle_lora.Image.open", wraps=real_open) as open_mock:
+                inputs = build_eagle_inputs(
+                    processor,
+                    [str(image_path)],
+                    None,
+                    torch.device("cpu"),
+                    image_tensors=path_backed_batch["vision_images"],
+                )
+            self.assertEqual(open_mock.call_count, 1)
+            self.assertIn("pixel_values", inputs)
+
     def test_selective_loader_reads_only_vision_and_projector_tensors(self) -> None:
         from safetensors.torch import save_file
 

@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v2.1`
+Release: `v2.1.1`
 
 English | [中文说明](README_zh.md)
 
@@ -75,7 +75,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v2.1` snapshot was validated with:
+This `v2.1.1` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -332,13 +332,13 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 | stage 1 | `stage1_freeze_locate_gt_box` | MoonViT only; train vision LoRA | `gt` | `coco,mpii,crowdpose` | `20` with a `60,000`-step cap |
 | stage 2 | `stage2_locate_box_closed_loop` | full multimodal Locate; train all LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
-In vision-only Stage 1, the loader instantiates only MoonViT, the frozen `mlp1` visual projector, and vision LoRA. It does not instantiate the Qwen2.5 language model or load any `language_model.*` checkpoint tensors, and it uses `AutoImageProcessor` without loading a tokenizer. Stage 2 loads the complete LocateAnything model and injects the Stage-1 vision LoRA through the identical `base_model.model.vision_model.*` parameter namespace.
+In vision-only Stage 1, the loader instantiates only MoonViT, the frozen `mlp1` visual projector, and vision LoRA. It does not instantiate the Qwen2.5 language model, tokenizer, or dataset prompts. Dataset workers open each image once, apply one synchronized augmentation, pass the same original-resolution uint8 result to MoonViT, and derive the local RGB tensor from that image. Stage 2 loads the complete LocateAnything model and injects the Stage-1 vision LoRA through the identical `base_model.model.vision_model.*` parameter namespace.
 
 Additional default knobs:
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=8` (global batch `32` on four GPUs)
+- `STAGE1_BATCH_SIZE=6` (global batch `24` on four GPUs)
 - `STAGE2_BATCH_SIZE=1`
 - `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
@@ -369,9 +369,11 @@ Additional default knobs:
 - `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
-- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072` (default `24576` for batch 8)
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072` (default `18432` for batch 6)
 - `STAGE2_LOCATE_BATCH_TOKEN_LIMIT=STAGE2_BATCH_SIZE*4096` (default `4096`)
 - cross-rank vision-token cost balancing is enabled by default
+- Stage 1 synchronized pose augmentation is enabled by default; Stage 2 augmentation is disabled
+- default augmentation: horizontal flip `0.5`, affine `0.8` with `±15°`, scale `0.85–1.15`, translation `±8%`, plus moderate color/blur/erase augmentation
 - `LOCATE_GENERATION_MODE=hybrid`
 - `LOCATE_BOX_MAX_NEW_TOKENS=8192`
 - `STAGE2_W_LOCATE_BOX_LM=0.04`
@@ -388,7 +390,7 @@ bash scripts/locatepose.sh
 Example with explicit run name and the current 4-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v2_1 \
+RUN_NAME=locatepose_v2_1_1 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -427,6 +429,9 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
 - `STAGE1_LOCATE_BATCH_TOKEN_LIMIT`, `STAGE2_LOCATE_BATCH_TOKEN_LIMIT`: local micro-batch token budgets; defaults scale with each stage's batch size
 - `DISABLE_VISION_TOKEN_BALANCING`: set to `1` only to disable cross-rank cost-balanced batching
+- `STAGE1_POSE_AUGMENT`, `STAGE2_POSE_AUGMENT`: synchronized pose augmentation switches; defaults are `1` and `0`
+- `AUGMENT_FLIP_PROB`, `AUGMENT_AFFINE_PROB`, `AUGMENT_ROTATE_DEGREES`, `AUGMENT_SCALE_MIN/MAX`, `AUGMENT_TRANSLATE_FRACTION`: geometric augmentation controls
+- `AUGMENT_COLOR_PROB`, `AUGMENT_BRIGHTNESS`, `AUGMENT_CONTRAST`, `AUGMENT_SATURATION`, `AUGMENT_HUE`, `AUGMENT_GRAYSCALE_PROB`, `AUGMENT_BLUR_PROB`, `AUGMENT_ERASE_PROB`: photometric and occlusion controls
 - `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
 - `LOCATE_VISION_SCALE`: learning-rate multiplier for Locate vision LoRA parameters
 - `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
@@ -635,6 +640,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v2.1`
+- Git tags such as `v2.1.1`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

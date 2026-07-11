@@ -2088,6 +2088,58 @@ def distributed_barrier() -> None:
         torch.distributed.barrier()
 
 
+def distributed_any(value: bool, device: torch.device) -> bool:
+    """Return True on every rank when any rank reports True."""
+    flag = torch.tensor(int(bool(value)), device=device, dtype=torch.int32)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def iter_named_floating_tensors(value, prefix: str = ""):
+    """Yield floating tensors from nested model outputs without detaching them."""
+    if torch.is_tensor(value):
+        if torch.is_floating_point(value):
+            yield prefix or "tensor", value
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            yield from iter_named_floating_tensors(item, child)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            child = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            yield from iter_named_floating_tensors(item, child)
+
+
+def synchronized_finite_check(
+    named_tensors,
+    device: torch.device,
+    *,
+    max_bad_names: int = 4,
+) -> tuple[bool, list[str]]:
+    """Check tensors locally and synchronize the result across all ranks."""
+    items = [(name, tensor) for name, tensor in named_tensors if tensor is not None]
+    local_ok = torch.ones((), device=device, dtype=torch.int32)
+    for _, tensor in items:
+        tensor_ok = torch.isfinite(tensor.detach()).all().to(device=device, dtype=torch.int32)
+        local_ok = torch.minimum(local_ok, tensor_ok)
+    global_ok = local_ok.clone()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(global_ok, op=torch.distributed.ReduceOp.MIN)
+    if bool(global_ok.item()):
+        return True, []
+    bad_names: list[str] = []
+    if not bool(local_ok.item()):
+        for name, tensor in items:
+            if not bool(torch.isfinite(tensor.detach()).all().item()):
+                bad_names.append(name)
+                if len(bad_names) >= max_bad_names:
+                    break
+    return False, bad_names
+
+
 def update_progress_bar(progress_bar, postfix: dict[str, object]) -> None:
     if progress_bar is not None:
         progress_bar.set_postfix(postfix, refresh=False)
@@ -3504,6 +3556,13 @@ def build_cosine_scheduler(
 
 def main() -> None:
     args = parse_args()
+    sharing_strategy = os.environ.get("QWENPOSE_MP_SHARING_STRATEGY", "file_system").strip()
+    if sharing_strategy not in {"file_descriptor", "file_system"}:
+        raise ValueError(
+            "QWENPOSE_MP_SHARING_STRATEGY must be file_descriptor or file_system, "
+            f"got {sharing_strategy!r}."
+        )
+    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
     if args.grad_accum_steps <= 0:
@@ -4395,6 +4454,15 @@ def main() -> None:
                         target_box_mask=target_box_mask,
                         images=batch.get("images"),
                     )
+                    outputs_finite, bad_output_names = synchronized_finite_check(
+                        iter_named_floating_tensors(outputs),
+                        device,
+                    )
+                    if not outputs_finite:
+                        local_detail = ", ".join(bad_output_names) if bad_output_names else "nonfinite values reported by another rank"
+                        raise FloatingPointError(
+                            f"Non-finite model output before loss at step={global_step} micro={micro_step}: {local_detail}"
+                        )
                     loss, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
                     loss_dict.update(
                         compute_pose_diagnostics(outputs, pose_targets, batch["task_ids"])
@@ -4409,14 +4477,13 @@ def main() -> None:
                         loss_dict["loss_lm_weight"] = torch.as_tensor(lm_weight, device=loss.device)
                         loss_dict["loss_total"] = loss
 
-                # --- Loss spike detection ---
+                # --- Synchronized loss spike detection ---
                 loss_val = float(loss.detach())
                 trace_loss_val = loss_val
-                skip_batch = False
-                if not math.isfinite(loss_val) or loss_val > loss_abs_cap:
-                    skip_batch = True
-                elif loss_ema is not None and loss_val > loss_ema * loss_spike_threshold:
-                    skip_batch = True
+                local_skip_batch = not math.isfinite(loss_val) or loss_val > loss_abs_cap
+                if not local_skip_batch and loss_ema is not None:
+                    local_skip_batch = loss_val > loss_ema * loss_spike_threshold
+                skip_batch = distributed_any(local_skip_batch, device)
                 if skip_batch:
                     loss_spike_count += 1
                     ema_str = f"{loss_ema:.4f}" if loss_ema is not None else "n/a"
@@ -4424,16 +4491,13 @@ def main() -> None:
                         progress_write(
                             progress_bar,
                             f"[SPIKE] step={global_step} micro={micro_step} loss={loss_val:.4f} "
-                            f"ema={ema_str} consecutive={loss_spike_count} — skipping batch",
+                            f"ema={ema_str} consecutive={loss_spike_count} — optimizer step skipped on all ranks",
                         )
-                    # Replace loss with zero so backward produces zero gradients.
-                    loss = loss * 0.0
                     if loss_spike_count >= loss_spike_max:
                         if is_main_process():
                             print(f"[ABORT] {loss_spike_count} consecutive loss spikes; stopping training.")
                         stop_training = True
                 else:
-                    loss_spike_count = 0
                     loss_ema = (
                         loss_val
                         if loss_ema is None
@@ -4445,20 +4509,84 @@ def main() -> None:
 
                 sync_cuda_for_timing(args.sync_timing, device)
                 step_started = time.perf_counter()
-                if use_deepspeed:
+                if skip_batch:
+                    if use_deepspeed:
+                        active_model.zero_grad()
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                elif use_deepspeed:
                     boundary = active_model.is_gradient_accumulation_boundary()
                     active_model.backward(loss)
-                    active_model.step()
-                    did_update = bool(boundary)
+                    gradients_finite, bad_gradient_names = synchronized_finite_check(
+                        (
+                            (name, parameter.grad)
+                            for name, parameter in training_model.named_parameters()
+                            if parameter.requires_grad and parameter.grad is not None
+                        ),
+                        device,
+                    )
+                    if not gradients_finite:
+                        skip_batch = True
+                        loss_spike_count += 1
+                        active_model.zero_grad()
+                        if is_main_process():
+                            local_detail = ", ".join(bad_gradient_names) if bad_gradient_names else "nonfinite gradients reported by another rank"
+                            progress_write(
+                                progress_bar,
+                                f"[NONFINITE_GRAD] step={global_step} micro={micro_step} {local_detail} — optimizer step skipped on all ranks",
+                            )
+                        if loss_spike_count >= loss_spike_max:
+                            stop_training = True
+                    else:
+                        loss_spike_count = 0
+                        active_model.step()
+                        did_update = bool(boundary)
                 else:
                     scaler.scale(loss / args.grad_accum_steps).backward()
                     if micro_step % args.grad_accum_steps == 0:
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(training_model.parameters(), args.grad_clip)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                        did_update = True
+                        gradients_finite, bad_gradient_names = synchronized_finite_check(
+                            (
+                                (name, parameter.grad)
+                                for name, parameter in training_model.named_parameters()
+                                if parameter.requires_grad and parameter.grad is not None
+                            ),
+                            device,
+                        )
+                        if not gradients_finite:
+                            skip_batch = True
+                            loss_spike_count += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            scaler.update()
+                            if is_main_process():
+                                local_detail = ", ".join(bad_gradient_names) if bad_gradient_names else "nonfinite gradients reported by another rank"
+                                progress_write(
+                                    progress_bar,
+                                    f"[NONFINITE_GRAD] step={global_step} micro={micro_step} {local_detail} — optimizer step skipped on all ranks",
+                                )
+                            if loss_spike_count >= loss_spike_max:
+                                stop_training = True
+                        else:
+                            loss_spike_count = 0
+                            torch.nn.utils.clip_grad_norm_(training_model.parameters(), args.grad_clip)
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            did_update = True
+                if did_update:
+                    parameters_finite, bad_parameter_names = synchronized_finite_check(
+                        (
+                            (name, parameter)
+                            for name, parameter in training_model.named_parameters()
+                            if parameter.requires_grad
+                        ),
+                        device,
+                    )
+                    if not parameters_finite:
+                        local_detail = ", ".join(bad_parameter_names) if bad_parameter_names else "nonfinite parameters reported by another rank"
+                        raise FloatingPointError(
+                            f"Optimizer produced non-finite parameters at step={global_step} micro={micro_step}: {local_detail}"
+                        )
                 sync_cuda_for_timing(args.sync_timing, device)
                 step_time = time.perf_counter() - step_started
                 loss_metrics_for_trace = {k: float(v.detach().cpu()) for k, v in loss_dict.items()}
@@ -4660,19 +4788,47 @@ def main() -> None:
 
     if not use_deepspeed and micro_step % args.grad_accum_steps != 0 and not stop_training:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(training_model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        global_step += 1
-        if len(loader) > 0:
-            resume_cursor_epoch, resume_cursor_batch_in_epoch = normalize_resume_position(
-                resume_cursor_epoch,
-                resume_cursor_batch_in_epoch,
-                len(loader),
+        gradients_finite, bad_gradient_names = synchronized_finite_check(
+            (
+                (name, parameter.grad)
+                for name, parameter in training_model.named_parameters()
+                if parameter.requires_grad and parameter.grad is not None
+            ),
+            device,
+        )
+        if not gradients_finite:
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            if is_main_process():
+                local_detail = ", ".join(bad_gradient_names) if bad_gradient_names else "nonfinite gradients reported by another rank"
+                print(f"[NONFINITE_GRAD] final partial accumulation skipped: {local_detail}")
+        else:
+            torch.nn.utils.clip_grad_norm_(training_model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            parameters_finite, bad_parameter_names = synchronized_finite_check(
+                (
+                    (name, parameter)
+                    for name, parameter in training_model.named_parameters()
+                    if parameter.requires_grad
+                ),
+                device,
             )
-        if scheduler is not None:
-            scheduler.step()
+            if not parameters_finite:
+                local_detail = ", ".join(bad_parameter_names) if bad_parameter_names else "nonfinite parameters reported by another rank"
+                raise FloatingPointError(
+                    f"Optimizer produced non-finite parameters in final partial accumulation: {local_detail}"
+                )
+            global_step += 1
+            if len(loader) > 0:
+                resume_cursor_epoch, resume_cursor_batch_in_epoch = normalize_resume_position(
+                    resume_cursor_epoch,
+                    resume_cursor_batch_in_epoch,
+                    len(loader),
+                )
+            if scheduler is not None:
+                scheduler.step()
 
     training_state = build_training_state(
         epoch=resume_cursor_epoch,

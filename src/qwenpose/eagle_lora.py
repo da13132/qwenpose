@@ -562,10 +562,11 @@ class EagleFeatureExtractor(nn.Module):
             nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size),
             nn.Conv2d(hidden_size, hidden_size, kernel_size=1),
         )
-        # Start exactly from the pretrained LM feature map. The fusion branch is
-        # zero-initialized and opens gradually instead of perturbing features at
-        # step zero with a random 0.5-weight residual.
-        self.dual_feature_gate = nn.Parameter(torch.tensor(-4.0))
+        # Start multimodal Stage 2 from the same normalized raw visual map used
+        # by vision-only Stage 1. The zero-initialized branch makes the transition
+        # exact at step zero, while a neutral gate lets Stage 2 learn LM context
+        # promptly instead of waiting for a nearly closed gate to open.
+        self.dual_feature_gate = nn.Parameter(torch.tensor(0.0))
         final_fuse = self.dual_feature_fuse[-1]
         nn.init.zeros_(final_fuse.weight)
         if final_fuse.bias is not None:
@@ -841,7 +842,7 @@ class EagleFeatureExtractor(nn.Module):
             lm_maps = lm_maps.to(dtype=fuse_dtype)
         fused_delta = self.dual_feature_fuse(torch.cat([raw_maps, lm_maps], dim=1))
         gate = torch.sigmoid(self.dual_feature_gate).to(device=fused_delta.device, dtype=fused_delta.dtype)
-        return lm_maps + gate * fused_delta
+        return raw_maps + gate * fused_delta
 
     @staticmethod
     def _cache_seq_len(past_key_values: object) -> int:

@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v2.2 - 2026-07-11
+
+- Added synchronized finite-value checks for model outputs, gradients, and trainable parameters. Loss spikes and non-finite gradients now skip the optimizer step consistently on every distributed rank instead of silently replacing invalid values.
+- Changed the default vision-only Stage 1 recipe to freeze the Locate backbone and train the PoseHead with batch 32 per GPU, two-step gradient accumulation, a 100-epoch ceiling, and the existing 60,000-step cap. The optional vision-LoRA learning-rate multiplier is reduced to `0.01`.
+- Changed Stage 2 multimodal fusion to start exactly from the normalized Stage 1 visual feature map while retaining a learnable zero-initialized context branch and neutral gate.
+- Improved long-running multi-worker training robustness by raising the open-file soft limit when possible, using the `file_system` tensor-sharing strategy by default, and adding a locked four-GPU availability waiter script.
+
 ## v2.1.1 - 2026-07-10
 
 - Added synchronized Stage-1 pose augmentation: horizontal flip with left/right joint remapping, affine rotation/scale/translation, color jitter, grayscale, blur, and random erasing. Boxes, loss boxes, loss areas, keypoints, validity masks, and visualization all follow the same transform.

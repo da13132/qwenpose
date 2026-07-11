@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v2.1.1`
+版本：`v2.2`
 
 [English](README.md) | 中文
 
@@ -38,6 +38,7 @@ qwenpose/
 │   ├── eval_qwenpose.sh
 │   ├── infer_locatepose.sh
 │   ├── locatepose.sh
+│   ├── wait_for_4gpu_locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
@@ -75,7 +76,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v2.1.1` 快照在以下环境中完成验证：
+这个 `v2.2` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -329,30 +330,29 @@ LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，在共享 PoseHea
 
 | 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
 |------|--------|----------------|------------|------------|------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | 仅用 MoonViT，训练 vision LoRA | `gt` | `coco,mpii,crowdpose` | `20`，并限制最多 `60,000` step |
+| stage 1 | `stage1_freeze_locate_gt_box` | 仅用 MoonViT，冻结 Locate backbone，训练 PoseHead | `gt` | `coco,mpii,crowdpose` | `100`，并限制最多 `60,000` step |
 | stage 2 | `stage2_locate_box_closed_loop` | 恢复完整多模态 Locate，训练全部 LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
-vision-only 的 Stage 1 现在只实例化 MoonViT、冻结的 `mlp1` 视觉 projector 和 vision LoRA；不会实例化 Qwen2.5 语言模型、tokenizer，也不再构造数据集 prompt。Dataset worker 每张图只打开一次，执行一次同步增强，把同一份原分辨率 uint8 图像交给 MoonViT，并由它生成本地 RGB tensor。Stage 2 再加载完整 LocateAnything，并通过完全一致的 `base_model.model.vision_model.*` 参数命名空间注入 Stage 1 的 vision LoRA。
+vision-only 的 Stage 1 现在只实例化 MoonViT 和冻结的 `mlp1` 视觉 projector，Locate backbone 保持冻结，只训练 PoseHead；不会实例化 Qwen2.5 语言模型、tokenizer，也不再构造数据集 prompt。Dataset worker 每张图只打开一次，执行一次同步增强，把同一份原分辨率 uint8 图像交给 MoonViT，并由它生成本地 RGB tensor。Stage 2 再加载完整 LocateAnything，多模态融合从归一化后的 Stage 1 原始视觉特征图精确起步，再学习语言条件残差。
 
 其他关键默认值：
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=6`（4 卡全局 batch 为 `24`）
+- `STAGE1_BATCH_SIZE=32`，`STAGE1_GRAD_ACCUM_STEPS=2`（4 卡有效全局 batch 为 `256`）
 - `STAGE2_BATCH_SIZE=1`
-- `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
 - `STAGE1_LR=3e-4`
 - `STAGE1_MAX_STEPS=60000`
 - `STAGE2_LR=5e-5`
 - `STAGE1_LOCATE_FEATURE_SOURCE=vision_only`
-- `STAGE1_LOCATE_TRAIN_SCOPE=vision_lora`
+- `STAGE1_LOCATE_TRAIN_SCOPE=frozen`
 - `STAGE1_LOCATE_GRADIENT_CHECKPOINTING=0`
 - `STAGE2_LOCATE_FEATURE_SOURCE=multimodal`
 - `STAGE2_LOCATE_TRAIN_SCOPE=all_lora`
 - `POSE_DROPOUT=0.0`
 - `LOCATE_LORA_DROPOUT=0.0`、`LOCATE_VISION_LORA_DROPOUT=0.0`
-- `LOCATE_VISION_SCALE=0.05`
+- 显式启用 vision LoRA 时使用 `LOCATE_VISION_SCALE=0.01`
 - `STAGE1_BOX_JITTER_SCALE=0.0`、`STAGE1_BOX_JITTER_SHIFT=0.0` 仅作为全局 fallback；每条数据记录携带各数据集自己的默认扰动策略
 - `DATASET_MIX_WEIGHTS=auto` 表示按数据量比例 interleave；手动权重仅用于受控消融
 - `W_OKS=0.5`
@@ -369,7 +369,7 @@ vision-only 的 Stage 1 现在只实例化 MoonViT、冻结的 `mlp1` 视觉 pro
 - `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
-- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072`（batch 6 时默认 `18432`）
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072`（batch 32 时默认 `98304`）
 - `STAGE2_LOCATE_BATCH_TOKEN_LIMIT=STAGE2_BATCH_SIZE*4096`（默认 `4096`）
 - 默认启用跨 rank 视觉 token 成本均衡
 - Stage 1 默认启用同步姿态增强，Stage 2 默认关闭增强
@@ -390,7 +390,7 @@ bash scripts/locatepose.sh
 按当前默认 4 卡布局启动的示例：
 
 ```bash
-RUN_NAME=locatepose_v2_1_1 \
+RUN_NAME=locatepose_v2_2 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -640,6 +640,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v2.1.1`
+- Git tag，例如 `v2.2`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

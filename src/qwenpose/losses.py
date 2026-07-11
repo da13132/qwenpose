@@ -80,17 +80,20 @@ def compute_pose_losses(
     task_ids: torch.Tensor,
     weights: LossWeights,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # Keep loss arithmetic in float32, but never hide NaN/Inf model outputs.
+    # The training loop performs a synchronized finite-value check before loss
+    # construction so one bad rank cannot silently poison every optimizer shard.
     clean_outputs = {}
     for key, value in outputs.items():
         if isinstance(value, list):
             clean_outputs[key] = [
-                torch.nan_to_num(item.float(), nan=0.0, posinf=1.0, neginf=0.0)
+                item.float()
                 if torch.is_tensor(item) and torch.is_floating_point(item)
                 else item
                 for item in value
             ]
         elif torch.is_tensor(value) and torch.is_floating_point(value):
-            clean_outputs[key] = torch.nan_to_num(value.float(), nan=0.0, posinf=1.0, neginf=0.0)
+            clean_outputs[key] = value.float()
         else:
             clean_outputs[key] = value
     outputs = clean_outputs

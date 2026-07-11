@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v2.1.1`
+Release: `v2.2`
 
 English | [中文说明](README_zh.md)
 
@@ -38,6 +38,7 @@ qwenpose/
 │   ├── eval_qwenpose.sh
 │   ├── infer_locatepose.sh
 │   ├── locatepose.sh
+│   ├── wait_for_4gpu_locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
 │   ├── zero2.json
 │   ├── zero3.json
@@ -75,7 +76,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v2.1.1` snapshot was validated with:
+This `v2.2` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -329,30 +330,29 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the sha
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | MoonViT only; train vision LoRA | `gt` | `coco,mpii,crowdpose` | `20` with a `60,000`-step cap |
+| stage 1 | `stage1_freeze_locate_gt_box` | MoonViT only; frozen Locate backbone, train PoseHead | `gt` | `coco,mpii,crowdpose` | `100` with a `60,000`-step cap |
 | stage 2 | `stage2_locate_box_closed_loop` | full multimodal Locate; train all LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
 
-In vision-only Stage 1, the loader instantiates only MoonViT, the frozen `mlp1` visual projector, and vision LoRA. It does not instantiate the Qwen2.5 language model, tokenizer, or dataset prompts. Dataset workers open each image once, apply one synchronized augmentation, pass the same original-resolution uint8 result to MoonViT, and derive the local RGB tensor from that image. Stage 2 loads the complete LocateAnything model and injects the Stage-1 vision LoRA through the identical `base_model.model.vision_model.*` parameter namespace.
+In vision-only Stage 1, the loader instantiates only MoonViT and the frozen `mlp1` visual projector, while the Locate backbone remains frozen and the PoseHead is trained. It does not instantiate the Qwen2.5 language model, tokenizer, or dataset prompts. Dataset workers open each image once, apply one synchronized augmentation, pass the same original-resolution uint8 result to MoonViT, and derive the local RGB tensor from that image. Stage 2 loads the complete LocateAnything model and starts multimodal fusion exactly from the normalized Stage-1 visual map before learning the language-conditioned residual.
 
 Additional default knobs:
 
 - `CUDA_VISIBLE_DEVICES=0,1,2,3`
 - `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=6` (global batch `24` on four GPUs)
+- `STAGE1_BATCH_SIZE=32` with `STAGE1_GRAD_ACCUM_STEPS=2` (effective global batch `256` on four GPUs)
 - `STAGE2_BATCH_SIZE=1`
-- `STAGE1_GRAD_ACCUM_STEPS=1`
 - `STAGE2_GRAD_ACCUM_STEPS=4`
 - `STAGE1_LR=3e-4`
 - `STAGE1_MAX_STEPS=60000`
 - `STAGE2_LR=5e-5`
 - `STAGE1_LOCATE_FEATURE_SOURCE=vision_only`
-- `STAGE1_LOCATE_TRAIN_SCOPE=vision_lora`
+- `STAGE1_LOCATE_TRAIN_SCOPE=frozen`
 - `STAGE1_LOCATE_GRADIENT_CHECKPOINTING=0`
 - `STAGE2_LOCATE_FEATURE_SOURCE=multimodal`
 - `STAGE2_LOCATE_TRAIN_SCOPE=all_lora`
 - `POSE_DROPOUT=0.0`
 - `LOCATE_LORA_DROPOUT=0.0` and `LOCATE_VISION_LORA_DROPOUT=0.0`
-- `LOCATE_VISION_SCALE=0.05`
+- `LOCATE_VISION_SCALE=0.01` when vision LoRA is explicitly enabled
 - `STAGE1_BOX_JITTER_SCALE=0.0` and `STAGE1_BOX_JITTER_SHIFT=0.0` as global fallbacks; each dataset record carries its own default jitter policy
 - `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use manual weights only for controlled ablations
 - `W_OKS=0.5`
@@ -369,7 +369,7 @@ Additional default knobs:
 - `W_SIMCC_REFINE=0.0,0.0,0.5`
 - `SIMCC_SIGMA=2.0`
 - `LOCATE_IMAGE_TOKEN_LIMIT=4096`
-- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072` (default `18432` for batch 6)
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072` (default `98304` for batch 32)
 - `STAGE2_LOCATE_BATCH_TOKEN_LIMIT=STAGE2_BATCH_SIZE*4096` (default `4096`)
 - cross-rank vision-token cost balancing is enabled by default
 - Stage 1 synchronized pose augmentation is enabled by default; Stage 2 augmentation is disabled
@@ -390,7 +390,7 @@ bash scripts/locatepose.sh
 Example with explicit run name and the current 4-GPU default layout:
 
 ```bash
-RUN_NAME=locatepose_v2_1_1 \
+RUN_NAME=locatepose_v2_2 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
@@ -640,6 +640,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v2.1.1`
+- Git tags such as `v2.2`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

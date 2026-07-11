@@ -399,9 +399,9 @@ esac
 # DEEPSPEED_CONFIG：DeepSpeed JSON 配置路径；ZERO_STAGE=none 时为空。
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${DEFAULT_DEEPSPEED_CONFIG}}"
 # CUDA_VISIBLE_DEVICES：可见 GPU 列表。
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="0,1,2,3"
 # NPROC_PER_NODE：每个节点启动的训练进程数，一般等于可见 GPU 数。
-export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+export NPROC_PER_NODE="4"
 # MASTER_ADDR：torch.distributed 主节点地址。
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 # MASTER_PORT：torch.distributed 端口；默认随机选一个高位端口。
@@ -418,6 +418,18 @@ export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # WANDB_DISABLED：默认关闭 wandb，避免公共训练脚本误上传。
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
+# OPEN_FILE_LIMIT：大 batch + 多 worker 会为共享 tensor 创建大量句柄；提升 tmux 子进程的 soft nofile。
+OPEN_FILE_LIMIT="${OPEN_FILE_LIMIT:-65536}"
+HARD_OPEN_FILE_LIMIT="$(ulimit -Hn)"
+TARGET_OPEN_FILE_LIMIT="${OPEN_FILE_LIMIT}"
+if [[ "${HARD_OPEN_FILE_LIMIT}" != "unlimited" ]] && (( TARGET_OPEN_FILE_LIMIT > HARD_OPEN_FILE_LIMIT )); then
+  TARGET_OPEN_FILE_LIMIT="${HARD_OPEN_FILE_LIMIT}"
+fi
+if ! ulimit -S -n "${TARGET_OPEN_FILE_LIMIT}"; then
+  echo "[WARN] unable to raise open-file soft limit to ${TARGET_OPEN_FILE_LIMIT}; current=$(ulimit -Sn)" >&2
+fi
+# QWENPOSE_MP_SHARING_STRATEGY：file_system 避免每个 DataLoader tensor storage 长期占用一个 FD。
+export QWENPOSE_MP_SHARING_STRATEGY="${QWENPOSE_MP_SHARING_STRATEGY:-file_system}"
 
 ###############################################################################
 # 数据集与 DataLoader 参数
@@ -545,8 +557,8 @@ DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
 
 # LR：全局基础学习率；stage 可用 STAGE*_LR 单独覆盖。
 LR="${LR:-2e-4}"
-# LOCATE_VISION_SCALE：LocateAnything vision LoRA 参数学习率相对 LR 的倍率。
-LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.05}"
+# LOCATE_VISION_SCALE：LocateAnything vision LoRA 参数学习率相对 LR 的倍率；默认保守，Stage1 显式解冻时避免破坏预训练视觉特征。
+LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.01}"
 # WEIGHT_DECAY：AdamW weight decay。
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 # GRAD_CLIP：梯度裁剪范数。
@@ -647,19 +659,20 @@ STAGE2_INIT_WEIGHTS_DIR="${STAGE2_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage2_init_we
 STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose}"
 STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 # STAGE1_EPOCHS：仅作为 MAX_STEPS 未达到时的上限。
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-20}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
 # STAGE2_EPOCHS：stage2 epoch 数。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-5}"
-# STAGE1_BATCH_SIZE：stage1 每卡 micro batch size；Locate vision 走 flash_attention_2 full-batch forward。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-6}"
+# STAGE1_BATCH_SIZE：stage1 每卡 micro batch size。默认 32 以容纳拥挤样本的 PoseHead 注意力峰值；
+# 配合 2 步梯度累积，4 卡全局有效 batch 仍为 256。
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-32}"
 # STAGE2_BATCH_SIZE：stage2 每卡 micro batch size；locate_generate 逐图生成，默认 1。
 STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-1}"
 # Stage 1 每图保留约 3072 raw patch tokens；Stage 2 单图保持 4096。
 # 也可用 LOCATE_BATCH_TOKEN_LIMIT 同时覆盖两阶段，或分别覆盖下面两个变量。
 STAGE1_LOCATE_BATCH_TOKEN_LIMIT="${STAGE1_LOCATE_BATCH_TOKEN_LIMIT:-${LOCATE_BATCH_TOKEN_LIMIT:-$((STAGE1_BATCH_SIZE * 3072))}}"
 STAGE2_LOCATE_BATCH_TOKEN_LIMIT="${STAGE2_LOCATE_BATCH_TOKEN_LIMIT:-${LOCATE_BATCH_TOKEN_LIMIT:-$((STAGE2_BATCH_SIZE * 4096))}}"
-# STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。
-STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
+# STAGE1_GRAD_ACCUM_STEPS：stage1 梯度累积步数。32 × 4 GPU × 2 = effective batch 256。
+STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-2}"
 # STAGE2_GRAD_ACCUM_STEPS：stage2 梯度累积步数。
 STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-4}"
 # STAGE1_LR：stage1 基础学习率。
@@ -670,14 +683,14 @@ STAGE2_LR="${STAGE2_LR:-5e-5}"
 STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-${MAX_STEPS:-60000}}"
 # STAGE2_MAX_STEPS：stage2 最大 optimizer step；0 表示按 epoch 跑满。
 STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-0}"
-# Stage 1 不整体冻结 LocateAnything，只开放 vision LoRA。
-STAGE1_FREEZE_LOCATE="${STAGE1_FREEZE_LOCATE:-0}"
+# Stage 1 默认冻结视觉塔，只训练 PoseHead；显式设为 0 可启用视觉 LoRA。
+STAGE1_FREEZE_LOCATE="${STAGE1_FREEZE_LOCATE:-1}"
 # STAGE2_FREEZE_LOCATE：stage2 是否冻结 LocateAnything。
 STAGE2_FREEZE_LOCATE="${STAGE2_FREEZE_LOCATE:-0}"
-# Stage 1 跳过 LLM，只开放 vision LoRA；Stage 2 恢复完整多模态和全部 LoRA。
+# Stage 1 跳过 LLM，默认冻结视觉塔；Stage 2 恢复完整多模态和全部 LoRA。
 STAGE1_LOCATE_FEATURE_SOURCE="${STAGE1_LOCATE_FEATURE_SOURCE:-vision_only}"
 STAGE2_LOCATE_FEATURE_SOURCE="${STAGE2_LOCATE_FEATURE_SOURCE:-multimodal}"
-STAGE1_LOCATE_TRAIN_SCOPE="${STAGE1_LOCATE_TRAIN_SCOPE:-vision_lora}"
+STAGE1_LOCATE_TRAIN_SCOPE="${STAGE1_LOCATE_TRAIN_SCOPE:-frozen}"
 STAGE2_LOCATE_TRAIN_SCOPE="${STAGE2_LOCATE_TRAIN_SCOPE:-all_lora}"
 # Stage 1 关闭 checkpointing 提速；Stage 2 生成闭环按需开启以节省显存。
 STAGE1_LOCATE_GRADIENT_CHECKPOINTING="${STAGE1_LOCATE_GRADIENT_CHECKPOINTING:-0}"
@@ -1049,6 +1062,10 @@ run_stage() {
   echo "DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG}"
   echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
   echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+  echo "OPEN_FILE_SOFT_LIMIT=$(ulimit -Sn)"
+  echo "MP_SHARING_STRATEGY=${QWENPOSE_MP_SHARING_STRATEGY}"
+  echo "NUM_WORKERS=${NUM_WORKERS}"
+  echo "PREFETCH_FACTOR=${PREFETCH_FACTOR}"
   echo "BATCH_SIZE=${batch_size}"
   echo "GRAD_ACCUM_STEPS=${grad_accum_steps}"
   echo "EFFECTIVE_BATCH=${effective_batch}"

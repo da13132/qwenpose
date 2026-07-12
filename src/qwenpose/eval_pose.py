@@ -37,7 +37,9 @@ from qwenpose.train_pose import (
     LocatePoseUnifiedRuntime,
     QwenPoseTrainingModel,
     checkpoint_step,
+    locate_boxes_abs_from_responses,
     move_batch_to_device,
+    nms_box_indices_xyxy,
     prepare_box_conditioning,
     prepare_locate_generated_box_conditioning_from_responses,
     save_pose_visualization,
@@ -311,6 +313,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_vllm_trust_remote_code", dest="vllm_trust_remote_code", action="store_false")
     parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
     parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
+    parser.add_argument(
+        "--disable_pre_pose_nms",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--post_pose_nms_iou_thresh", type=float, default=0.95)
     parser.add_argument("--disable_refinement", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -471,7 +479,12 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
     return model, backbone_processor
 
 
-def tensor_to_prediction_rows(outputs: dict[str, torch.Tensor], batch: dict, args: argparse.Namespace) -> list[dict]:
+def tensor_to_prediction_rows(
+    outputs: dict[str, torch.Tensor],
+    batch: dict,
+    args: argparse.Namespace,
+    raw_boxes_abs: list[list[list[float]]] | None = None,
+) -> list[dict]:
     rows: list[dict] = []
     person_scores = outputs["person_logits"].sigmoid().detach().cpu()
     ref_logits = outputs["ref_logits"].detach().cpu()
@@ -484,6 +497,24 @@ def tensor_to_prediction_rows(outputs: dict[str, torch.Tensor], batch: dict, arg
         width = float(target["width"])
         height = float(target["height"])
         task_id = int(batch["task_ids"][b].cpu().item())
+        detection_boxes = boxes[b].clone()
+        sample_raw_boxes = (
+            raw_boxes_abs[b]
+            if raw_boxes_abs is not None and b < len(raw_boxes_abs)
+            else []
+        )
+        for query_idx, raw_box in enumerate(sample_raw_boxes[: int(detection_boxes.shape[0])]):
+            if len(raw_box) != 4:
+                continue
+            detection_boxes[query_idx] = torch.tensor(
+                [
+                    float(raw_box[0]) / max(width, 1.0),
+                    float(raw_box[1]) / max(height, 1.0),
+                    float(raw_box[2]) / max(width, 1.0),
+                    float(raw_box[3]) / max(height, 1.0),
+                ],
+                dtype=detection_boxes.dtype,
+            ).clamp(0.0, 1.0)
         valid = torch.nonzero(box_mask_cpu[b], as_tuple=False).flatten()
         if task_id == 1:
             selected = [int(valid[0].item())] if valid.numel() > 0 else []
@@ -491,17 +522,38 @@ def tensor_to_prediction_rows(outputs: dict[str, torch.Tensor], batch: dict, arg
             keep = valid[person_scores[b, valid] >= args.score_threshold] if valid.numel() > 0 else valid
             if keep.numel() == 0 and valid.numel() > 0:
                 keep = valid[:1]
-            selected = keep[: args.max_predictions_per_image].tolist()
+            if keep.numel() > 0:
+                schema_valid = outputs.get("keypoint_valid_mask")
+                if schema_valid is not None:
+                    valid_joints = schema_valid[b].detach().cpu().bool()
+                    valid_count = valid_joints.float().sum().clamp(min=1.0)
+                    pose_scores = (
+                        keypoints[b, keep, :, 2] * valid_joints.float().view(1, -1)
+                    ).sum(dim=-1) / valid_count
+                else:
+                    pose_scores = keypoints[b, keep, :, 2].mean(dim=-1)
+            else:
+                pose_scores = torch.zeros(0)
+            kept_local = nms_box_indices_xyxy(
+                detection_boxes[keep],
+                pose_scores,
+                iou_thresh=float(getattr(args, "post_pose_nms_iou_thresh", 0.95)),
+                max_boxes=args.max_predictions_per_image,
+            )
+            selected = [int(keep[idx].item()) for idx in kept_local]
 
         predictions = []
         for query_idx in selected:
-            box = boxes[b, query_idx].tolist()
-            box_abs = [
-                box[0] * width,
-                box[1] * height,
-                box[2] * width,
-                box[3] * height,
-            ]
+            box = detection_boxes[query_idx].tolist()
+            if query_idx < len(sample_raw_boxes) and len(sample_raw_boxes[query_idx]) == 4:
+                box_abs = [float(value) for value in sample_raw_boxes[query_idx]]
+            else:
+                box_abs = [
+                    box[0] * width,
+                    box[1] * height,
+                    box[2] * width,
+                    box[3] * height,
+                ]
             pose_box = pose_boxes[b, query_idx].tolist()
             pose_box_abs = [
                 pose_box[0] * width,
@@ -589,6 +641,8 @@ def main() -> None:
         raise ValueError("--box_match_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
+    if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
+        raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
     if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
     if args.box_source == "locate_generate" and args.backbone != "eagle":
@@ -756,6 +810,7 @@ def main() -> None:
                     batch = move_batch_to_device(batch, device)
                     prep_time = time.perf_counter() - prep_started
                     forward_started = time.perf_counter()
+                    raw_boxes_abs_for_rows: list[list[list[float]]] | None = None
                     if use_vllm_integrated:
                         if vllm_generator is None:
                             raise RuntimeError("Integrated vLLM generator is not initialized.")
@@ -779,6 +834,7 @@ def main() -> None:
                             max_instances=unified_config.max_instances,
                             match_iou_thresh=unified_config.box_match_iou_thresh,
                             nms_iou_thresh=unified_config.box_nms_iou_thresh,
+                            disable_pre_pose_nms=unified_config.disable_pre_pose_nms,
                         )
                         outputs = vllm_generator.run_pose(
                             batch,
@@ -786,6 +842,13 @@ def main() -> None:
                             target_box_mask,
                             feature_map,
                             text_embed,
+                        )
+                        raw_boxes_abs_for_rows = locate_boxes_abs_from_responses(
+                            responses,
+                            batch,
+                            max_instances=unified_config.max_instances,
+                            nms_iou_thresh=unified_config.box_nms_iou_thresh,
+                            disable_pre_pose_nms=unified_config.disable_pre_pose_nms,
                         )
                         actual_vllm_integrated_features_used = True
                     else:
@@ -799,6 +862,7 @@ def main() -> None:
                         outputs = unified_result.outputs
                         pose_targets = unified_result.pose_targets or batch["targets"]
                         gt_targets_for_eval = unified_result.gt_targets or pose_targets
+                        raw_boxes_abs_for_rows = unified_result.locate_boxes_abs
                         actual_single_pass_features_used = (
                             actual_single_pass_features_used or unified_result.used_single_pass_features
                         )
@@ -807,7 +871,12 @@ def main() -> None:
                     for key, value in loss_dict.items():
                         totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
 
-                    rows = tensor_to_prediction_rows(outputs, {**batch, "targets": gt_targets_for_eval}, args)
+                    rows = tensor_to_prediction_rows(
+                        outputs,
+                        {**batch, "targets": gt_targets_for_eval},
+                        args,
+                        raw_boxes_abs=raw_boxes_abs_for_rows,
+                    )
                     for local_idx, row in enumerate(rows):
                         f.write(json.dumps(row, ensure_ascii=False) + "\n")
                         ds_name = row.get("dataset", "unknown")

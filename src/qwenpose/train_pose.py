@@ -16,6 +16,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    from scipy.optimize import linear_sum_assignment as _scipy_linear_sum_assignment
+except Exception:  # pragma: no cover - deterministic greedy fallback keeps minimal envs usable.
+    _scipy_linear_sum_assignment = None
 from torch.utils.data.distributed import DistributedSampler
 
 try:
@@ -94,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         type=str,
-        default="coco,mpii,crowdpose,aic,refhuman",
+        default="coco,mpii,crowdpose,refhuman",
         help="Comma-separated datasets. RefHuman contributes REF_POSE; others contribute ALL_POSE.",
     )
     parser.add_argument("--max_instances", type=int, default=80)
@@ -266,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--qwen_lora_lr_scale", type=float, default=1.0)
     parser.add_argument("--qwen_vision_lr_scale", type=float, default=0.01)
-    parser.add_argument("--locate_vision_scale", type=float, default=0.02)
+    parser.add_argument("--locate_vision_scale", type=float, default=0.10)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -334,9 +339,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_generation_mode", choices=["fast", "slow", "hybrid"], default="hybrid")
     parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
     parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
+    parser.add_argument(
+        "--disable_pre_pose_nms",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep every parsed Locate box until after PoseHead; recommended for crowded people.",
+    )
+    parser.add_argument("--post_pose_nms_iou_thresh", type=float, default=0.95)
     parser.add_argument("--w_locate_box_lm", type=float, default=0.0)
     parser.add_argument("--w_locate_point_lm", type=float, default=0.0)
-    parser.add_argument("--locate_lm_loss_every", type=int, default=2)
+    parser.add_argument("--locate_lm_loss_every", type=int, default=1)
     parser.add_argument("--locate_lm_max_instances", type=int, default=20)
     parser.add_argument("--locate_lm_max_points", type=int, default=8)
     parser.add_argument("--disable_locate_grounding_aux", action="store_true")
@@ -387,6 +399,80 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     batch["schema_ids"] = batch["schema_ids"].to(device, non_blocking=True)
     batch["task_ids"] = batch["task_ids"].to(device, non_blocking=True)
     return batch
+
+
+def validate_pose_batch_contract(batch: dict) -> None:
+    """Validate the canonical pose-target schema before loading large models."""
+    targets = batch.get("targets")
+    task_ids = batch.get("task_ids")
+    if not isinstance(targets, list) or not torch.is_tensor(task_ids):
+        raise TypeError("Pose batch requires a target list and tensor task_ids.")
+    if len(targets) != int(task_ids.numel()):
+        raise ValueError(
+            f"Pose batch size mismatch: targets={len(targets)} task_ids={int(task_ids.numel())}."
+        )
+
+    union_count = len(UNION_KEYPOINTS)
+    for sample_idx, target in enumerate(targets):
+        if not isinstance(target, dict):
+            raise TypeError(f"Pose target {sample_idx} must be a dict.")
+        context = (
+            f"sample={sample_idx} dataset={target.get('dataset', '')!r} "
+            f"image_id={target.get('image_id', '')!r}"
+        )
+        boxes = target.get("boxes")
+        keypoints = target.get("keypoints")
+        keypoint_valid = target.get("keypoint_valid")
+        if keypoint_valid is None and torch.is_tensor(target.get("keypoint_mask")):
+            keypoint_valid = target["keypoint_mask"]
+            target["keypoint_valid"] = keypoint_valid
+        if not torch.is_tensor(boxes) or boxes.ndim != 2 or boxes.shape[-1] != 4:
+            raise ValueError(f"Invalid boxes for {context}; expected [N,4].")
+        if (
+            not torch.is_tensor(keypoints)
+            or keypoints.ndim != 3
+            or keypoints.shape[1:] != (union_count, 3)
+        ):
+            raise ValueError(
+                f"Invalid keypoints for {context}; expected [N,{union_count},3]."
+            )
+        if (
+            not torch.is_tensor(keypoint_valid)
+            or keypoint_valid.ndim != 2
+            or keypoint_valid.shape[1] != union_count
+        ):
+            available = ", ".join(sorted(str(key) for key in target.keys()))
+            raise ValueError(
+                f"Invalid or missing keypoint_valid for {context}; expected "
+                f"[N,{union_count}]. Available keys: {available}"
+            )
+        instance_count = int(boxes.shape[0])
+        if int(keypoints.shape[0]) != instance_count or int(keypoint_valid.shape[0]) != instance_count:
+            raise ValueError(
+                f"Instance count mismatch for {context}: boxes={instance_count}, "
+                f"keypoints={int(keypoints.shape[0])}, "
+                f"keypoint_valid={int(keypoint_valid.shape[0])}."
+            )
+        visibility_valid = target.get("visibility_valid")
+        if visibility_valid is not None and (
+            not torch.is_tensor(visibility_valid)
+            or tuple(visibility_valid.shape) != tuple(keypoint_valid.shape)
+        ):
+            raise ValueError(
+                f"Invalid visibility_valid for {context}; expected "
+                f"shape {tuple(keypoint_valid.shape)}."
+            )
+        ref_target = target.get("ref_target")
+        task_id = int(task_ids[sample_idx].detach().cpu().item())
+        if task_id == 1:
+            if not torch.is_tensor(ref_target) or ref_target.numel() != 1:
+                raise ValueError(f"REF_POSE target requires scalar ref_target for {context}.")
+            ref_index = int(ref_target.detach().cpu().item())
+            if not 0 <= ref_index < instance_count:
+                raise ValueError(
+                    f"REF_POSE ref_target={ref_index} is out of range for "
+                    f"{instance_count} instances ({context})."
+                )
 
 
 def summarize_batch(batch: dict) -> str:
@@ -586,6 +672,22 @@ def append_batch_trace(trace_handle, record: dict[str, object]) -> None:
     trace_handle.flush()
 
 
+def _spatially_sorted_instance_indices(
+    boxes: torch.Tensor,
+    indices: list[int],
+    max_instances: int,
+) -> list[int]:
+    """Return a deterministic top-to-bottom, then left-to-right instance order."""
+    limited = [int(idx) for idx in indices if 0 <= int(idx) < int(boxes.shape[0])]
+    limited.sort(
+        key=lambda idx: (
+            float((boxes[idx, 1] + boxes[idx, 3]).item()) * 0.5,
+            float((boxes[idx, 0] + boxes[idx, 2]).item()) * 0.5,
+        )
+    )
+    return limited[: max(int(max_instances), 0)]
+
+
 def build_lm_responses(batch: dict, max_instances: int = 10) -> list[str]:
     responses = []
     for sample_idx, target in enumerate(batch["targets"]):
@@ -597,7 +699,11 @@ def build_lm_responses(batch: dict, max_instances: int = 10) -> list[str]:
             ref_target = int(target["ref_target"].detach().cpu().item())
             instance_indices = [ref_target] if 0 <= ref_target < int(boxes.shape[0]) else []
         else:
-            instance_indices = list(range(min(int(boxes.shape[0]), max_instances)))
+            instance_indices = _spatially_sorted_instance_indices(
+                boxes,
+                list(range(int(boxes.shape[0]))),
+                max_instances,
+            )
 
         people = []
         for person_idx in instance_indices:
@@ -643,14 +749,29 @@ def build_locate_grounding_responses(
         width = float(target["width"])
         height = float(target["height"])
         boxes = target["boxes"].detach().cpu()
-        keypoints = target["keypoints"].detach().cpu()
-        keypoint_mask = target["keypoint_mask"].detach().cpu().bool()
+        use_points = int(max_points) > 0
+        keypoints = None
+        keypoint_mask = None
+        if use_points:
+            keypoints_value = target.get("keypoints")
+            keypoint_mask_value = target.get("keypoint_valid", target.get("keypoint_mask"))
+            if keypoints_value is None or keypoint_mask_value is None:
+                raise KeyError(
+                    "Locate point-LM supervision requires target['keypoints'] and "
+                    "target['keypoint_valid'] (legacy alias: target['keypoint_mask'])."
+                )
+            keypoints = keypoints_value.detach().cpu()
+            keypoint_mask = keypoint_mask_value.detach().cpu().bool()
         task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
         if task_id == 1:
             ref_target = int(target["ref_target"].detach().cpu().item())
             instance_indices = [ref_target] if 0 <= ref_target < int(boxes.shape[0]) else []
         else:
-            instance_indices = list(range(min(int(boxes.shape[0]), max_instances)))
+            instance_indices = _spatially_sorted_instance_indices(
+                boxes,
+                list(range(int(boxes.shape[0]))),
+                max_instances,
+            )
         box_chunks: list[str] = []
         point_chunks: list[str] = []
         for person_idx in instance_indices:
@@ -663,15 +784,19 @@ def build_locate_grounding_responses(
                 + _locate_coord_token(box[3] * height, height)
                 + box_end
             )
-            visible_indices = torch.nonzero(keypoint_mask[person_idx], as_tuple=False).flatten().tolist()
-            for joint_idx in visible_indices[: max(0, int(max_points))]:
-                xy = keypoints[person_idx, joint_idx].tolist()
-                point_chunks.append(
-                    box_start
-                    + _locate_coord_token(xy[0] * width, width)
-                    + _locate_coord_token(xy[1] * height, height)
-                    + box_end
-                )
+            if use_points:
+                assert keypoints is not None and keypoint_mask is not None
+                visible_indices = torch.nonzero(
+                    keypoint_mask[person_idx], as_tuple=False
+                ).flatten().tolist()
+                for joint_idx in visible_indices[: int(max_points)]:
+                    xy = keypoints[person_idx, joint_idx].tolist()
+                    point_chunks.append(
+                        box_start
+                        + _locate_coord_token(xy[0] * width, width)
+                        + _locate_coord_token(xy[1] * height, height)
+                        + box_end
+                    )
         box_responses.append("".join(box_chunks) if box_chunks else "None")
         point_responses.append("".join(point_chunks) if point_chunks else "None")
     return box_responses, point_responses
@@ -872,6 +997,33 @@ def nms_boxes_xyxy(boxes: torch.Tensor, iou_thresh: float, max_boxes: int) -> to
     return boxes[torch.as_tensor(keep, dtype=torch.long)]
 
 
+def nms_box_indices_xyxy(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    iou_thresh: float,
+    max_boxes: int,
+) -> list[int]:
+    """Score-ordered NMS that returns indices into the original box tensor."""
+    if boxes.numel() == 0 or max(int(max_boxes), 0) == 0:
+        return []
+    boxes_cpu = boxes.detach().cpu().float().clamp(0.0, 1.0)
+    scores_cpu = scores.detach().cpu().float().reshape(-1)
+    order = torch.argsort(scores_cpu, descending=True).tolist()
+    keep: list[int] = []
+    for idx in order:
+        if len(keep) >= int(max_boxes):
+            break
+        if keep:
+            overlaps = box_iou_xyxy(
+                boxes_cpu[idx : idx + 1],
+                boxes_cpu[torch.as_tensor(keep, dtype=torch.long)],
+            ).flatten()
+            if bool((overlaps > float(iou_thresh)).any().item()):
+                continue
+        keep.append(int(idx))
+    return keep
+
+
 def greedy_match_boxes(
     pred_boxes: torch.Tensor,
     gt_boxes: torch.Tensor,
@@ -898,6 +1050,112 @@ def greedy_match_boxes(
         matches.append((pred_idx, gt_idx, iou))
     matches.sort(key=lambda item: item[0])
     return matches
+
+
+def hungarian_match_boxes(
+    pred_boxes: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    iou_thresh: float,
+) -> list[tuple[int, int, float]]:
+    """Globally match predicted and GT boxes, then reject very-low-IoU pairs."""
+    if pred_boxes.numel() == 0 or gt_boxes.numel() == 0:
+        return []
+    pred = pred_boxes.detach().cpu().float()
+    gt = gt_boxes.detach().cpu().float()
+    ious = box_iou_xyxy(pred, gt)
+    pred_center = (pred[:, :2] + pred[:, 2:]) * 0.5
+    gt_center = (gt[:, :2] + gt[:, 2:]) * 0.5
+    pred_wh = (pred[:, 2:] - pred[:, :2]).clamp(min=1e-4).log()
+    gt_wh = (gt[:, 2:] - gt[:, :2]).clamp(min=1e-4).log()
+    center_cost = torch.cdist(pred_center, gt_center, p=1)
+    size_cost = torch.cdist(pred_wh, gt_wh, p=1)
+    cost = (1.0 - ious) + 0.5 * center_cost + 0.25 * size_cost
+    if not bool(torch.isfinite(cost).all().item()) or _scipy_linear_sum_assignment is None:
+        return greedy_match_boxes(pred, gt, iou_thresh=iou_thresh)
+    pred_indices, gt_indices = _scipy_linear_sum_assignment(cost.numpy())
+    matches: list[tuple[int, int, float]] = []
+    for pred_idx, gt_idx in zip(pred_indices.tolist(), gt_indices.tolist()):
+        iou = float(ious[pred_idx, gt_idx].item())
+        if iou >= float(iou_thresh):
+            matches.append((int(pred_idx), int(gt_idx), iou))
+    matches.sort(key=lambda item: item[0])
+    return matches
+
+
+def align_target_to_predictions(
+    target: dict[str, Any],
+    pred_boxes: torch.Tensor,
+    gt_indices: list[int],
+    matches: list[tuple[int, int, float]],
+    *,
+    task_id: int,
+) -> dict[str, Any]:
+    """Build a query-aligned target; unmatched queries carry no pose supervision."""
+    selected = dict(target)
+    count = int(pred_boxes.shape[0])
+    target_device = target["boxes"].device
+    pred_boxes = pred_boxes.detach().to(
+        device=target_device,
+        dtype=target["boxes"].dtype,
+    )
+    pred_areas = (
+        (pred_boxes[:, 2] - pred_boxes[:, 0]).clamp(min=0.0)
+        * (pred_boxes[:, 3] - pred_boxes[:, 1]).clamp(min=0.0)
+    ).clamp(min=1e-8)
+
+    selected["boxes"] = pred_boxes.clone()
+    selected["loss_boxes"] = pred_boxes.clone()
+    selected["loss_areas"] = pred_areas.clone()
+    for key in ("keypoints", "keypoint_valid", "visibility_valid"):
+        template = target[key]
+        selected[key] = template.new_zeros((count, *template.shape[1:]))
+
+    fallback_context = _context_scale_for_indices(target, [], count)
+    selected["box_context_scale"] = fallback_context.to(
+        device=target_device,
+        dtype=torch.float32,
+    )
+    selected["box_jitter_scale"] = torch.zeros(
+        count, device=target_device, dtype=torch.float32
+    )
+    selected["box_jitter_shift"] = torch.zeros(
+        count, device=target_device, dtype=torch.float32
+    )
+    matched_gt_indices = torch.full(
+        (count,), -1, device=target_device, dtype=torch.long
+    )
+    match_ious = torch.zeros(count, device=target_device, dtype=torch.float32)
+
+    instance_fields = (
+        "boxes",
+        "loss_boxes",
+        "loss_areas",
+        "keypoints",
+        "keypoint_valid",
+        "visibility_valid",
+        "box_context_scale",
+        "box_jitter_scale",
+        "box_jitter_shift",
+    )
+    ref_query = -1
+    for pred_idx, local_gt_idx, iou in matches:
+        if not (0 <= local_gt_idx < len(gt_indices) and 0 <= pred_idx < count):
+            continue
+        original_gt_idx = int(gt_indices[local_gt_idx])
+        for key in instance_fields:
+            if key in target:
+                selected[key][pred_idx] = target[key][original_gt_idx]
+        matched_gt_indices[pred_idx] = original_gt_idx
+        match_ious[pred_idx] = float(iou)
+        if task_id == 1:
+            ref_query = pred_idx
+
+    selected["matched_gt_indices"] = matched_gt_indices
+    selected["match_ious"] = match_ious
+    selected["ref_target"] = torch.tensor(
+        ref_query, device=target_device, dtype=torch.long
+    )
+    return selected
 
 
 def _extract_first_json_object(text: str) -> str | None:
@@ -1256,6 +1514,65 @@ def parse_locate_bbox_response(text: str, max_instances: int) -> torch.Tensor:
     return torch.tensor(boxes, dtype=torch.float32).clamp_(0.0, 1.0)
 
 
+def parse_locate_boxes_for_task(
+    response: str,
+    *,
+    task_id: int,
+    max_instances: int,
+    nms_iou_thresh: float,
+    disable_pre_pose_nms: bool,
+) -> torch.Tensor:
+    """Parse one Locate response with the exact train/eval/infer filtering policy."""
+    boxes = parse_locate_bbox_response(response, max_instances=max_instances)
+    if disable_pre_pose_nms:
+        boxes = boxes[:max_instances]
+    else:
+        boxes = nms_boxes_xyxy(
+            boxes,
+            iou_thresh=nms_iou_thresh,
+            max_boxes=max_instances,
+        )
+    if int(task_id) == 1 and int(boxes.shape[0]) > 1:
+        boxes = boxes[:1]
+    return boxes
+
+
+def locate_boxes_abs_from_responses(
+    responses: list[str],
+    batch: dict,
+    *,
+    max_instances: int,
+    nms_iou_thresh: float,
+    disable_pre_pose_nms: bool,
+) -> list[list[list[float]]]:
+    """Return raw Locate boxes in image pixels, before PoseHead context expansion."""
+    output: list[list[list[float]]] = []
+    for sample_idx, target in enumerate(batch["targets"]):
+        task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+        response = responses[sample_idx] if sample_idx < len(responses) else ""
+        boxes = parse_locate_boxes_for_task(
+            response,
+            task_id=task_id,
+            max_instances=max_instances,
+            nms_iou_thresh=nms_iou_thresh,
+            disable_pre_pose_nms=disable_pre_pose_nms,
+        )
+        width = float(target["width"])
+        height = float(target["height"])
+        output.append(
+            [
+                [
+                    float(box[0]) * width,
+                    float(box[1]) * height,
+                    float(box[2]) * width,
+                    float(box[3]) * height,
+                ]
+                for box in boxes.detach().cpu().tolist()
+            ]
+        )
+    return output
+
+
 def _normalize_locate_generate_output(response: object) -> str:
     if isinstance(response, tuple) and response:
         response = response[0]
@@ -1338,6 +1655,7 @@ def prepare_locate_generated_box_conditioning(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     image_token_limit: int | None = None,
+    disable_pre_pose_nms: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
     responses = generate_locate_bbox_responses(
         training_model,
@@ -1357,6 +1675,7 @@ def prepare_locate_generated_box_conditioning(
         max_instances=max_instances,
         match_iou_thresh=match_iou_thresh,
         nms_iou_thresh=nms_iou_thresh,
+        disable_pre_pose_nms=disable_pre_pose_nms,
     )
 
 
@@ -1368,8 +1687,9 @@ def prepare_locate_generated_box_conditioning_from_responses(
     *,
     match_iou_thresh: float,
     nms_iou_thresh: float,
+    disable_pre_pose_nms: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
-    selected_targets: list[dict[str, torch.Tensor]] = []
+    selected_targets: list[dict[str, Any]] = []
     selected_condition_boxes: list[torch.Tensor] = []
     for sample_idx, target in enumerate(batch["targets"]):
         task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
@@ -1383,34 +1703,28 @@ def prepare_locate_generated_box_conditioning_from_responses(
         gt_index_tensor = torch.as_tensor(gt_indices, dtype=torch.long)
         gt_boxes = gt_boxes_all[gt_index_tensor].clone() if gt_indices else gt_boxes_all[:0].clone()
 
-        pred_boxes = parse_locate_bbox_response(
+        pred_boxes = parse_locate_boxes_for_task(
             responses[sample_idx] if sample_idx < len(responses) else "",
+            task_id=task_id,
             max_instances=max_instances,
+            nms_iou_thresh=nms_iou_thresh,
+            disable_pre_pose_nms=disable_pre_pose_nms,
         )
-        pred_boxes = nms_boxes_xyxy(pred_boxes, iou_thresh=nms_iou_thresh, max_boxes=max_instances)
-        matches = greedy_match_boxes(pred_boxes, gt_boxes, iou_thresh=match_iou_thresh)
-        pred_match_indices = [pred_idx for pred_idx, _, _ in matches]
-        gt_match_indices = [gt_idx for _, gt_idx, _ in matches]
-        pred_index_tensor = torch.as_tensor(pred_match_indices, dtype=torch.long)
-        matched_gt_index_tensor = torch.as_tensor(gt_match_indices, dtype=torch.long)
 
-        if matches:
-            matched_original_indices = gt_index_tensor[matched_gt_index_tensor].tolist()
-            selected = _select_target_instances(
-                target, matched_original_indices, task_id=task_id
-            )
-            condition_boxes = pred_boxes[pred_index_tensor].clone()
-            context_scale = selected.get(
-                "box_context_scale",
-                torch.ones(condition_boxes.shape[0], dtype=condition_boxes.dtype),
-            )
-            condition_boxes = expand_boxes_xyxy_per_box(
-                condition_boxes, context_scale
-            )
-            selected_condition_boxes.append(condition_boxes[:max_instances].clone())
-        else:
-            selected = _select_target_instances(target, [], task_id=task_id)
-            selected_condition_boxes.append(gt_boxes_all[:0].clone())
+        matches = hungarian_match_boxes(pred_boxes, gt_boxes, iou_thresh=match_iou_thresh)
+        selected = align_target_to_predictions(
+            target,
+            pred_boxes,
+            gt_indices,
+            matches,
+            task_id=task_id,
+        )
+        context_scale = selected.get(
+            "box_context_scale",
+            torch.ones(pred_boxes.shape[0], dtype=pred_boxes.dtype),
+        )
+        condition_boxes = expand_boxes_xyxy_per_box(pred_boxes, context_scale)
+        selected_condition_boxes.append(condition_boxes[:max_instances].clone())
         selected_targets.append(selected)
 
     max_boxes = max([int(boxes.shape[0]) for boxes in selected_condition_boxes] + [1])
@@ -1665,6 +1979,8 @@ class LocatePoseUnifiedConfig:
     locate_generation_mode: str = "hybrid"
     box_match_iou_thresh: float = 0.10
     box_nms_iou_thresh: float = 0.70
+    disable_pre_pose_nms: bool = True
+    post_pose_nms_iou_thresh: float = 0.95
     qwen_min_pixels: int | None = None
     qwen_max_pixels: int | None = None
     eagle_min_pixels: int | None = None
@@ -1692,6 +2008,8 @@ class LocatePoseUnifiedConfig:
             locate_generation_mode=str(getattr(args, "locate_generation_mode", "hybrid")),
             box_match_iou_thresh=float(getattr(args, "box_match_iou_thresh", 0.10)),
             box_nms_iou_thresh=float(getattr(args, "box_nms_iou_thresh", 0.70)),
+            disable_pre_pose_nms=bool(getattr(args, "disable_pre_pose_nms", True)),
+            post_pose_nms_iou_thresh=float(getattr(args, "post_pose_nms_iou_thresh", 0.95)),
             qwen_min_pixels=getattr(args, "qwen_min_pixels", None),
             qwen_max_pixels=getattr(args, "qwen_max_pixels", None),
             eagle_min_pixels=getattr(args, "eagle_min_pixels", None),
@@ -1818,14 +2136,13 @@ class LocatePoseUnifiedRuntime:
         locate_boxes_abs: list[list[list[float]]] = []
         for sample_idx, response in enumerate(responses):
             task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
-            boxes = parse_locate_bbox_response(response, max_instances=config.max_instances)
-            boxes = nms_boxes_xyxy(
-                boxes,
-                iou_thresh=config.box_nms_iou_thresh,
-                max_boxes=config.max_instances,
+            boxes = parse_locate_boxes_for_task(
+                response,
+                task_id=task_id,
+                max_instances=config.max_instances,
+                nms_iou_thresh=config.box_nms_iou_thresh,
+                disable_pre_pose_nms=config.disable_pre_pose_nms,
             )
-            if task_id == 1 and boxes.shape[0] > 1:
-                boxes = boxes[:1]
 
             target = batch["targets"][sample_idx]
             width = float(target["width"])
@@ -1963,6 +2280,7 @@ class LocatePoseUnifiedRuntime:
                 min_pixels=config.eagle_min_pixels,
                 max_pixels=config.eagle_max_pixels,
                 image_token_limit=config.eagle_image_token_limit,
+                disable_pre_pose_nms=config.disable_pre_pose_nms,
             )
         return prepare_box_conditioning(
             batch["targets"],
@@ -1990,6 +2308,7 @@ class LocatePoseUnifiedRuntime:
         external_feature_map = None
         external_text_embed = None
         responses: list[str] | None = None
+        locate_boxes_abs: list[list[list[float]]] | None = None
         if box_source == "qwen_generate":
             target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
                 self.model,
@@ -2014,6 +2333,7 @@ class LocatePoseUnifiedRuntime:
                     max_instances=config.max_instances,
                     match_iou_thresh=config.box_match_iou_thresh,
                     nms_iou_thresh=config.box_nms_iou_thresh,
+                    disable_pre_pose_nms=config.disable_pre_pose_nms,
                 )
             elif config.use_single_pass_features:
                 responses, external_feature_map, external_text_embed = self.generate_locate_responses(batch, config)
@@ -2024,22 +2344,26 @@ class LocatePoseUnifiedRuntime:
                     max_instances=config.max_instances,
                     match_iou_thresh=config.box_match_iou_thresh,
                     nms_iou_thresh=config.box_nms_iou_thresh,
+                    disable_pre_pose_nms=config.disable_pre_pose_nms,
                 )
             else:
-                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning(
-                    self.model,
-                    self.processor,
+                responses, _, _ = self.generate_locate_responses(batch, config)
+                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                    responses,
                     batch,
                     self.device,
                     max_instances=config.max_instances,
-                    max_new_tokens=config.locate_box_max_new_tokens,
-                    generation_mode=config.locate_generation_mode,
                     match_iou_thresh=config.box_match_iou_thresh,
                     nms_iou_thresh=config.box_nms_iou_thresh,
-                    min_pixels=config.eagle_min_pixels,
-                    max_pixels=config.eagle_max_pixels,
-                    image_token_limit=config.eagle_image_token_limit,
+                    disable_pre_pose_nms=config.disable_pre_pose_nms,
                 )
+            locate_boxes_abs = locate_boxes_abs_from_responses(
+                responses or [],
+                batch,
+                max_instances=config.max_instances,
+                nms_iou_thresh=config.box_nms_iou_thresh,
+                disable_pre_pose_nms=config.disable_pre_pose_nms,
+            )
         else:
             target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
                 batch["targets"],
@@ -2064,6 +2388,7 @@ class LocatePoseUnifiedRuntime:
             pose_targets=pose_targets,
             gt_targets=gt_targets_for_eval,
             locate_responses=responses,
+            locate_boxes_abs=locate_boxes_abs,
             external_feature_map=external_feature_map,
             external_text_embed=external_text_embed,
             qwen_inputs=qwen_inputs,
@@ -2422,14 +2747,24 @@ def compute_pose_diagnostics(
             is_ref = int(task_ids[sample_idx].detach().cpu().item()) == 1
             if is_ref:
                 ref_total += 1
-                ref_matched += int(n > 0)
+                matched_gt_indices = target.get("matched_gt_indices")
+                if isinstance(matched_gt_indices, torch.Tensor):
+                    ref_matched += int(bool((matched_gt_indices[:n] >= 0).any().item()))
+                else:
+                    ref_matched += int(n > 0)
             if n <= 0:
                 continue
 
             queries = valid_queries[:n]
-            pred = outputs["keypoints"][sample_idx, queries, :, :2]
             gt = target["keypoints"].to(device)[:n, :, :2]
             valid = target["keypoint_valid"].to(device)[:n].bool()
+            supervised_people = valid.any(dim=-1)
+            if not supervised_people.any():
+                continue
+            queries = queries[supervised_people]
+            gt = gt[supervised_people]
+            valid = valid[supervised_people]
+            pred = outputs["keypoints"][sample_idx, queries, :, :2]
             valid_f = valid.float()
             joint_count = valid_f.sum()
             if joint_count <= 0:
@@ -2438,7 +2773,7 @@ def compute_pose_diagnostics(
             image_joint_error = (pred - gt).abs().mean(dim=-1)
             image_error_sum = image_error_sum + (image_joint_error * valid_f).sum()
 
-            loss_boxes = target.get("loss_boxes", target["boxes"]).to(device)[:n]
+            loss_boxes = target.get("loss_boxes", target["boxes"]).to(device)[:n][supervised_people]
             loss_wh = (loss_boxes[:, 2:] - loss_boxes[:, :2]).clamp(min=1e-4)
             box_joint_error = (
                 (pred - gt).abs() / loss_wh[:, None, :]
@@ -2457,7 +2792,7 @@ def compute_pose_diagnostics(
             valid_joint_count = valid_joint_count + joint_count
 
             if str(target.get("dataset", "")).lower() == "mpii":
-                condition_boxes = target["boxes"].to(device)[:n]
+                condition_boxes = target["boxes"].to(device)[:n][supervised_people]
                 condition_wh = (
                     condition_boxes[:, 2:] - condition_boxes[:, :2]
                 ).clamp(min=0.0)
@@ -3595,6 +3930,15 @@ def main() -> None:
         raise ValueError("--box_match_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
+    if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
+        raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
+    if args.w_locate_box_lm < 0.0 or args.w_locate_point_lm < 0.0:
+        raise ValueError("Locate grounding LM weights must be non-negative.")
+    if args.w_locate_box_lm > 0.0 and args.w_locate_point_lm > 0.0:
+        raise ValueError(
+            "Box and point Locate LM losses require separate forward passes; enable only one. "
+            "The LocatePose recipe uses --w_locate_box_lm > 0 and --w_locate_point_lm 0."
+        )
     if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
     if args.box_source == "locate_generate" and args.backbone != "eagle":
@@ -3844,6 +4188,7 @@ def main() -> None:
         sampler.set_epoch(0)
     first_batch_started = time.perf_counter()
     first_batch = next(iter(loader))
+    validate_pose_batch_contract(first_batch)
     first_batch_elapsed = time.perf_counter() - first_batch_started
     if is_main_process():
         print(f"First batch warmup ready in {first_batch_elapsed:.2f}s")
@@ -4084,7 +4429,9 @@ def main() -> None:
                 f"generation_mode={args.locate_generation_mode}, "
                 f"max_new_tokens={args.locate_box_max_new_tokens}, "
                 f"match_iou_thresh={args.box_match_iou_thresh}, "
-                f"nms_iou_thresh={args.box_nms_iou_thresh}"
+                f"disable_pre_pose_nms={args.disable_pre_pose_nms}, "
+                f"pre_nms_iou_thresh={args.box_nms_iou_thresh}, "
+                f"post_nms_iou_thresh={args.post_pose_nms_iou_thresh}"
             )
         print(
             "Qwen feature refiner: "
@@ -4388,12 +4735,13 @@ def main() -> None:
                         box_responses, point_responses = build_locate_grounding_responses(
                             batch,
                             max_instances=args.locate_lm_max_instances,
-                            max_points=args.locate_lm_max_points,
+                            max_points=(args.locate_lm_max_points if args.w_locate_point_lm > 0.0 else 0),
                         )
-                        locate_responses = [
-                            "".join(part for part in (box_text, point_text) if part and part != "None") or "None"
-                            for box_text, point_text in zip(box_responses, point_responses)
-                        ]
+                        locate_responses = (
+                            box_responses
+                            if args.w_locate_box_lm > 0.0
+                            else point_responses
+                        )
                         qwen_lm_inputs = build_eagle_lm_inputs(
                             backbone_processor,
                             batch["image_paths"],
@@ -4471,7 +4819,11 @@ def main() -> None:
                         lm_loss = outputs["lm_loss"].float()
                         lm_weight = weights.lm
                         if backbone_name == "eagle":
-                            lm_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
+                            lm_weight = (
+                                float(args.w_locate_box_lm)
+                                if args.w_locate_box_lm > 0.0
+                                else float(args.w_locate_point_lm)
+                            )
                         loss = loss + lm_weight * lm_loss
                         loss_dict["loss_lm"] = lm_loss
                         loss_dict["loss_lm_weight"] = torch.as_tensor(lm_weight, device=loss.device)
@@ -4873,4 +5225,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass

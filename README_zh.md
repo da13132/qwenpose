@@ -1,6 +1,6 @@
 # QwenPose 中文说明
 
-版本：`v2.2`
+版本：`v2.3`
 
 [English](README.md) | 中文
 
@@ -76,7 +76,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v2.2` 快照在以下环境中完成验证：
+这个 `v2.3` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -640,6 +640,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v2.2`
+- Git tag，例如 `v2.3`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

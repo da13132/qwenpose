@@ -1,6 +1,6 @@
 # QwenPose
 
-Release: `v2.2`
+Release: `v2.3`
 
 English | [中文说明](README_zh.md)
 
@@ -76,7 +76,7 @@ qwenpose/
 
 ## Tested Environment
 
-This `v2.2` snapshot was validated with:
+This `v2.3` snapshot was validated with:
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -640,6 +640,6 @@ This repository tracks public snapshots with:
 - `VERSION`: repository version string
 - `CHANGELOG.md`: newest release first
 - `qwenpose.__version__`: Python package version
-- Git tags such as `v2.2`
+- Git tags such as `v2.3`
 
 When publishing a new snapshot, update the code, README, changelog, and tag together so the Git history and the documented workflow stay aligned.

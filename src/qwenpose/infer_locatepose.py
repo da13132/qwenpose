@@ -36,8 +36,8 @@ from qwenpose.train_pose import (
     _context_scale_for_indices,
     expand_boxes_xyxy_per_box,
     move_batch_to_device,
-    nms_boxes_xyxy,
     parse_locate_bbox_response,
+    parse_locate_boxes_for_task,
     prepare_box_conditioning,
     save_pose_visualization,
 )
@@ -199,8 +199,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_single_pass_features", action="store_true", help="禁用 transformers backend 的 Locate/PoseHead 特征复用，回退到两次前向。")
     # --locate_box_max_new_tokens：Locate 生成框文本最大新 token 数；多人图可适当增大。
     parser.add_argument("--locate_box_max_new_tokens", type=int, default=8192, help="Locate 生成框最大新 token 数。")
-    # --box_nms_iou_thresh：Locate 生成框 NMS 阈值；越小去重越强。
-    parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70, help="生成框 NMS IoU 阈值。")
+    # --box_nms_iou_thresh：仅在显式启用 PoseHead 前 NMS 时使用。
+    parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70, help="可选的 PoseHead 前 NMS IoU 阈值。")
+    parser.add_argument(
+        "--disable_pre_pose_nms",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="默认保留全部 Locate 框进入 PoseHead。",
+    )
+    parser.add_argument("--post_pose_nms_iou_thresh", type=float, default=0.95, help="PoseHead 输出后的高阈值去重。")
     # --score_threshold：可视化和结果筛选的关键点/person score 阈值。
     parser.add_argument("--score_threshold", type=float, default=0.05, help="预测分数阈值。")
     # --max_predictions_per_image：每张图最多写出多少个预测实例。
@@ -352,8 +359,7 @@ def prompt_for_format(format_name: str, caption: str = "") -> tuple[str, str, st
         return (
             "REF_POSE",
             schema,
-            "Locate a single person that matches the following description: "
-            f"\"{text}\". Estimate the human pose for the located person.",
+            f'Locate a single person that matches the following description: "{text}".',
         )
     return ("ALL_POSE", schema, ALL_POSE_PROMPT)
 
@@ -996,14 +1002,13 @@ def condition_inference_from_locate_responses(
     raw_locate_boxes_abs: list[list[list[float]]] = []
     for sample_idx, response in enumerate(responses):
         task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
-        boxes = parse_locate_bbox_response(response, max_instances=config.max_instances)
-        boxes = nms_boxes_xyxy(
-            boxes,
-            iou_thresh=config.box_nms_iou_thresh,
-            max_boxes=config.max_instances,
+        boxes = parse_locate_boxes_for_task(
+            response,
+            task_id=task_id,
+            max_instances=config.max_instances,
+            nms_iou_thresh=config.box_nms_iou_thresh,
+            disable_pre_pose_nms=config.disable_pre_pose_nms,
         )
-        if task_id == 1 and boxes.shape[0] > 1:
-            boxes = boxes[:1]
         target = batch["targets"][sample_idx]
         width = float(target["width"])
         height = float(target["height"])
@@ -1087,6 +1092,8 @@ def main() -> None:
         raise ValueError("--worker_index is out of range.")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
+    if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
+        raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
     if args.locate_box_max_new_tokens <= 0:
         raise ValueError("--locate_box_max_new_tokens must be positive.")
     if args.vllm_tensor_parallel_size <= 0:
@@ -1273,7 +1280,12 @@ def main() -> None:
                         actual_single_pass_features_used = (
                             actual_single_pass_features_used or unified_result.used_single_pass_features
                         )
-                    rows = tensor_to_prediction_rows(outputs, batch, args)
+                    rows = tensor_to_prediction_rows(
+                        outputs,
+                        batch,
+                        args,
+                        raw_boxes_abs=locate_boxes_abs,
+                    )
                     for local_idx, row in enumerate(rows):
                         row["caption"] = batch.get("ref_texts", [""] * len(rows))[local_idx]
                         row["locate_response"] = responses[local_idx] if local_idx < len(responses) else ""

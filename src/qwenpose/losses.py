@@ -173,6 +173,19 @@ def compute_box_conditioned_pose_losses(
         gt_keypoints = target["keypoints"].to(device)[:n]
         gt_valid = target["keypoint_valid"].to(device)[:n].bool()
         gt_visibility_valid = target.get("visibility_valid", target["keypoint_valid"]).to(device)[:n].bool()
+
+        supervised_people = gt_valid.any(dim=-1)
+        if not supervised_people.any():
+            continue
+        q = q[supervised_people]
+        gt_boxes = gt_boxes[supervised_people]
+        loss_boxes = loss_boxes[supervised_people]
+        loss_areas = loss_areas[supervised_people]
+        gt_keypoints = gt_keypoints[supervised_people]
+        gt_valid = gt_valid[supervised_people]
+        gt_visibility_valid = gt_visibility_valid[supervised_people]
+        n = int(supervised_people.sum().item())
+
         pred_keypoints = outputs["keypoints"][b, q]
         schema_valid = outputs["keypoint_valid_mask"][b].to(device).bool().view(1, -1).expand(n, -1)
 

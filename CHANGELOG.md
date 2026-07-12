@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## v2.3 - 2026-07-12
+
+- Reworked LocatePose Stage 2 into trainable human grounding: LocateAnything LoRA and vision LoRA are unfrozen, bbox grounding LM supervision is enabled at `0.10`, point-token supervision is disabled, and the same native Locate prompt is used for generation, multimodal features, and LM training. RefHuman retains single-person referring-expression grounding while AIC remains available but disabled in the default dataset lists.
+- Aligned COCO, CrowdPose, MPII, and AIC with a YOLO-Pose-style box/keypoint contract. All valid non-crowd person boxes are retained for bbox supervision, zero-keypoint people are masked out of pose losses, MPII participates in all-person bbox LM training, and the record cache contract is bumped to v11.
+- Preserved every generated Locate proposal through PoseHead training, added Hungarian one-to-one matching for pose supervision, excluded unsupervised queries from pose-loss denominators, disabled pre-PoseHead NMS by default, and added high-threshold post-pose duplicate suppression for crowded scenes.
+- Hardened training and evaluation with legacy `keypoint_mask` compatibility, first-batch target-contract validation before model loading, distributed cleanup on failures, raw Locate bbox export separate from PoseHead context boxes, schema-aware post-NMS scoring, configurable GPU/process environment overrides, and expanded CPU regression coverage.
+
 ## v2.2 - 2026-07-11
 
 - Added synchronized finite-value checks for model outputs, gradients, and trainable parameters. Loss spikes and non-finite gradients now skip the optimizer step consistently on every distributed rank instead of silently replacing invalid values.

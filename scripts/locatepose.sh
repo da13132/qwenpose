@@ -21,7 +21,7 @@ fi
 # 目标模型：LocateAnything-3B + QwenPose PoseHead。
 #
 # Stage 1 / GT-box pose warmup：
-#   只加载 MoonViT 与 mlp1，不实例化语言模型；训练 vision LoRA、PoseHead 和特征适配器；
+#   只加载 MoonViT 与 mlp1，不实例化语言模型；默认冻结 Locate 主干，训练 PoseHead 和特征适配器；
 #   PoseHead 输入 GT box，按固定 optimizer step 快速收敛。
 #
 # Stage 2 / closed-loop Locate-box training：
@@ -59,7 +59,7 @@ Options:
   -h, --help      Show this help message.
 
 Stages:
-  stage1_freeze_locate_gt_box       MoonViT vision-only warmup with vision LoRA and GT boxes
+  stage1_freeze_locate_gt_box       frozen MoonViT vision-only warmup with GT boxes
   stage2_locate_box_closed_loop     full multimodal Locate adapters with generated boxes
 EOF
 }
@@ -398,10 +398,10 @@ case "${ZERO_STAGE}" in
 esac
 # DEEPSPEED_CONFIG：DeepSpeed JSON 配置路径；ZERO_STAGE=none 时为空。
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${DEFAULT_DEEPSPEED_CONFIG}}"
-# CUDA_VISIBLE_DEVICES：可见 GPU 列表。
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+# CUDA_VISIBLE_DEVICES：可见 GPU 列表。尊重环境变量/CLI；未设置时默认 0,1,2,3。
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3}"
 # NPROC_PER_NODE：每个节点启动的训练进程数，一般等于可见 GPU 数。
-export NPROC_PER_NODE="4"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 # MASTER_ADDR：torch.distributed 主节点地址。
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 # MASTER_PORT：torch.distributed 端口；默认随机选一个高位端口。
@@ -557,8 +557,8 @@ DISABLE_REFINEMENT="${DISABLE_REFINEMENT:-0}"
 
 # LR：全局基础学习率；stage 可用 STAGE*_LR 单独覆盖。
 LR="${LR:-2e-4}"
-# LOCATE_VISION_SCALE：LocateAnything vision LoRA 参数学习率相对 LR 的倍率；默认保守，Stage1 显式解冻时避免破坏预训练视觉特征。
-LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.01}"
+# LOCATE_VISION_SCALE：LocateAnything vision LoRA 参数学习率相对 LR 的倍率；Stage2 默认以 0.1 倍主 LR 适配人体检测。
+LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.10}"
 # WEIGHT_DECAY：AdamW weight decay。
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 # GRAD_CLIP：梯度裁剪范数。
@@ -630,10 +630,14 @@ LOCATE_GENERATION_MODE="${LOCATE_GENERATION_MODE:-hybrid}"
 LOCATE_BOX_MAX_NEW_TOKENS="${LOCATE_BOX_MAX_NEW_TOKENS:-8192}"
 # BOX_MATCH_IOU_THRESH：生成框和 GT 框匹配的 IoU 阈值。
 BOX_MATCH_IOU_THRESH="${BOX_MATCH_IOU_THRESH:-0.10}"
-# BOX_NMS_IOU_THRESH：生成框 NMS 阈值。
+# BOX_NMS_IOU_THRESH：仅在显式启用 PoseHead 前 NMS 时使用。
 BOX_NMS_IOU_THRESH="${BOX_NMS_IOU_THRESH:-0.70}"
+# DISABLE_PRE_POSE_NMS：默认保留全部 Locate 框进入 PoseHead，避免拥挤人物被提前抑制。
+DISABLE_PRE_POSE_NMS="${DISABLE_PRE_POSE_NMS:-1}"
+# POST_POSE_NMS_IOU_THRESH：PoseHead 输出后的高阈值重复框去重。
+POST_POSE_NMS_IOU_THRESH="${POST_POSE_NMS_IOU_THRESH:-0.95}"
 # LOCATE_LM_LOSS_EVERY：Locate grounding LM 辅助 loss 计算频率。
-LOCATE_LM_LOSS_EVERY="${LOCATE_LM_LOSS_EVERY:-2}"
+LOCATE_LM_LOSS_EVERY="${LOCATE_LM_LOSS_EVERY:-1}"
 # LOCATE_LM_MAX_INSTANCES：Locate bbox LM answer 中最多监督实例数。
 LOCATE_LM_MAX_INSTANCES="${LOCATE_LM_MAX_INSTANCES:-20}"
 # LOCATE_LM_MAX_POINTS：Locate point LM answer 中每实例最多监督点数。
@@ -711,10 +715,10 @@ STAGE2_BOX_JITTER_SHIFT="${STAGE2_BOX_JITTER_SHIFT:-0.0}"
 STAGE1_W_LOCATE_BOX_LM="${STAGE1_W_LOCATE_BOX_LM:-0}"
 # STAGE1_W_LOCATE_POINT_LM：stage1 Locate point LM 辅助 loss 权重，默认关闭。
 STAGE1_W_LOCATE_POINT_LM="${STAGE1_W_LOCATE_POINT_LM:-0}"
-# STAGE2_W_LOCATE_BOX_LM：stage2 Locate bbox LM 辅助 loss 权重。
-STAGE2_W_LOCATE_BOX_LM="${STAGE2_W_LOCATE_BOX_LM:-0.04}"
-# STAGE2_W_LOCATE_POINT_LM：stage2 Locate point LM 辅助 loss 权重。
-STAGE2_W_LOCATE_POINT_LM="${STAGE2_W_LOCATE_POINT_LM:-0.01}"
+# STAGE2_W_LOCATE_BOX_LM：stage2 Locate bbox grounding LM loss 权重。
+STAGE2_W_LOCATE_BOX_LM="${STAGE2_W_LOCATE_BOX_LM:-0.10}"
+# STAGE2_W_LOCATE_POINT_LM：关键点统一由 PoseHead 输出，默认关闭 Locate point LM。
+STAGE2_W_LOCATE_POINT_LM="${STAGE2_W_LOCATE_POINT_LM:-0}"
 # STAGE1_RESUME_FROM_CHECKPOINT：stage1 断点续训路径。none 表示不续训。
 STAGE1_RESUME_FROM_CHECKPOINT="${STAGE1_RESUME_FROM_CHECKPOINT:-none}"
 # STAGE2_RESUME_FROM_CHECKPOINT：stage2 断点续训路径。none 表示不续训。
@@ -780,7 +784,7 @@ for spec in \
   STAGE1_LOCATE_GRADIENT_CHECKPOINTING STAGE2_LOCATE_GRADIENT_CHECKPOINTING \
   MERGE_FINAL_WEIGHTS LOCATE_GRADIENT_CHECKPOINTING AMP DRY_RUN_DATA PROGRESS_BAR SYNC_TIMING \
   DISABLE_BATCH_TRACE DISABLE_HOMOGENEOUS_BATCHES DISABLE_VISION_TOKEN_BALANCING DISABLE_REFINEMENT DISABLE_LOCATE_GROUNDING_AUX \
-  STAGE1_POSE_AUGMENT STAGE2_POSE_AUGMENT DISABLE_RECORD_CACHE; do
+  DISABLE_PRE_POSE_NMS STAGE1_POSE_AUGMENT STAGE2_POSE_AUGMENT DISABLE_RECORD_CACHE; do
   require_bool "${spec}" "${!spec}"
 done
 
@@ -995,6 +999,12 @@ common_args() {
   a+=(--locate_vision_scale "${LOCATE_VISION_SCALE}")
   a+=(--locate_generation_mode "${LOCATE_GENERATION_MODE}" --locate_box_max_new_tokens "${LOCATE_BOX_MAX_NEW_TOKENS}")
   a+=(--box_match_iou_thresh "${BOX_MATCH_IOU_THRESH}" --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}")
+  a+=(--post_pose_nms_iou_thresh "${POST_POSE_NMS_IOU_THRESH}")
+  if [[ "${DISABLE_PRE_POSE_NMS}" == "1" ]]; then
+    a+=(--disable_pre_pose_nms)
+  else
+    a+=(--no-disable_pre_pose_nms)
+  fi
   a+=(--weight_decay "${WEIGHT_DECAY}" --grad_clip "${GRAD_CLIP}" --warmup_steps "${WARMUP_STEPS}" --min_lr_ratio "${MIN_LR_RATIO}")
   a+=(--log_every "${LOG_EVERY}" --save_every "${SAVE_EVERY}" --save_total_limit "${SAVE_TOTAL_LIMIT}" --seed "${SEED}" --device "${DEVICE}")
   a+=(--w_oks "${W_OKS}" --w_coord "${W_COORD}" --w_image_coord "${W_IMAGE_COORD}" --w_vis "${W_VIS}")
@@ -1098,6 +1108,8 @@ run_stage() {
   echo "LOCATE_BOX_MAX_NEW_TOKENS=${LOCATE_BOX_MAX_NEW_TOKENS}"
   echo "BOX_MATCH_IOU_THRESH=${BOX_MATCH_IOU_THRESH}"
   echo "BOX_NMS_IOU_THRESH=${BOX_NMS_IOU_THRESH}"
+  echo "DISABLE_PRE_POSE_NMS=${DISABLE_PRE_POSE_NMS}"
+  echo "POST_POSE_NMS_IOU_THRESH=${POST_POSE_NMS_IOU_THRESH}"
   echo "LR=${lr}"
   echo "LOCATE_LORA_DROPOUT=${LOCATE_LORA_DROPOUT}"
   echo "LOCATE_VISION_LORA_DROPOUT=${LOCATE_VISION_LORA_DROPOUT}"

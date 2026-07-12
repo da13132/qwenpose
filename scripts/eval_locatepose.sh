@@ -225,8 +225,12 @@ LOCATE_GENERATION_MODE="${LOCATE_GENERATION_MODE:-hybrid}"
 LOCATE_BOX_MAX_NEW_TOKENS="${LOCATE_BOX_MAX_NEW_TOKENS:-8192}"
 # BOX_MATCH_IOU_THRESH：生成框和 GT 框匹配阈值，仅影响 loss 对齐，不改变导出预测框。
 BOX_MATCH_IOU_THRESH="${BOX_MATCH_IOU_THRESH:-0.10}"
-# BOX_NMS_IOU_THRESH：生成框 NMS 阈值，越小去重越强。
+# BOX_NMS_IOU_THRESH：仅在启用 PoseHead 前 NMS 时使用。
 BOX_NMS_IOU_THRESH="${BOX_NMS_IOU_THRESH:-0.70}"
+# DISABLE_PRE_POSE_NMS：默认保留全部 Locate 框进入 PoseHead。
+DISABLE_PRE_POSE_NMS="${DISABLE_PRE_POSE_NMS:-1}"
+# POST_POSE_NMS_IOU_THRESH：PoseHead 输出后的高阈值重复框去重。
+POST_POSE_NMS_IOU_THRESH="${POST_POSE_NMS_IOU_THRESH:-0.95}"
 
 ###############################################################################
 # 输出、可视化与筛选
@@ -306,6 +310,7 @@ args=(
   --locate_box_max_new_tokens "${LOCATE_BOX_MAX_NEW_TOKENS}"
   --box_match_iou_thresh "${BOX_MATCH_IOU_THRESH}"
   --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}"
+  --post_pose_nms_iou_thresh "${POST_POSE_NMS_IOU_THRESH}"
   --score_threshold "${SCORE_THRESHOLD}"
   --max_predictions_per_image "${MAX_PREDICTIONS_PER_IMAGE}"
   --visualize_max_samples "${VISUALIZE_MAX_SAMPLES}"
@@ -323,6 +328,11 @@ args=(
 [[ -n "${LOCATE_IMAGE_TOKEN_LIMIT}" ]] && args+=(--locate_image_token_limit "${LOCATE_IMAGE_TOKEN_LIMIT}")
 [[ "${DISABLE_RECORD_CACHE}" == "1" ]] && args+=(--disable_record_cache)
 [[ "${DISABLE_SINGLE_PASS_FEATURES}" == "1" ]] && args+=(--disable_single_pass_features)
+if [[ "${DISABLE_PRE_POSE_NMS}" == "1" ]]; then
+  args+=(--disable_pre_pose_nms)
+else
+  args+=(--no-disable_pre_pose_nms)
+fi
 [[ "${PROGRESS_BAR}" == "0" ]] && args+=(--disable_progress)
 [[ "${DISABLE_VLLM_FALLBACK}" == "1" ]] && args+=(--disable_vllm_fallback)
 [[ "${VLLM_ENFORCE_EAGER}" == "1" ]] && args+=(--vllm_enforce_eager)
@@ -335,6 +345,8 @@ echo "BOX_SOURCE=${BOX_SOURCE}"
 echo "LOCATE_GENERATION_BACKEND=${LOCATE_GENERATION_BACKEND}"
 echo "SINGLE_PASS_PROMPT=${SINGLE_PASS_PROMPT}"
 echo "DISABLE_SINGLE_PASS_FEATURES=${DISABLE_SINGLE_PASS_FEATURES}"
+echo "DISABLE_PRE_POSE_NMS=${DISABLE_PRE_POSE_NMS}"
+echo "POST_POSE_NMS_IOU_THRESH=${POST_POSE_NMS_IOU_THRESH}"
 echo "VLLM_BATCH_SIZE=${VLLM_BATCH_SIZE}"
 echo "VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS}"
 echo "VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS}"

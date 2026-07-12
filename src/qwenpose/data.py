@@ -34,12 +34,9 @@ from .schemas import (
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 10
+RECORD_CACHE_VERSION = 11
 
-ALL_POSE_PROMPT = (
-    "Locate all the instances that match the following description: person. "
-    "Estimate the human pose for each located person."
-)
+ALL_POSE_PROMPT = "Locate all the instances that match the following description: person."
 
 DATASET_BOX_CONTEXT_SCALE = {
     "coco": 1.15,
@@ -1235,7 +1232,7 @@ def load_coco_records(
     images = {img["id"]: img for img in data["images"]}
     anns_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for ann in data["annotations"]:
-        if ann.get("iscrowd", 0) or ann.get("num_keypoints", 0) <= 0:
+        if ann.get("iscrowd", 0):
             continue
         anns_by_image[ann["image_id"]].append(ann)
     records: list[PoseRecord] = []
@@ -1246,8 +1243,6 @@ def load_coco_records(
             kp, valid, visibility_valid = coco_to_union(
                 ann["keypoints"], img["width"], img["height"]
             )
-            if valid.sum().item() == 0:
-                continue
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(ann["bbox"]), img["width"], img["height"]))
             kpts.append(kp)
             masks.append(valid)
@@ -1279,7 +1274,7 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
     images = {img["id"]: img for img in data["images"]}
     anns_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for ann in data["annotations"]:
-        if ann.get("iscrowd", 0) or ann.get("num_keypoints", 0) <= 0:
+        if ann.get("iscrowd", 0):
             continue
         anns_by_image[ann["image_id"]].append(ann)
     records: list[PoseRecord] = []
@@ -1290,8 +1285,6 @@ def load_crowdpose_records(root: Path, split: str = "train", max_samples: int | 
             kp, valid, visibility_valid = crowdpose_to_union(
                 ann["keypoints"], img["width"], img["height"]
             )
-            if valid.sum().item() == 0:
-                continue
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(ann["bbox"]), img["width"], img["height"]))
             kpts.append(kp)
             masks.append(valid)
@@ -1363,13 +1356,13 @@ def load_aic_records(
         width, height = size
         boxes, kpts, masks, visibility_masks = [], [], [], []
         for human_id, box in item.get("human_annotations", {}).items():
-            if human_id not in item.get("keypoint_annotations", {}):
-                continue
-            kp, valid, visibility_valid = aic_to_union(
-                item["keypoint_annotations"][human_id], width, height
-            )
-            if valid.sum().item() == 0:
-                continue
+            annotation = item.get("keypoint_annotations", {}).get(human_id)
+            if annotation is None:
+                kp = torch.zeros(len(UNION_KEYPOINTS), 3, dtype=torch.float32)
+                valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
+                visibility_valid = torch.zeros(len(UNION_KEYPOINTS), dtype=torch.bool)
+            else:
+                kp, valid, visibility_valid = aic_to_union(annotation, width, height)
             boxes.append(clamp_box_xyxy(box, width, height))
             kpts.append(kp)
             masks.append(valid)
@@ -1426,8 +1419,6 @@ def load_mpii_records(root: Path, split: str = "train", max_samples: int | None 
             kp, valid, visibility_valid = mpii_to_union(
                 ann["joints"], ann["joints_vis"], width, height
             )
-            if valid.sum().item() == 0:
-                continue
             geometry = mpii_boxes_from_center_scale(
                 ann.get("center"), ann.get("scale", 0.0), width, height
             )
@@ -1503,8 +1494,6 @@ def load_refhuman_records(
             kp, valid, visibility_valid = coco_to_union(
                 cand_ann["keypoints"], img["width"], img["height"]
             )
-            if valid.sum().item() == 0:
-                continue
             if cand["candidate_key"] == target_key:
                 ref_target = len(boxes)
             boxes.append(clamp_box_xyxy(xywh_to_xyxy(cand_ann["bbox"]), img["width"], img["height"]))
@@ -1513,11 +1502,7 @@ def load_refhuman_records(
             visibility_masks.append(visibility_valid)
         if ref_target < 0:
             continue
-        prompt = (
-            "Locate a single person that matches the following description: "
-            f"\"{caption}\". "
-            "Estimate the human pose for the located person."
-        )
+        prompt = f'Locate a single person that matches the following description: "{caption}".'
         _record_if_valid(
             records,
             image_root / img["file_name"],

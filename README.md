@@ -6,7 +6,7 @@ English | [中文说明](README_zh.md)
 
 This repository is a public training snapshot for box-conditioned human pose estimation. It contains two maintained workflows built on the same pose head, data pipeline, and evaluation code:
 
-- `LocatePose`: a LocateAnything-3B-based two-stage closed-loop recipe
+- `LocatePose`: a LocateAnything-3B-based two-stage person-query recipe
 - `QwenPose`: a Qwen3-VL-4B-Instruct-based two-stage closed-loop recipe
 
 The public documentation below is ordered in the same way: shared setup first, `LocatePose` first, `QwenPose` second.
@@ -208,10 +208,10 @@ The public code supports `coco`, `aic`, `mpii`, `crowdpose`, and `refhuman`.
 
 Important defaults:
 
-- `LocatePose` stage 1 uses `coco,mpii,crowdpose` with vision-only MoonViT features
-- `LocatePose` stage 2 uses `coco,mpii,crowdpose,refhuman` with the full multimodal Locate path
+- both LocatePose stages use `coco,mpii,crowdpose,refhuman` with raw multimodal features
+- RefHuman trains from Stage 1 through the person-query match and shared pose heads
 - `QwenPose` stage 1 and stage 2 use `coco` by default
-- `RefHuman` is intentionally delayed until stage 2 because it requires text conditioning
+- `RefHuman` requires the LLM text path, which is loaded but frozen in LocatePose Stage 1
 
 ### COCO
 
@@ -302,6 +302,7 @@ Notes:
 
 - RefHuman samples are loaded as referring-person pose tasks
 - The JSON rows must contain the image metadata, boxes, keypoints, and the text description used as the referring expression
+- By default, each person contributes one caption per epoch; its unique captions follow a seed-randomized rotation across epochs
 
 ## DeepSpeed Presets
 
@@ -320,64 +321,41 @@ ZERO_STAGE=zero3_offload bash scripts/locatepose.sh
 ZERO_STAGE=none bash scripts/train_qwenpose_two_stage.sh
 ```
 
-For both `locate_generate` and `qwen_generate` closed-loop training, the public stage-2 recipe currently supports `ZERO_STAGE=zero2` or `ZERO_STAGE=none`.
+The current LocatePose recipe uses person queries in both stages. The legacy QwenPose generated-box recipe supports `ZERO_STAGE=zero2` or `ZERO_STAGE=none`.
 
 ## LocatePose
 
-LocatePose uses `LocateAnything-3B` as the grounding backbone and trains the shared pose head in a two-stage schedule.
+LocatePose uses `LocateAnything-3B` as the grounding backbone and trains one identical 800×800 pose architecture across two stages.
 
 ### Default LocatePose schedule
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | MoonViT only; frozen Locate backbone, train PoseHead | `gt` | `coco,mpii,crowdpose` | `100` with a `60,000`-step cap |
-| stage 2 | `stage2_locate_box_closed_loop` | full multimodal Locate; train all LoRA | `locate_generate` | `coco,mpii,crowdpose,refhuman` | `5` |
+| stage 1 | `stage1_freeze_locate_person_queries` | frozen Locate backbone | `person_queries` | `coco,mpii,crowdpose,refhuman` | `50` |
+| stage 2 | `stage2_unfreeze_locate_person_queries` | selective vision/LLM LoRA | `person_queries` | `coco,mpii,crowdpose,refhuman` | `3` |
 
-In vision-only Stage 1, the loader instantiates only MoonViT and the frozen `mlp1` visual projector, while the Locate backbone remains frozen and the PoseHead is trained. It does not instantiate the Qwen2.5 language model, tokenizer, or dataset prompts. Dataset workers open each image once, apply one synchronized augmentation, pass the same original-resolution uint8 result to MoonViT, and derive the local RGB tensor from that image. Stage 2 loads the complete LocateAnything model and starts multimodal fusion exactly from the normalized Stage-1 visual map before learning the language-conditioned residual.
+Both stages use the same unified RGB pose pyramid and parameter shapes: an 800×800 input produces stride-4/8/16 features at 200×200, 100×100, and 50×50. The old 256 and 640 RGB branches and all SimCC heads are removed. Learned person queries pass through a two-layer human box decoder that predicts objectness and boxes; those same boxes condition the shared keypoint decoder. Box DN and keypoint DN remain enabled.
+
+Both stages load the multimodal Locate backbone and feed the same raw MoonViT feature type (`raw_visual`) to PoseHead. Stage 1 freezes Locate; Stage 2 selectively trains configured vision and LLM LoRA layers. Coordinate generation, `lm_head`, KV-cache generation, generated-box matching, and Locate teacher-forcing loss are not part of training. RefHuman trains an independent expression-to-person matching head against caption-independent person-query detections; the same shared pose decoder is used for every person and receives optional RefHuman text conditioning. Old checkpoints from the generated-box or dual-RGB/SimCC architectures are not compatible with this training path.
 
 Additional default knobs:
 
-- `CUDA_VISIBLE_DEVICES=0,1,2,3`
-- `NPROC_PER_NODE=4`
-- `STAGE1_BATCH_SIZE=32` with `STAGE1_GRAD_ACCUM_STEPS=2` (effective global batch `256` on four GPUs)
-- `STAGE2_BATCH_SIZE=1`
-- `STAGE2_GRAD_ACCUM_STEPS=4`
-- `STAGE1_LR=3e-4`
-- `STAGE1_MAX_STEPS=60000`
-- `STAGE2_LR=5e-5`
-- `STAGE1_LOCATE_FEATURE_SOURCE=vision_only`
-- `STAGE1_LOCATE_TRAIN_SCOPE=frozen`
-- `STAGE1_LOCATE_GRADIENT_CHECKPOINTING=0`
-- `STAGE2_LOCATE_FEATURE_SOURCE=multimodal`
-- `STAGE2_LOCATE_TRAIN_SCOPE=all_lora`
-- `POSE_DROPOUT=0.0`
-- `LOCATE_LORA_DROPOUT=0.0` and `LOCATE_VISION_LORA_DROPOUT=0.0`
-- `LOCATE_VISION_SCALE=0.01` when vision LoRA is explicitly enabled
-- `STAGE1_BOX_JITTER_SCALE=0.0` and `STAGE1_BOX_JITTER_SHIFT=0.0` as global fallbacks; each dataset record carries its own default jitter policy
-- `DATASET_MIX_WEIGHTS=auto` for size-proportional interleaving; use manual weights only for controlled ablations
-- `W_OKS=0.5`
-- `W_COORD=3.0`
-- `W_IMAGE_COORD=5.0`
-- `POSE_ROI_SIZE=32`
-- `SIMCC_BINS=256`
-- `W_COARSE_COORD=0.5`
-- `W_DEFORM_COORD=0.75`
-- `W_REFINE_COORDS=0.75,1.0,1.25`
-- SimCC is computed only once, after the final refinement step
-- `W_SIMCC_COARSE=0.0`
-- `W_SIMCC_DEFORM=0.0`
-- `W_SIMCC_REFINE=0.0,0.0,0.5`
-- `SIMCC_SIGMA=2.0`
-- `LOCATE_IMAGE_TOKEN_LIMIT=4096`
-- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT=STAGE1_BATCH_SIZE*3072` (default `98304` for batch 32)
-- `STAGE2_LOCATE_BATCH_TOKEN_LIMIT=STAGE2_BATCH_SIZE*4096` (default `4096`)
-- cross-rank vision-token cost balancing is enabled by default
-- Stage 1 synchronized pose augmentation is enabled by default; Stage 2 augmentation is disabled
-- default augmentation: horizontal flip `0.5`, affine `0.8` with `±15°`, scale `0.85–1.15`, translation `±8%`, plus moderate color/blur/erase augmentation
-- `LOCATE_GENERATION_MODE=hybrid`
-- `LOCATE_BOX_MAX_NEW_TOKENS=8192`
-- `STAGE2_W_LOCATE_BOX_LM=0.04`
-- `STAGE2_W_LOCATE_POINT_LM=0.01`
+- the LocatePose script forcibly uses physical GPUs `1,2,3` and launches three processes
+- Stage 1: `BATCH_SIZE=1`, `GRAD_ACCUM_STEPS=1`, `LR=2e-4`
+- Stage 2: `BATCH_SIZE=1`, `GRAD_ACCUM_STEPS=4`, `LR=1e-4`
+- image size is fixed at `800`; the Locate feature map is fixed at 100×100 in the public recipe
+- `POSE_PYRAMID_CHANNELS=128`, `POSE_PYRAMID_BLOCKS=3`
+- `POSE_ROI_SIZE=16`, `HUMAN_DECODER_LAYERS=2`, `POSE_DECODER_LAYERS=3`
+- `DEFORMABLE_POINTS=4`, `DEFORMABLE_MIN_RADIUS_CELLS=2.0`
+- `ENABLE_BOX_DENOISING=1`, `MAX_DN_QUERIES=96`, `MAX_DN_GROUPS=4`
+- `DN_POSITIVE_NOISE=0.40`, `DN_NEGATIVE_NOISE=1.00`
+- `W_BOX_OBJECTNESS=1.0`, `W_BOX_L1=5.0`, `W_BOX_GIOU=2.0`, `W_BOX_RELATIVE=1.0`, `W_BOX_DN=1.0`
+- RefHuman: `REF_TEXT_SCALE=0.2`, `W_REF_MATCH=1.0`
+- both stages use `raw_visual` and `person_queries`
+- Stage 2 uses `selective_lora` with vision layers 15–26 and LLM layers 32–35
+- both stages default to `coco:1,mpii:1,crowdpose:1,refhuman:1`; zero and fractional traversal multipliers are supported
+- keypoint coordinates use direct regression only; there is no SimCC branch or fused decoder
+- coordinate generation and synchronized image augmentation are disabled in this raw-visual RefHuman training path
 
 ### Train LocatePose
 
@@ -387,12 +365,10 @@ Start a new run:
 bash scripts/locatepose.sh
 ```
 
-Example with explicit run name and the current 4-GPU default layout:
+Example with an explicit run name; the script always uses physical GPUs 1, 2, and 3:
 
 ```bash
 RUN_NAME=locatepose_v2_2 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=4 \
 ZERO_STAGE=zero2 \
 bash scripts/locatepose.sh
 ```
@@ -400,7 +376,7 @@ bash scripts/locatepose.sh
 Quick data-path smoke test:
 
 ```bash
-DRY_RUN_DATA=1 ZERO_STAGE=none NPROC_PER_NODE=1 bash scripts/locatepose.sh
+DRY_RUN_DATA=1 ZERO_STAGE=none bash scripts/locatepose.sh
 ```
 
 Resume from an existing run, stage directory, checkpoint directory, or checkpoint file:
@@ -415,27 +391,20 @@ bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
 - `DATASET_ROOT`: dataset root, default `datasets`
 - `OUTPUT_ROOT`: training root, default `outputs/locatepose`
 - `ZERO_STAGE`: one of `zero2`, `zero3`, `zero3_offload`, or `none`
-- `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists; vision-only stage 1 must not include RefHuman
-- `STAGE1_LOCATE_FEATURE_SOURCE`, `STAGE2_LOCATE_FEATURE_SOURCE`: `vision_only` for fast pose warmup and `multimodal` for the closed loop
-- `STAGE1_LOCATE_TRAIN_SCOPE`, `STAGE2_LOCATE_TRAIN_SCOPE`: `frozen`, `vision_lora`, or `all_lora`
-- `POSE_DROPOUT`: Transformer dropout inside the pose head, default `0.0`
-- `STAGE1_BOX_JITTER_SCALE`, `STAGE1_BOX_JITTER_SHIFT`: stage-1 GT-box perturbation knobs
-- `LOCATE_ATTN_IMPLEMENTATION`: LocateAnything attention backend used during training, default `flash_attention_2`
-- `SIMCC_BINS`: auxiliary SimCC bins per axis, default `256`; use `0` to disable SimCC entirely
+- `STAGE1_TRAIN_DATASETS`, `STAGE2_TRAIN_DATASETS`: comma-separated dataset lists; both default to all four datasets including RefHuman
+- `STAGE1_DATASET_MIX_WEIGHTS`, `STAGE2_DATASET_MIX_WEIGHTS`: per-epoch traversal multipliers; non-negative integers, decimals, and zero are supported
+- Stage 1 always uses `raw_visual` with a frozen Locate backbone; `STAGE2_LOCATE_TRAIN_SCOPE` defaults to `selective_lora`
+- `POSE_PYRAMID_CHANNELS`, `POSE_PYRAMID_BLOCKS`: unified P2/P3/P4 RGB encoder settings
+- `HUMAN_DECODER_LAYERS`: iterative person-box refinement layers
+- `ENABLE_BOX_DENOISING`, `MAX_DN_QUERIES`, `MAX_DN_GROUPS`, `DN_POSITIVE_NOISE`, `DN_NEGATIVE_NOISE`: box-only denoising settings
+- `W_BOX_OBJECTNESS`, `W_BOX_L1`, `W_BOX_GIOU`, `W_BOX_RELATIVE`, `W_BOX_DN`: human-box loss weights
+- `REF_TEXT_SCALE`: RefHuman text-conditioning scale for the shared pose queries
+- `W_REF_MATCH`: independent RefHuman expression-to-candidate classification loss
+- `REF_POSE_QUALITY_ALPHA`: pose-quality exponent used after the independent RefHuman match score during evaluation/inference
 - `SCHEMA_JOINT_PRIORS_PATH`: JSON file containing schema-specific box-relative joint priors
-- `W_IMAGE_COORD`: full-image normalized coordinate loss weight
-- `W_COARSE_COORD`, `W_DEFORM_COORD`, `W_REFINE_COORDS`: coordinate deep-supervision weights for the coarse, deformable, and refinement stages
-- `W_SIMCC_COARSE`, `W_SIMCC_DEFORM`, `W_SIMCC_REFINE`, `SIMCC_SIGMA`: SimCC auxiliary supervision weights and Gaussian target width
+- `W_IMAGE_COORD`, `W_COARSE_COORD`, `W_DEFORM_COORD`, `W_REFINE_COORDS`: regression and coordinate deep-supervision weights
 - `LOCATE_IMAGE_TOKEN_LIMIT`: raw MoonViT token budget per image
-- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT`, `STAGE2_LOCATE_BATCH_TOKEN_LIMIT`: local micro-batch token budgets; defaults scale with each stage's batch size
-- `DISABLE_VISION_TOKEN_BALANCING`: set to `1` only to disable cross-rank cost-balanced batching
-- `STAGE1_POSE_AUGMENT`, `STAGE2_POSE_AUGMENT`: synchronized pose augmentation switches; defaults are `1` and `0`
-- `AUGMENT_FLIP_PROB`, `AUGMENT_AFFINE_PROB`, `AUGMENT_ROTATE_DEGREES`, `AUGMENT_SCALE_MIN/MAX`, `AUGMENT_TRANSLATE_FRACTION`: geometric augmentation controls
-- `AUGMENT_COLOR_PROB`, `AUGMENT_BRIGHTNESS`, `AUGMENT_CONTRAST`, `AUGMENT_SATURATION`, `AUGMENT_HUE`, `AUGMENT_GRAYSCALE_PROB`, `AUGMENT_BLUR_PROB`, `AUGMENT_ERASE_PROB`: photometric and occlusion controls
-- `LOCATE_GENERATION_MODE`: LocateAnything generation mode, one of `fast`, `slow`, or `hybrid`
-- `LOCATE_VISION_SCALE`: learning-rate multiplier for Locate vision LoRA parameters
-- `BOX_MATCH_IOU_THRESH`, `BOX_NMS_IOU_THRESH`: generated-box matching and NMS thresholds
-- `MERGE_FINAL_WEIGHTS`: currently does not produce a full merged LocateAnything checkpoint in this public script
+- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT`, `STAGE2_LOCATE_BATCH_TOKEN_LIMIT`: local micro-batch token budgets
 
 ### Evaluate LocatePose
 
@@ -445,12 +414,12 @@ Evaluate the latest LocatePose run:
 bash scripts/eval_locatepose.sh
 ```
 
-By default, `scripts/eval_locatepose.sh` uses `LOCATE_GENERATION_BACKEND=vllm`, which runs LocateAnything box generation and PoseHead feature reuse inside the integrated custom vLLM path.
+By default, `scripts/eval_locatepose.sh` evaluates the person-query outputs in one forward pass. Legacy generated-box checkpoints can still opt into `BOX_SOURCE=locate_generate`.
 
 Evaluate a specific checkpoint or stage directory:
 
 ```bash
-CHECKPOINT=outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+CHECKPOINT=outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
 bash scripts/eval_locatepose.sh
 ```
 
@@ -460,16 +429,17 @@ Evaluate on multiple datasets:
 DATASETS=coco,mpii,crowdpose,refhuman bash scripts/eval_locatepose.sh
 ```
 
-Evaluate the GT-box upper bound instead of the closed-loop generated-box path:
+Evaluate the GT-box upper bound instead of the person-query path:
 
 ```bash
 BOX_SOURCE=gt bash scripts/eval_locatepose.sh
 ```
 
-Run the same evaluation without `vllm`:
+For a legacy generated-box checkpoint, select that path explicitly; `transformers` avoids the optional `vllm` dependency:
 
 ```bash
-LOCATE_GENERATION_BACKEND=transformers bash scripts/eval_locatepose.sh
+BOX_SOURCE=locate_generate LOCATE_GENERATION_BACKEND=transformers \
+bash scripts/eval_locatepose.sh
 ```
 
 Outputs are written to:
@@ -486,30 +456,35 @@ Run image or folder inference from a trained LocatePose checkpoint:
 
 ```bash
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --checkpoint outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
   --input demo/images \
   --format coco
 ```
 
-Run the same inference without `vllm`:
+Legacy generated-box inference can still use the Transformers backend explicitly:
 
 ```bash
-LOCATE_GENERATION_BACKEND=transformers \
+BOX_SOURCE=locate_generate LOCATE_GENERATION_BACKEND=transformers \
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --checkpoint outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
   --input demo/images \
   --format crowdpose
 ```
 
+Final keypoint coordinates come exclusively from the direct regression head.
+
 RefHuman caption-conditioned inference example:
 
 ```bash
+REF_POSE_QUALITY_ALPHA=0.25 \
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --checkpoint outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
   --input datasets/refhuman \
   --format refhuman \
   --split val
 ```
+
+RefHuman inference detects all person-query candidates in the same forward pass, scores them with `ref_match_head`, and selects the referred person with `ref_score × pose_quality^0.25`. The selected candidate uses the same shared pose decoder as ordinary all-person inference.
 
 The inference directory writes `summary.json`, `predictions.jsonl`, `predictions.json`, optional format-specific exports, `manifest.json`, and visualizations.
 
@@ -618,8 +593,8 @@ Typical LocatePose run:
 ```text
 outputs/locatepose/<run_name>/
 ├── logs/
-├── stage1_freeze_locate_gt_box/
-└── stage2_locate_box_closed_loop/
+├── stage1_freeze_locate_person_queries/
+└── stage2_unfreeze_locate_person_queries/
 ```
 
 Typical QwenPose run:

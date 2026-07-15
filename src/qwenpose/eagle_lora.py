@@ -20,7 +20,9 @@ from dataclasses import dataclass
 import importlib
 import json
 from pathlib import Path
+import tempfile
 import types
+import warnings
 
 import numpy as np
 import torch
@@ -43,6 +45,154 @@ class EagleLoRAConfig:
     dtype: str = "bfloat16"
     attn_implementation: str = "flash_attention_2"
     gradient_checkpointing: bool = False
+    prune_generation: bool = False
+
+
+class PrunedEagleLMHead(nn.Module):
+    """Zero-parameter sentinel for LocateAnything's unused vocabulary head."""
+
+    def forward(self, *_: object, **__: object) -> torch.Tensor:
+        raise RuntimeError(
+            "LocateAnything autoregressive generation was pruned for this LocatePose run. "
+            "Use the person-query detection/ref/pose heads, or reload with "
+            "prune_generation=False when token generation is explicitly required."
+        )
+
+
+def eagle_generation_is_pruned(model: nn.Module) -> bool:
+    return bool(getattr(get_eagle_base_model(model), "generation_components_pruned", False))
+
+
+def prune_eagle_generation_components(model: nn.Module) -> dict[str, int | bool]:
+    """Remove the generation-only output projection and disable KV caching.
+
+    LocateAnything ties ``lm_head.weight`` to the input token embedding after
+    loading, so deleting the module does not delete the embedding needed by the
+    RefHuman text path.  The important runtime change is that feature extraction
+    calls the decoder directly and never materializes vocabulary logits.
+    """
+    base = get_eagle_base_model(model)
+    language_model = getattr(base, "language_model", None)
+    if language_model is None:
+        return {"lm_head_numel": 0, "lm_head_tied": False}
+    if bool(getattr(base, "generation_components_pruned", False)):
+        return dict(getattr(base, "generation_prune_stats", {}))
+
+    lm_head = getattr(language_model, "lm_head", None)
+    lm_head_weight = getattr(lm_head, "weight", None)
+    input_embeddings = language_model.get_input_embeddings()
+    input_weight = getattr(input_embeddings, "weight", None)
+    tied = bool(
+        isinstance(lm_head_weight, torch.Tensor)
+        and isinstance(input_weight, torch.Tensor)
+        and lm_head_weight.data_ptr() == input_weight.data_ptr()
+    )
+    stats: dict[str, int | bool] = {
+        "lm_head_numel": int(lm_head_weight.numel()) if isinstance(lm_head_weight, torch.Tensor) else 0,
+        "lm_head_tied": tied,
+    }
+    language_model.lm_head = PrunedEagleLMHead()
+
+    for candidate in (
+        base,
+        language_model,
+        getattr(language_model, "model", None),
+    ):
+        cfg = getattr(candidate, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg.use_cache = False
+        generation_cfg = getattr(candidate, "generation_config", None)
+        if generation_cfg is not None and hasattr(generation_cfg, "use_cache"):
+            generation_cfg.use_cache = False
+    base.generation_components_pruned = True
+    base.generation_prune_stats = stats
+    language_model.generation_components_pruned = True
+    return stats
+
+
+def _load_eagle_without_generation_head(
+    model_path: str,
+    eagle_config,
+    *,
+    dtype: torch.dtype | None,
+    text_attn_impl: str,
+) -> nn.Module:
+    """Load a local sharded checkpoint without reading duplicate lm_head data.
+
+    The official checkpoint stores ``lm_head.weight`` even though it is tied to
+    ``embed_tokens.weight``.  A temporary filtered index lets Transformers skip
+    that 152681x2048 tensor while preserving the original checkpoint directory.
+    Unsupported/non-local checkpoint layouts fall back to normal loading and
+    are still pruned immediately afterwards.
+    """
+    from transformers import AutoModel
+
+    root = Path(model_path).expanduser().resolve()
+    index_path = root / "model.safetensors.index.json"
+    auto_map = getattr(eagle_config, "auto_map", None) or {}
+    model_ref = auto_map.get("AutoModel") or auto_map.get("AutoModelForCausalLM")
+    if not index_path.is_file() or not model_ref:
+        warnings.warn(
+            "LocateAnything generation pruning could not filter the checkpoint index; "
+            "loading the full checkpoint once before removing lm_head.",
+            RuntimeWarning,
+        )
+        return AutoModel.from_pretrained(
+            model_path,
+            config=eagle_config,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            attn_implementation=text_attn_impl,
+        )
+
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    with index_path.open("r", encoding="utf-8") as handle:
+        checkpoint_index = json.load(handle)
+    weight_map = checkpoint_index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise TypeError(f"Invalid weight_map in {index_path}")
+    filtered_weight_map = {
+        str(name): str(shard)
+        for name, shard in weight_map.items()
+        if str(name) != "language_model.lm_head.weight"
+    }
+    if len(filtered_weight_map) == len(weight_map):
+        warnings.warn(
+            f"No language_model.lm_head.weight entry found in {index_path}; loading normally.",
+            RuntimeWarning,
+        )
+        return AutoModel.from_pretrained(
+            model_path,
+            config=eagle_config,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            attn_implementation=text_attn_impl,
+        )
+
+    model_class = get_class_from_dynamic_module(str(model_ref), str(root))
+    with tempfile.TemporaryDirectory(prefix="qwenpose-locate-no-generation-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        filtered_index = dict(checkpoint_index)
+        filtered_index["weight_map"] = filtered_weight_map
+        with (temp_dir / index_path.name).open("w", encoding="utf-8") as handle:
+            json.dump(filtered_index, handle)
+        for shard_name in sorted(set(filtered_weight_map.values())):
+            shard_path = root / shard_name
+            if not shard_path.is_file():
+                raise FileNotFoundError(f"Missing LocateAnything weight shard: {shard_path}")
+            (temp_dir / shard_name).symlink_to(shard_path)
+        model = model_class.from_pretrained(
+            str(temp_dir),
+            config=eagle_config,
+            local_files_only=True,
+            torch_dtype=dtype,
+            attn_implementation=text_attn_impl,
+        )
+    # Do not leak the deleted temporary directory into PEFT adapter metadata.
+    model.config._name_or_path = str(root)
+    model.name_or_path = str(root)
+    return model
 
 
 def find_eagle_lora_targets(model: nn.Module) -> tuple[list[str], dict[str, int], dict[str, int]]:
@@ -54,7 +204,10 @@ def find_eagle_lora_targets(model: nn.Module) -> tuple[list[str], dict[str, int]
       - base_model.model.mlp1.* : MLP projector (not targeted)
     """
     llm_suffixes = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
-    vision_suffixes = ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2")
+    # LocateAnything ships a local MoonViT implementation whose attention uses
+    # fused ``wqkv``/``wo`` projections and whose MLP uses ``fc0``/``fc1``.
+    # These names are verified against model.safetensors.index.json.
+    vision_suffixes = ("wqkv", "wo", "fc0", "fc1")
     targets: list[str] = []
     rank_pattern: dict[str, int] = {}
     alpha_pattern: dict[str, int] = {}
@@ -271,13 +424,23 @@ def load_eagle_with_lora(config: EagleLoRAConfig):
     if hasattr(eagle_config, "vision_config"):
         eagle_config.vision_config._attn_implementation = vision_attn_impl
 
-    model = AutoModel.from_pretrained(
-        model_path,
-        config=eagle_config,
-        trust_remote_code=True,
-        torch_dtype=_dtype_from_name(config.dtype),
-        attn_implementation=text_attn_impl,
-    )
+    model_dtype = _dtype_from_name(config.dtype)
+    if config.prune_generation:
+        model = _load_eagle_without_generation_head(
+            model_path,
+            eagle_config,
+            dtype=model_dtype,
+            text_attn_impl=text_attn_impl,
+        )
+        prune_eagle_generation_components(model)
+    else:
+        model = AutoModel.from_pretrained(
+            model_path,
+            config=eagle_config,
+            trust_remote_code=True,
+            torch_dtype=model_dtype,
+            attn_implementation=text_attn_impl,
+        )
     _set_eagle_vision_attention(model, vision_attn_impl)
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
@@ -304,6 +467,11 @@ def load_eagle_with_lora(config: EagleLoRAConfig):
     )
     model = get_peft_model(model, lora_config)
     _set_eagle_vision_attention(model, vision_attn_impl)
+
+    # PEFT does not need the vocabulary projection for feature-extraction LoRA,
+    # but keep the invariant explicit in case a future PEFT version reties it.
+    if config.prune_generation:
+        prune_eagle_generation_components(model)
 
     if config.gradient_checkpointing:
         _enable_gradient_checkpointing(model)
@@ -353,16 +521,10 @@ def count_eagle_lora_parameters(model: nn.Module) -> tuple[int, int]:
 
 
 def _locate_image_token_limit(
-    processor,
-    max_pixels: int | None = None,
     image_token_limit: int | None = None,
 ) -> int | None:
     if image_token_limit is not None and int(image_token_limit) > 0:
         return int(image_token_limit)
-    image_processor = getattr(processor, "image_processor", processor)
-    patch_size = int(getattr(image_processor, "patch_size", 14))
-    if max_pixels is not None and int(max_pixels) > 0:
-        return max(int(max_pixels) // max(patch_size * patch_size, 1), 1)
     return None
 
 
@@ -371,8 +533,6 @@ def build_eagle_inputs(
     image_paths: list[str],
     prompts: list[str] | None,
     device: torch.device,
-    min_pixels: int | None = None,
-    max_pixels: int | None = None,
     image_token_limit: int | None = None,
     batch_token_limit: int | None = None,
     image_tensors: list[torch.Tensor] | None = None,
@@ -384,10 +544,6 @@ def build_eagle_inputs(
     The Eagle image processor handles dynamic resolution internally.
 
     Args:
-        min_pixels: kept only for API compatibility; LocateAnythingProcessor
-            does not consume Qwen-style min_pixels.
-        max_pixels: optional pixel budget converted into LocateAnything's raw
-            MoonViT patch-token limit when image_token_limit is not set.
         image_token_limit: LocateAnything native raw MoonViT patch-token budget
             per image. This controls processor.image_processor.in_token_limit.
         batch_token_limit: Optional raw patch-token budget for the complete local
@@ -416,7 +572,7 @@ def build_eagle_inputs(
 
     is_vision_only = bool(getattr(processor, "_qwenpose_vision_only", False))
     image_processor = getattr(processor, "image_processor", processor)
-    token_limit = _locate_image_token_limit(processor, max_pixels=max_pixels, image_token_limit=image_token_limit)
+    token_limit = _locate_image_token_limit(image_token_limit=image_token_limit)
     if batch_token_limit is not None and int(batch_token_limit) > 0 and images:
         # LocateAnything pads both dimensions to 2x2 patch multiples after the
         # area cap. Keep 12.5% headroom for that rounding so the final packed
@@ -481,24 +637,26 @@ def build_eagle_lm_inputs(
     prompts,
     responses,
     device,
-    min_pixels=None,
-    max_pixels=None,
     image_token_limit=None,
     image_tensors=None,
 ):
+    """Build teacher-forcing inputs for LocateAnything coordinate tokens.
+
+    Only response tokens contribute to the causal-LM loss; image and prompt
+    tokens are masked with ``-100``.  This path intentionally requires the
+    complete LocateAnything model, including its tokenizer and ``lm_head``.
+    """
     if bool(getattr(processor, "_qwenpose_vision_only", False)):
         raise RuntimeError(
-            "Locate grounding LM supervision is unavailable in vision-only Stage 1 "
-            "because no tokenizer or language model is loaded."
+            "Locate grounding LM supervision requires the full LocateAnything "
+            "model; vision-only loading is not supported."
         )
-    mixed_prompts = [p + " " + str(r) for p, r in zip(prompts, responses)]
+    mixed_prompts = [str(prompt) + " " + str(response) for prompt, response in zip(prompts, responses)]
     inputs = build_eagle_inputs(
         processor,
         image_paths,
         mixed_prompts,
         device,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
         image_token_limit=image_token_limit,
         image_tensors=image_tensors,
     )
@@ -507,15 +665,17 @@ def build_eagle_lm_inputs(
         image_paths,
         prompts,
         device,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
         image_token_limit=image_token_limit,
         image_tensors=image_tensors,
     )
     labels = inputs["input_ids"].clone()
     prompt_mask = prompt_inputs.get("attention_mask")
     for row in range(labels.shape[0]):
-        prompt_len = int(prompt_mask[row].sum().item()) if prompt_mask is not None else int(prompt_inputs["input_ids"].shape[1])
+        prompt_len = (
+            int(prompt_mask[row].sum().item())
+            if prompt_mask is not None
+            else int(prompt_inputs["input_ids"].shape[1])
+        )
         labels[row, : min(prompt_len, labels.shape[1])] = -100
     if "attention_mask" in inputs:
         labels = labels.masked_fill(inputs["attention_mask"].eq(0), -100)
@@ -542,35 +702,19 @@ class EagleFeatureExtractor(nn.Module):
         refiner_layers: int = 0,
         refiner_bottleneck_dim: int = 256,
         refiner_init_scale: float = 0.1,
-        feature_source: str = "multimodal",
+        feature_source: str = "raw_visual",
     ) -> None:
         super().__init__()
         self.eagle_model = eagle_model
         self.output_size = output_size
         self.feature_source = str(feature_source)
-        if self.feature_source not in {"vision_only", "multimodal"}:
+        if self.feature_source not in {"vision_only", "raw_visual"}:
             raise ValueError(
                 f"Unsupported Locate feature source {self.feature_source!r}; "
-                "expected 'vision_only' or 'multimodal'."
+                "expected 'vision_only' or 'raw_visual'."
             )
         hidden_size = eagle_hidden_size(eagle_model)
         self.raw_feature_norm = nn.LayerNorm(hidden_size)
-        self.lm_feature_norm = nn.LayerNorm(hidden_size)
-        self.dual_feature_fuse = nn.Sequential(
-            nn.Conv2d(hidden_size * 2, hidden_size, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size),
-            nn.Conv2d(hidden_size, hidden_size, kernel_size=1),
-        )
-        # Start multimodal Stage 2 from the same normalized raw visual map used
-        # by vision-only Stage 1. The zero-initialized branch makes the transition
-        # exact at step zero, while a neutral gate lets Stage 2 learn LM context
-        # promptly instead of waiting for a nearly closed gate to open.
-        self.dual_feature_gate = nn.Parameter(torch.tensor(0.0))
-        final_fuse = self.dual_feature_fuse[-1]
-        nn.init.zeros_(final_fuse.weight)
-        if final_fuse.bias is not None:
-            nn.init.zeros_(final_fuse.bias)
         self.feature_refiner = QwenFeatureRefiner(
             hidden_size,
             num_layers=refiner_layers,
@@ -582,22 +726,22 @@ class EagleFeatureExtractor(nn.Module):
         self,
         eagle_inputs: dict[str, torch.Tensor],
         freeze_eagle: bool = False,
+        require_text: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Stage 1 can use MoonViT features directly and completely skip the 3B
-        # language model. This both preserves local visual detail and removes the
-        # dominant wall-clock cost. Stage 2 switches back to multimodal features.
-        if self.feature_source == "vision_only":
+        # Stage 1 skips the 3B language model entirely. Stage 2/3 use
+        # ``raw_visual`` so the full model and language LoRA are available while
+        # the PoseHead still receives exactly the same MoonViT feature type.
+        if self.feature_source == "vision_only" or not bool(require_text):
             raw_maps, text_embed = self._extract_eagle_vision_features(
                 eagle_inputs,
                 freeze_backbone=bool(freeze_eagle),
             )
-            visual_map = self.normalize_raw_feature_maps(raw_maps)
         else:
-            raw_maps, lm_maps, text_embed = self._extract_eagle_feature_maps(
+            raw_maps, _, text_embed = self._extract_eagle_feature_maps(
                 eagle_inputs,
                 freeze_backbone=bool(freeze_eagle),
             )
-            visual_map = self.fuse_feature_maps(raw_maps, lm_maps)
+        visual_map = self.normalize_raw_feature_maps(raw_maps)
         visual_map = self.feature_refiner(visual_map)
         return visual_map, text_embed
 
@@ -673,17 +817,21 @@ class EagleFeatureExtractor(nn.Module):
         self._ensure_safe_image_processing(lm)
         was_training = lm.training
         lm.eval()
-        lm_outputs = lm(
+        decoder = getattr(lm, "model", None)
+        if decoder is None:
+            raise RuntimeError("LocateAnything language_model has no decoder core.")
+        lm_outputs = decoder(
             input_ids=input_ids,
             visual_features=projected_visual_tokens,
             image_token_index=image_token_id,
             attention_mask=attention_mask,
             use_cache=False,
-            output_hidden_states=True,
+            output_hidden_states=False,
+            return_dict=True,
         )
         if was_training:
             lm.train()
-        return lm_outputs.hidden_states[-1]
+        return lm_outputs.last_hidden_state
 
     def run_language_prefill(
         self,
@@ -692,6 +840,10 @@ class EagleFeatureExtractor(nn.Module):
         projected_visual_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, object]:
         base = get_eagle_base_model(self.eagle_model)
+        if eagle_generation_is_pruned(self.eagle_model):
+            raise RuntimeError(
+                "LocateAnything KV-cache prefill is unavailable because generation components were pruned."
+            )
         image_token_id = int(base.image_token_index)
         lm = base.language_model
         self._ensure_safe_image_processing(lm)
@@ -829,21 +981,6 @@ class EagleFeatureExtractor(nn.Module):
         text_embed = (hidden * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp(min=1.0)
         return raw_maps, lm_maps, text_embed
 
-    def fuse_feature_maps(self, raw_maps: torch.Tensor, lm_maps: torch.Tensor) -> torch.Tensor:
-        raw_maps = self.normalize_raw_feature_maps(raw_maps)
-        adapter_param = self.lm_feature_norm.weight
-        lm_maps = lm_maps.to(device=adapter_param.device, dtype=adapter_param.dtype)
-        b, c, h, w = lm_maps.shape
-        lm_tokens = lm_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        lm_maps = self.lm_feature_norm(lm_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
-        fuse_dtype = next(self.dual_feature_fuse.parameters()).dtype
-        if raw_maps.dtype != fuse_dtype:
-            raw_maps = raw_maps.to(dtype=fuse_dtype)
-            lm_maps = lm_maps.to(dtype=fuse_dtype)
-        fused_delta = self.dual_feature_fuse(torch.cat([raw_maps, lm_maps], dim=1))
-        gate = torch.sigmoid(self.dual_feature_gate).to(device=fused_delta.device, dtype=fused_delta.dtype)
-        return raw_maps + gate * fused_delta
-
     @staticmethod
     def _cache_seq_len(past_key_values: object) -> int:
         if hasattr(past_key_values, "get_seq_length"):
@@ -876,6 +1013,11 @@ class EagleFeatureExtractor(nn.Module):
         states become the PoseHead visual/text features, and the returned KV cache
         is used to continue box generation without a second LocateAnything pass.
         """
+        if eagle_generation_is_pruned(self.eagle_model):
+            raise RuntimeError(
+                "LocateAnything cached autoregressive generation is unavailable because "
+                "generation components were pruned."
+            )
         base = get_eagle_base_model(self.eagle_model)
         token_ids = getattr(base, "token_ids", None)
         generate_globals = getattr(base.generate, "__globals__", {})
@@ -926,7 +1068,7 @@ class EagleFeatureExtractor(nn.Module):
                 projected_vit_list,
                 hidden,
             )
-            feature_map = self.feature_refiner(self.fuse_feature_maps(raw_maps, lm_maps))
+            feature_map = self.feature_refiner(self.normalize_raw_feature_maps(raw_maps))
 
             generated = input_ids.clone()
             tokenizer_max_length = int(getattr(tokenizer, "model_max_length", seq_len + int(max_new_tokens)))
@@ -1080,5 +1222,5 @@ class EagleFeatureExtractor(nn.Module):
         return self.build_feature_maps(input_ids, attention_mask, image_grid_hws, projected_vit_list, hidden)
 
     def _extract_eagle_features(self, eagle_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        raw_maps, lm_maps, text_embed = self._extract_eagle_feature_maps(eagle_inputs, freeze_backbone=False)
-        return self.fuse_feature_maps(raw_maps, lm_maps), text_embed
+        raw_maps, _, text_embed = self._extract_eagle_feature_maps(eagle_inputs, freeze_backbone=False)
+        return self.normalize_raw_feature_maps(raw_maps), text_embed

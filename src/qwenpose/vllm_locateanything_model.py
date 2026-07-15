@@ -387,20 +387,12 @@ class LocateAnythingVLLMForConditionalGeneration(
 
         from qwenpose.qwen_lora import QwenFeatureRefiner
 
-        feature_size = int(os.environ.get("QWENPOSE_VLLM_FEATURE_SIZE", "64"))
+        feature_size = int(os.environ.get("QWENPOSE_VLLM_FEATURE_SIZE", "100"))
         refiner_layers = int(os.environ.get("QWENPOSE_VLLM_FEATURE_REFINER_LAYERS", "2"))
         refiner_bottleneck_dim = int(os.environ.get("QWENPOSE_VLLM_FEATURE_REFINER_BOTTLENECK_DIM", "256"))
         refiner_init_scale = float(os.environ.get("QWENPOSE_VLLM_FEATURE_REFINER_INIT_SCALE", "0.1"))
         self.qwenpose_feature_size = feature_size
         self.raw_feature_norm = nn.LayerNorm(llm_hidden_size)
-        self.lm_feature_norm = nn.LayerNorm(llm_hidden_size)
-        self.dual_feature_fuse = nn.Sequential(
-            nn.Conv2d(llm_hidden_size * 2, llm_hidden_size, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(llm_hidden_size, llm_hidden_size, kernel_size=3, padding=1, groups=llm_hidden_size),
-            nn.Conv2d(llm_hidden_size, llm_hidden_size, kernel_size=1),
-        )
-        self.dual_feature_gate = nn.Parameter(torch.tensor(0.0))
         self.feature_refiner = QwenFeatureRefiner(
             llm_hidden_size,
             num_layers=refiner_layers,
@@ -434,15 +426,12 @@ class LocateAnythingVLLMForConditionalGeneration(
         if isinstance(extractor_state, Mapping):
             adapter_prefixes = (
                 "raw_feature_norm.",
-                "lm_feature_norm.",
-                "dual_feature_fuse.",
-                "dual_feature_gate",
                 "feature_refiner.",
             )
             adapter_state = {
                 key: value
                 for key, value in extractor_state.items()
-                if key == "dual_feature_gate" or key.startswith(adapter_prefixes)
+                if key.startswith(adapter_prefixes)
             }
             self.load_state_dict(adapter_state, strict=False)
             self._qwenpose_feature_adapter_loaded = True
@@ -457,11 +446,23 @@ class LocateAnythingVLLMForConditionalGeneration(
 
         hidden_size = int(self.config.text_config.hidden_size)
         saved_pose_config = checkpoint.get("pose_config") or {}
+        if (
+            "pose_pyramid_channels" not in saved_pose_config
+            or int(saved_pose_config.get("rgb_input_size", 0)) != 800
+        ):
+            raise ValueError(
+                "The vLLM checkpoint predates the unified 800x800 pose pyramid. "
+                "Train a new Stage1 checkpoint before vLLM export."
+            )
         pose_config_kwargs = {
             key: saved_pose_config[key]
             for key in QwenPoseConfig.__dataclass_fields__
             if key in saved_pose_config
         }
+        if "enable_keypoint_denoising" not in saved_pose_config:
+            pose_config_kwargs["enable_keypoint_denoising"] = False
+        if "pose_coordinate_init" not in saved_pose_config:
+            pose_config_kwargs["pose_coordinate_init"] = "schema_prior"
         pose_config_kwargs["external_dim"] = hidden_size
         pose_model = QwenPoseModel(QwenPoseConfig(**pose_config_kwargs))
         pose_model.load_state_dict(checkpoint["model"], strict=True)
@@ -473,24 +474,12 @@ class LocateAnythingVLLMForConditionalGeneration(
         self._qwenpose_pose_loaded = True
         print(f"[qwenpose vLLM] loaded PoseHead from {checkpoint_path}", flush=True)
 
-    def _fuse_qwenpose_feature_maps(self, raw_maps: torch.Tensor, lm_maps: torch.Tensor) -> torch.Tensor:
+    def _normalize_qwenpose_raw_feature_maps(self, raw_maps: torch.Tensor) -> torch.Tensor:
         adapter_param = self.raw_feature_norm.weight
-        adapter_device = adapter_param.device
-        adapter_dtype = adapter_param.dtype
-        raw_maps = raw_maps.to(device=adapter_device, dtype=adapter_dtype)
-        lm_maps = lm_maps.to(device=adapter_device, dtype=adapter_dtype)
+        raw_maps = raw_maps.to(device=adapter_param.device, dtype=adapter_param.dtype)
         b, c, h, w = raw_maps.shape
         raw_tokens = raw_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        lm_tokens = lm_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        raw_maps = self.raw_feature_norm(raw_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
-        lm_maps = self.lm_feature_norm(lm_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
-        fuse_dtype = next(self.dual_feature_fuse.parameters()).dtype
-        if raw_maps.dtype != fuse_dtype:
-            raw_maps = raw_maps.to(dtype=fuse_dtype)
-            lm_maps = lm_maps.to(dtype=fuse_dtype)
-        fused_delta = self.dual_feature_fuse(torch.cat([raw_maps, lm_maps], dim=1))
-        gate = torch.sigmoid(self.dual_feature_gate).to(device=fused_delta.device, dtype=fused_delta.dtype)
-        return lm_maps + gate * fused_delta
+        return self.raw_feature_norm(raw_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
 
     def _cache_qwenpose_prefill_features(
         self,
@@ -550,11 +539,10 @@ class LocateAnythingVLLMForConditionalGeneration(
                     f"merged_grid={h}x{w}, raw_grid={grid_hw}, merge_kernel={merge_h}x{merge_w}."
                 )
             raw_map = raw_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
-            lm_map = lm_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
             raw_map = F.interpolate(raw_map, size=(self.qwenpose_feature_size, self.qwenpose_feature_size), mode="bilinear", align_corners=False)
-            lm_map = F.interpolate(lm_map, size=(self.qwenpose_feature_size, self.qwenpose_feature_size), mode="bilinear", align_corners=False)
-            fused = self._fuse_qwenpose_feature_maps(raw_map, lm_map)
-            feature_map = self.feature_refiner(fused)
+            feature_map = self.feature_refiner(
+                self._normalize_qwenpose_raw_feature_maps(raw_map)
+            )
             non_image = ~image_mask
             text_mask = non_image.float().to(device=hidden_states.device).unsqueeze(-1)
             seq_hidden = hidden[left:right]
@@ -765,12 +753,9 @@ class LocateAnythingVLLMForConditionalGeneration(
         self._merge_qwenpose_vision_lora()
         qwenpose_prefixes = (
             "raw_feature_norm.",
-            "lm_feature_norm.",
-            "dual_feature_fuse.",
-            "dual_feature_gate",
             "feature_refiner.",
         )
         for name, _ in self.named_parameters():
-            if name == "dual_feature_gate" or name.startswith(qwenpose_prefixes):
+            if name.startswith(qwenpose_prefixes):
                 loaded.add(name)
         return loaded

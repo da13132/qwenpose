@@ -512,7 +512,7 @@ class PoseRecordDataset(Dataset):
         self,
         records: list[PoseRecord],
         max_instances: int = 80,
-        image_size: int = 256,
+        image_size: int = 640,
         load_image_tensors: bool = True,
         load_vision_images: bool = False,
         augment_config: PoseAugmentConfig | None = None,
@@ -529,8 +529,11 @@ class PoseRecordDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def _record_for_index(self, index: int) -> PoseRecord:
+        return self.records[index]
+
     def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[index]
+        record = self._record_for_index(index)
         n = min(record.boxes_xyxy.shape[0], self.max_instances)
         boxes = record.boxes_xyxy[:n].clone()
         loss_boxes = record.loss_boxes_xyxy[:n].clone()
@@ -658,18 +661,87 @@ class PoseRecordDataset(Dataset):
         }
 
 
+class EpochRandomRefHumanDataset(PoseRecordDataset):
+    """Expose a fixed number of captions per person with epoch-wise rotation.
+
+    Each person instance contributes at most ``captions_per_instance`` samples
+    to one epoch. Caption order is shuffled reproducibly once per instance and
+    rotated by epoch, so the default value of one never expands an instance
+    into every expression but also does not freeze one expression forever.
+    """
+
+    def __init__(
+        self,
+        records: list[PoseRecord],
+        *,
+        captions_per_instance: int = 1,
+        seed: int = 42,
+        max_samples: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        limit = max(int(captions_per_instance), 1)
+        grouped_records: dict[
+            tuple[str, tuple[float, float, float, float]], list[PoseRecord]
+        ] = defaultdict(list)
+        for record in records:
+            grouped_records[_refhuman_instance_key(record)].append(record)
+
+        representatives: list[PoseRecord] = []
+        caption_pools: list[list[PoseRecord]] = []
+        caption_slots: list[int] = []
+        caption_orders: list[list[int]] = []
+        sample_pool_indices: list[int] = []
+        for pool_index, pool in enumerate(grouped_records.values()):
+            order = list(range(len(pool)))
+            random.Random(int(seed) + pool_index * 9973).shuffle(order)
+            caption_pools.append(pool)
+            caption_orders.append(order)
+            for slot in range(min(limit, len(pool))):
+                representatives.append(pool[order[slot]])
+                caption_slots.append(slot)
+                sample_pool_indices.append(pool_index)
+
+        if max_samples is not None:
+            keep = max(int(max_samples), 0)
+            representatives = representatives[:keep]
+            caption_slots = caption_slots[:keep]
+            sample_pool_indices = sample_pool_indices[:keep]
+
+        super().__init__(representatives, **kwargs)
+        self.caption_pools = caption_pools
+        self.caption_orders = caption_orders
+        self.caption_slots = caption_slots
+        self.sample_pool_indices = sample_pool_indices
+        # DataLoader persistent workers retain their dataset copies. A shared
+        # scalar lets the main process change captions without recreating them.
+        self._shared_epoch = torch.zeros((), dtype=torch.long).share_memory_()
+
+    def set_epoch(self, epoch: int) -> None:
+        self._shared_epoch.fill_(max(int(epoch), 0))
+
+    def _record_for_index(self, index: int) -> PoseRecord:
+        pool_index = self.sample_pool_indices[index]
+        pool = self.caption_pools[pool_index]
+        order = self.caption_orders[pool_index]
+        slot = self.caption_slots[index]
+        epoch = int(self._shared_epoch.item())
+        return pool[order[(epoch + slot) % len(order)]]
+
+
 class InterleavedPoseDataset(Dataset):
     """Dataset-level weighted fair round-robin sampler.
 
-    When weights are None, the schedule is proportional to the actual number
-    of records loaded from each dataset, so one epoch keeps the natural dataset
-    size ratio while still interleaving sources instead of block-concatenating.
+    Manual weights are dataset traversal multipliers, not normalized
+    probabilities: ``coco:3,refhuman:0.5`` contributes three complete COCO
+    traversals and half of RefHuman to one epoch. Fractional traversals advance
+    their start offset every epoch, so 0.5 visits the first half and then the
+    second half instead of repeatedly sampling the same subset.
     """
 
     def __init__(
         self,
         named_datasets: list[tuple[str, Dataset]],
-        weights: dict[str, int] | None,
+        weights: dict[str, float] | None,
         seed: int = 42,
         epoch_size: int | None = None,
     ) -> None:
@@ -679,11 +751,12 @@ class InterleavedPoseDataset(Dataset):
         self.names = [name for name, _ in self.named_datasets]
         self.datasets = [dataset for _, dataset in self.named_datasets]
         self.auto_weights = weights is None
-        basis = (
-            [len(dataset) for dataset in self.datasets]
+        self.multipliers = (
+            [1.0 for _ in self.datasets]
             if weights is None
-            else [max(int(weights.get(name, 1)), 1) for name in self.names]
+            else [float(weights.get(name, 1.0)) for name in self.names]
         )
+        basis = [self.sample_count_for_epoch(idx, 0) for idx in range(len(self.datasets))]
         self.schedule = self._build_weighted_schedule(basis)
         self.weights = [self.schedule.count(idx) for idx in range(len(self.datasets))]
         self.slot_offsets: list[int] = []
@@ -695,7 +768,7 @@ class InterleavedPoseDataset(Dataset):
             running_counts[dataset_idx] += 1
         if not self.schedule:
             raise ValueError("Interleave schedule is empty.")
-        self.epoch_size = int(epoch_size or sum(len(dataset) for dataset in self.datasets))
+        self.epoch_size = int(epoch_size or sum(basis))
         self.offsets: list[int] = []
         self.strides: list[int] = []
         for dataset_idx, dataset in enumerate(self.datasets):
@@ -703,6 +776,54 @@ class InterleavedPoseDataset(Dataset):
             rng = random.Random(seed + dataset_idx * 9973)
             self.offsets.append(rng.randrange(n) if n > 1 else 0)
             self.strides.append(self._coprime_stride(n, rng))
+
+    def sample_count_for_epoch(self, dataset_idx: int, epoch: int) -> int:
+        """Return this source's fixed per-epoch sample budget.
+
+        ``ceil`` avoids silently dropping a tiny positive multiplier. The
+        rotating start below guarantees that every source record is eventually
+        reached; padding at the global-batch boundary is handled separately by
+        the batch sampler.
+        """
+        del epoch  # Reserved for a future exact variable-size remainder mode.
+        n = len(self.datasets[int(dataset_idx)])
+        multiplier = self.multipliers[int(dataset_idx)]
+        if n <= 0 or multiplier <= 0.0:
+            return 0
+        return max(int(math.ceil(n * multiplier - 1e-12)), 1)
+
+    def sample_start_for_epoch(self, dataset_idx: int, epoch: int) -> int:
+        """Return the continuation offset for fractional dataset traversals."""
+        n = len(self.datasets[int(dataset_idx)])
+        if n <= 0:
+            return 0
+        multiplier = self.multipliers[int(dataset_idx)]
+        return int(math.floor(max(int(epoch), 0) * n * multiplier + 1e-12)) % n
+
+    def sample_linear_indices_for_epoch(self, dataset_idx: int, epoch: int) -> list[int]:
+        """Build a fixed-size budget from one non-overlapping traversal slice.
+
+        For odd-sized datasets, a 0.5 slice alternates between floor/ceil unique
+        records. The smaller half is padded only from itself, so it never borrows
+        a record from the following epoch's half while DataLoader length remains
+        stable for checkpoint resume and scheduler calculations.
+        """
+        dataset_idx = int(dataset_idx)
+        epoch = max(int(epoch), 0)
+        n = len(self.datasets[dataset_idx])
+        multiplier = self.multipliers[dataset_idx]
+        budget = self.sample_count_for_epoch(dataset_idx, epoch)
+        if n <= 0 or multiplier <= 0.0 or budget <= 0:
+            return []
+        start = int(math.floor(epoch * n * multiplier + 1e-12))
+        end = int(math.floor((epoch + 1) * n * multiplier + 1e-12))
+        values = list(range(start, end))
+        if not values:
+            values = [start]
+        if len(values) < budget:
+            source = list(values)
+            values.extend(source[idx % len(source)] for idx in range(budget - len(values)))
+        return values[:budget]
 
     @staticmethod
     def _build_weighted_schedule(counts: list[int]) -> list[int]:
@@ -738,6 +859,12 @@ class InterleavedPoseDataset(Dataset):
 
     def __len__(self) -> int:
         return self.epoch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        for dataset in self.datasets:
+            setter = getattr(dataset, "set_epoch", None)
+            if callable(setter):
+                setter(int(epoch))
 
     def dataset_index_at(self, index: int) -> int:
         schedule_idx = index % len(self.schedule)
@@ -776,13 +903,23 @@ class InterleavedPoseDataset(Dataset):
         shown = ",".join(self.names[idx] for idx in self.schedule[:max_items])
         if len(self.schedule) > max_items:
             shown += f",... ({len(self.schedule)} slots)"
-        mode = "auto_size_proportional" if self.auto_weights else "manual_weighted"
+        mode = "auto_one_traversal" if self.auto_weights else "manual_traversal_multiplier"
         total = max(sum(self.weights), 1)
         counts = ",".join(
-            f"{name}:{count}({count / total:.1%})"
-            for name, count in zip(self.names, self.weights)
+            f"{name}:{multiplier:g}x={count}({count / total:.1%})"
+            for name, multiplier, count in zip(self.names, self.multipliers, self.weights)
         )
         return f"{mode} counts=[{counts}] first=[{shown}]"
+
+
+def set_pose_dataset_epoch(dataset: Dataset, epoch: int) -> None:
+    """Propagate an epoch cursor through mixed/concatenated datasets."""
+    setter = getattr(dataset, "set_epoch", None)
+    if callable(setter):
+        setter(int(epoch))
+        return
+    for child in getattr(dataset, "datasets", []):
+        set_pose_dataset_epoch(child, int(epoch))
 
 
 def pose_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1228,7 +1365,8 @@ def load_coco_records(
 ) -> list[PoseRecord]:
     ann_path = root / "annotations" / f"person_keypoints_{split}.json"
     image_root = root / split
-    data = json.load(open(ann_path, encoding="utf-8"))
+    with ann_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
     images = {img["id"]: img for img in data["images"]}
     anns_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for ann in data["annotations"]:
@@ -1319,7 +1457,8 @@ def load_aic_records(
 ) -> list[PoseRecord]:
     ann_path = resolve_aic_annotation_path(root, split)
     image_root = resolve_aic_image_root(root, split)
-    data = json.load(open(ann_path, encoding="utf-8"))
+    with ann_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
     image_size_map = _load_aic_image_sizes(
         root=root,
         split=split,
@@ -1402,7 +1541,8 @@ def load_aic_records(
 def load_mpii_records(root: Path, split: str = "train", max_samples: int | None = None) -> list[PoseRecord]:
     ann_path = root / "annotations" / f"mpii_{split}.json"
     image_root = root / "images"
-    data = json.load(open(ann_path, encoding="utf-8"))
+    with ann_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
     anns_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for ann in data:
         anns_by_image[ann["image"]].append(ann)
@@ -1460,7 +1600,8 @@ def load_refhuman_records(
 ) -> list[PoseRecord]:
     ann_path = root / f"RefHuman_{split}.json"
     image_root = root / "images"
-    data = json.load(open(ann_path, encoding="utf-8"))
+    with ann_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
 
     grouped_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen_candidate_keys: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
@@ -1535,36 +1676,11 @@ def _refhuman_instance_key(record: PoseRecord) -> tuple[str, tuple[float, float,
     )
 
 
-def sample_refhuman_records(
-    records: list[PoseRecord],
-    max_captions_per_instance: int,
-    seed: int,
-) -> list[PoseRecord]:
-    limit = max(int(max_captions_per_instance), 0)
-    if limit == 0:
-        return records
-
-    grouped_records: dict[tuple[str, tuple[float, float, float, float]], list[PoseRecord]] = defaultdict(list)
-    for record in records:
-        grouped_records[_refhuman_instance_key(record)].append(record)
-
-    # 启动时按 seed 对每个人体实例的 caption 做一次随机抽样，训练过程中保持固定。
-    rng = random.Random(int(seed))
-    selected_ids: set[int] = set()
-    for group_records in grouped_records.values():
-        if len(group_records) <= limit:
-            selected_ids.update(id(record) for record in group_records)
-            continue
-        sampled_records = rng.sample(group_records, k=limit)
-        selected_ids.update(id(record) for record in sampled_records)
-    return [record for record in records if id(record) in selected_ids]
-
-
 def build_datasets(
     dataset_root: Path,
     names: list[str],
     max_instances: int,
-    image_size: int = 256,
+    image_size: int = 640,
     load_image_tensors: bool = True,
     load_vision_images: bool = False,
     augment_config: PoseAugmentConfig | None = None,
@@ -1573,7 +1689,7 @@ def build_datasets(
     max_samples_per_dataset: int | None = None,
     refhuman_max_captions_per_instance: int = 1,
     mixing_strategy: str = "interleave",
-    dataset_mix_weights: str | dict[str, int] | None = None,
+    dataset_mix_weights: str | dict[str, float] | None = None,
     seed: int = 42,
     record_cache_dir: Path | None = Path(".cache/qwenpose_records"),
     disable_record_cache: bool = False,
@@ -1676,6 +1792,9 @@ def build_datasets(
                 source_paths=source_paths,
                 cache_dir=record_cache_dir,
                 disable_cache=disable_record_cache,
+                # This cache already contains every unique caption. Keep the
+                # legacy key value so existing 674 MB caches remain reusable;
+                # epoch-wise selection now happens in the dataset wrapper.
                 extra_cache_key={
                     "refhuman_caption_pool_mode": "all_unique_captions_then_sample",
                 },
@@ -1685,38 +1804,39 @@ def build_datasets(
                     max_samples=None,
                 ),
             )
-            records = sample_refhuman_records(
-                records,
-                max_captions_per_instance=refhuman_max_captions_per_instance,
-                seed=seed,
-            )
-            if max_samples_per_dataset is not None:
+            if refhuman_max_captions_per_instance == 0 and max_samples_per_dataset is not None:
                 records = records[: max(int(max_samples_per_dataset), 0)]
         else:
             raise ValueError(f"Unknown dataset {name!r}")
         if not records:
             raise RuntimeError(f"Dataset {name!r} produced no records.")
-        named_datasets.append(
-            (
-                name,
-                PoseRecordDataset(
-                    records,
-                    max_instances=max_instances,
-                    image_size=image_size,
-                    load_image_tensors=load_image_tensors,
-                    load_vision_images=load_vision_images,
-                    augment_config=augment_config,
-                    use_prompts=use_prompts,
-                ),
+        dataset_kwargs = {
+            "max_instances": max_instances,
+            "image_size": image_size,
+            "load_image_tensors": load_image_tensors,
+            "load_vision_images": load_vision_images,
+            "augment_config": augment_config,
+            "use_prompts": use_prompts,
+        }
+        if name == "refhuman" and refhuman_max_captions_per_instance > 0:
+            pose_dataset: Dataset = EpochRandomRefHumanDataset(
+                records,
+                captions_per_instance=refhuman_max_captions_per_instance,
+                seed=seed,
+                max_samples=max_samples_per_dataset,
+                **dataset_kwargs,
             )
-        )
+        else:
+            pose_dataset = PoseRecordDataset(records, **dataset_kwargs)
+        named_datasets.append((name, pose_dataset))
+        effective_record_count = len(pose_dataset)
         dataset_elapsed = time.perf_counter() - dataset_started
         total_elapsed = time.perf_counter() - overall_started
         remaining_count = max(total_datasets - dataset_index, 0)
         avg_per_dataset = total_elapsed / max(dataset_index, 1)
         eta_seconds = avg_per_dataset * remaining_count
         _data_log(
-            f"Loaded {len(records):6d} records from {name} split={split} "
+            f"Loaded {effective_record_count:6d} records from {name} split={split} "
             f"(dataset_time={dataset_elapsed:.2f}s, elapsed={_format_duration(total_elapsed)}, "
             f"eta={_format_duration(eta_seconds)})"
         )
@@ -1724,7 +1844,7 @@ def build_datasets(
             progress_bar.update(1)
             progress_bar.set_postfix(
                 dataset=name,
-                records=len(records),
+                records=effective_record_count,
                 last_s=f"{dataset_elapsed:.1f}",
                 eta=_format_duration(eta_seconds),
                 refresh=False,
@@ -1742,18 +1862,30 @@ def build_datasets(
     return mixed
 
 
-def parse_dataset_mix_weights(spec: str | dict[str, int] | None) -> dict[str, int] | None:
+def parse_dataset_mix_weights(spec: str | dict[str, float] | None) -> dict[str, float] | None:
     if spec is None or spec == "" or str(spec).lower() == "auto":
         return None
-    if isinstance(spec, dict):
-        return {str(k).lower(): max(int(v), 1) for k, v in spec.items()}
-    weights: dict[str, int] = {}
-    for chunk in spec.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if ":" not in chunk:
-            raise ValueError(f"Bad dataset weight item {chunk!r}; expected name:weight.")
-        name, value = chunk.split(":", 1)
-        weights[name.strip().lower()] = max(int(value), 1)
+    raw_items = spec.items() if isinstance(spec, dict) else None
+    if raw_items is None:
+        parsed_items: list[tuple[str, str]] = []
+        for chunk in str(spec).split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if ":" not in chunk:
+                raise ValueError(f"Bad dataset weight item {chunk!r}; expected name:weight.")
+            name, value = chunk.split(":", 1)
+            parsed_items.append((name, value))
+        raw_items = parsed_items
+    weights: dict[str, float] = {}
+    for raw_name, raw_value in raw_items:
+        name = str(raw_name).strip().lower()
+        if not name:
+            raise ValueError("Dataset weight name cannot be empty.")
+        value = float(raw_value)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"Dataset weight for {name!r} must be finite and non-negative, got {raw_value!r}.")
+        weights[name] = value
+    if not weights:
+        raise ValueError("dataset_mix_weights must contain at least one name:weight item.")
     return weights

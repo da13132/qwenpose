@@ -182,7 +182,7 @@ def _schema_to_union_impl(
 
     Returns:
         keypoints: ``[U, 3]`` normalized x/y and visibility target.
-        coord_valid: ``[U]`` mask for coordinate/OKS/SimCC supervision.
+        coord_valid: ``[U]`` mask for coordinate and OKS supervision.
         visibility_valid: ``[U]`` mask for visibility BCE supervision.
     """
     spec = get_schema(schema_name)

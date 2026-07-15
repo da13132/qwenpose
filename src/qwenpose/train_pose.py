@@ -37,8 +37,13 @@ from qwenpose.data import (
     PoseAugmentConfig,
     build_datasets,
     pose_collate,
+    set_pose_dataset_epoch,
 )
-from qwenpose.losses import LossWeights, compute_pose_losses
+from qwenpose.losses import (
+    LossWeights,
+    compute_person_confidence_quality_loss,
+    compute_pose_losses,
+)
 from qwenpose.model import QwenPoseConfig, QwenPoseModel, count_trainable_parameters
 from qwenpose.qwen_lora import (
     QwenFeatureExtractor,
@@ -61,18 +66,14 @@ from qwenpose.eagle_lora import (
     EagleFeatureExtractor,
     EagleLoRAConfig,
     build_eagle_inputs,
+    build_eagle_lm_inputs,
     count_eagle_lora_parameters,
     get_eagle_base_model,
     load_eagle_vision_only_with_lora,
     load_eagle_with_lora,
     eagle_hidden_size,
 )
-from qwenpose.schemas import ID_TO_SCHEMA, UNION_KEYPOINTS
-
-try:
-    from qwenpose.eagle_lora import build_eagle_lm_inputs
-except ImportError:  # pragma: no cover - optional for the Qwen-focused public snapshot.
-    build_eagle_lm_inputs = None
+from qwenpose.schemas import ID_TO_SCHEMA, UNION_KEYPOINTS, UNION_SIGMAS
 
 
 CHECKPOINT_PAYLOAD_NAME = "qwenpose_checkpoint.pt"
@@ -103,7 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated datasets. RefHuman contributes REF_POSE; others contribute ALL_POSE.",
     )
     parser.add_argument("--max_instances", type=int, default=80)
-    parser.add_argument("--image_size", type=int, default=256, help="Fixed RGB tensor size for the lightweight pose visual branch.")
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=800,
+        help="Unified square RGB input size shared by all LocatePose stages.",
+    )
     parser.add_argument(
         "--disable_image_tensors",
         action="store_true",
@@ -114,7 +120,11 @@ def parse_args() -> argparse.Namespace:
         "--refhuman_max_captions_per_instance",
         type=int,
         default=1,
-        help="Maximum captions kept for each RefHuman person instance. Captions are randomly sampled once at startup according to --seed. Use 0 to keep all captions.",
+        help=(
+            "Maximum captions used for each RefHuman person instance in one epoch. "
+            "Captions follow a seed-randomized epoch rotation; use 0 to keep all "
+            "captions as separate records."
+        ),
     )
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--prefetch_factor", type=int, default=2)
@@ -131,7 +141,11 @@ def parse_args() -> argparse.Namespace:
         "--dataset_mix_weights",
         type=str,
         default="auto",
-        help="Use auto for size-proportional interleaving, or manual weights like coco:4,aic:1.",
+        help=(
+            "Per-epoch dataset traversal multipliers. Use auto for one traversal of every source, "
+            "or values such as coco:3,mpii:3,crowdpose:3,refhuman:0.5. Zero disables a source; "
+            "fractional sources continue from the next slice in following epochs."
+        ),
     )
     parser.add_argument(
         "--disable_homogeneous_batches",
@@ -198,15 +212,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--locate_attn_implementation", "--eagle_attn_implementation", dest="eagle_attn_implementation", type=str, default="flash_attention_2")
     parser.add_argument("--locate_gradient_checkpointing", "--eagle_gradient_checkpointing", dest="eagle_gradient_checkpointing", action="store_true")
-    parser.add_argument("--locate_min_pixels", "--eagle_min_pixels", dest="eagle_min_pixels", type=int, default=None)
-    parser.add_argument("--locate_max_pixels", "--eagle_max_pixels", dest="eagle_max_pixels", type=int, default=None)
     parser.add_argument(
         "--locate_image_token_limit",
         "--eagle_image_token_limit",
         dest="eagle_image_token_limit",
         type=int,
         default=None,
-        help="LocateAnything raw MoonViT patch-token limit per image. Overrides --locate_max_pixels when set.",
+        help="LocateAnything raw MoonViT patch-token limit per image.",
     )
     parser.add_argument(
         "--locate_batch_token_limit",
@@ -216,7 +228,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum raw MoonViT patch-token budget for one local micro batch.",
     )
-    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=32)
+    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=100)
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
     parser.add_argument("--locate_feature_refiner_bottleneck_dim", "--eagle_feature_refiner_bottleneck_dim", dest="eagle_feature_refiner_bottleneck_dim", type=int, default=256)
     parser.add_argument("--locate_feature_refiner_init_scale", "--eagle_feature_refiner_init_scale", dest="eagle_feature_refiner_init_scale", type=float, default=0.1)
@@ -228,32 +240,144 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_vision_lora_dropout", "--eagle_vision_lora_dropout", dest="eagle_vision_lora_dropout", type=float, default=0.05)
     parser.add_argument(
         "--locate_feature_source",
-        choices=["vision_only", "multimodal"],
-        default="multimodal",
-        help="Use MoonViT visual features only, or fuse MoonViT with final LLM image-token features.",
+        choices=["vision_only", "raw_visual"],
+        default="raw_visual",
+        help=(
+            "vision_only loads only MoonViT; raw_visual loads the full model and LLM text path "
+            "while feeding the same raw MoonViT map to PoseHead."
+        ),
+    )
+    parser.add_argument(
+        "--prune_locate_generation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip LocateAnything's duplicate lm_head checkpoint tensor, remove the vocabulary "
+            "projection, and disable KV-cache generation. Use only when coordinates come from "
+            "the person-query detection head."
+        ),
     )
     parser.add_argument(
         "--locate_train_scope",
-        choices=["frozen", "vision_lora", "all_lora"],
+        choices=["frozen", "vision_lora", "all_lora", "selective_lora"],
         default="all_lora",
         help="Select which LocateAnything adapters receive gradients.",
     )
+    parser.add_argument(
+        "--locate_llm_layers",
+        type=str,
+        default="32-35",
+        help="LLM layer ranges enabled by selective_lora, e.g. 32-35.",
+    )
+    parser.add_argument(
+        "--locate_vision_layers",
+        type=str,
+        default="15-26",
+        help="MoonViT block ranges enabled by selective_lora, e.g. 15-26.",
+    )
+    parser.add_argument(
+        "--locate_llm_modules",
+        type=str,
+        default="q_proj,v_proj",
+        help="Comma-separated LLM LoRA projections enabled by selective_lora.",
+    )
+    parser.add_argument(
+        "--locate_vision_modules",
+        type=str,
+        default="wqkv,wo,fc0,fc1",
+        help="Comma-separated MoonViT LoRA projections enabled by selective_lora.",
+    )
     parser.add_argument("--train_locate_projector", action="store_true")
     parser.add_argument("--freeze_locate", "--freeze_eagle", dest="freeze_eagle", action="store_true")
-    parser.add_argument("--pose_decoder_layers", type=int, default=1)
+    parser.add_argument("--pose_decoder_layers", type=int, default=3)
     parser.add_argument("--refinement_steps", type=int, default=3)
+    parser.add_argument("--human_decoder_layers", type=int, default=2)
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--pose_dropout", type=float, default=0.0)
-    parser.add_argument("--box_condition_scale", type=float, default=1.0)
+    parser.add_argument("--box_condition_scale", type=float, default=1.25)
+    parser.add_argument(
+        "--pose_coordinate_init",
+        choices=("learned_spread", "box_center", "schema_prior"),
+        default="learned_spread",
+        help=(
+            "Main-pose coordinate reference. learned_spread uses trainable, "
+            "non-anatomical dispersed anchors; box_center is an ablation and "
+            "schema_prior is retained only for legacy checkpoint evaluation."
+        ),
+    )
     parser.add_argument(
         "--schema_joint_priors_path",
         type=str,
         default="configs/schema_joint_priors.json",
-        help="JSON file containing per-schema box-relative joint priors.",
+        help="Legacy schema-prior JSON; used only by --pose_coordinate_init=schema_prior.",
     )
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--simcc_bins", type=int, default=256)
+    parser.add_argument("--pose_pyramid_channels", type=int, default=128)
+    parser.add_argument("--pose_pyramid_blocks", type=int, default=3)
+    parser.add_argument("--deformable_points", type=int, default=4)
+    parser.add_argument("--deformable_min_radius_cells", type=float, default=2.0)
+    parser.add_argument(
+        "--ref_text_scale",
+        type=float,
+        default=0.2,
+        help="Scale applied when RefHuman text conditions human and joint queries.",
+    )
+    parser.add_argument(
+        "--disable_ref_visual_modulation",
+        action="store_true",
+        help="Disable zero-initialized RefHuman text FiLM modulation on P2/P3/P4.",
+    )
+    parser.add_argument(
+        "--disable_box_denoising",
+        action="store_true",
+        help="Disable training-only positive/negative box denoising queries.",
+    )
+    parser.add_argument("--max_dn_queries", type=int, default=96)
+    parser.add_argument("--max_dn_groups", type=int, default=4)
+    parser.add_argument("--dn_positive_noise", type=float, default=0.40)
+    parser.add_argument("--dn_negative_noise", type=float, default=1.00)
+    parser.add_argument(
+        "--disable_keypoint_denoising",
+        action="store_true",
+        help="Disable training-only box-conditioned OKS keypoint denoising.",
+    )
+    parser.add_argument("--max_keypoint_dn_queries", type=int, default=16)
+    parser.add_argument("--max_keypoint_dn_groups", type=int, default=2)
+    parser.add_argument("--keypoint_dn_positive_ks_min", type=float, default=0.5)
+    parser.add_argument("--keypoint_dn_positive_ks_max", type=float, default=1.0)
+    parser.add_argument("--keypoint_dn_negative_ks_min", type=float, default=0.1)
+    parser.add_argument("--keypoint_dn_negative_ks_max", type=float, default=0.5)
     parser.add_argument("--disable_refinement", action="store_true")
+    parser.add_argument(
+        "--person_confidence_rescue",
+        action="store_true",
+        help=(
+            "Rebuild the checkpoint-14000 legacy PoseHead, freeze every existing "
+            "weight, and train only a YOLO-style instance confidence head."
+        ),
+    )
+    parser.add_argument(
+        "--legacy_checkpoint_compat",
+        action="store_true",
+        help=(
+            "Use the checkpoint-14000 legacy PoseHead graph (legacy RGB/refinement "
+            "path and visibility head) without enabling rescue-only freezing."
+        ),
+    )
+    parser.add_argument(
+        "--enable_person_confidence_head",
+        action="store_true",
+        help=(
+            "Enable the learned YOLO-style instance confidence head during normal "
+            "pose training without freezing the rest of the model."
+        ),
+    )
+    parser.add_argument(
+        "--init_from_checkpoint",
+        type=Path,
+        default=None,
+        help="Weight-only initialization checkpoint used by confidence rescue.",
+    )
 
     # ---------------------------------------------------------------------
     # Optimization section.
@@ -261,7 +385,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, default=Path("outputs/qwenpose_debug"))
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help=(
+            "Number of training epochs. Set to 0 together with --max_steps > 0 "
+            "for optimizer-step-only training without an epoch cap."
+        ),
+    )
     parser.add_argument(
         "--max_steps",
         type=int,
@@ -272,6 +404,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen_lora_lr_scale", type=float, default=1.0)
     parser.add_argument("--qwen_vision_lr_scale", type=float, default=0.01)
     parser.add_argument("--locate_vision_scale", type=float, default=0.10)
+    parser.add_argument("--locate_llm_scale", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=100)
@@ -305,17 +438,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_oks", type=float, default=0.5)
     parser.add_argument("--w_coord", type=float, default=3.0)
     parser.add_argument("--w_image_coord", type=float, default=5.0)
-    parser.add_argument("--w_vis", type=float, default=0.05)
+    parser.add_argument(
+        "--w_keypoint_confidence",
+        "--w_vis",
+        dest="w_keypoint_confidence",
+        type=float,
+        default=0.1,
+        help="Weight for evaluator-aligned per-keypoint localization confidence.",
+    )
+    parser.add_argument(
+        "--w_person_confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for evaluator-aligned instance OKS confidence. Generated boxes "
+            "that do not match a GT person are zero-quality negatives."
+        ),
+    )
+    parser.add_argument(
+        "--w_ref_match",
+        type=float,
+        default=1.0,
+        help="Weight for RefHuman expression-to-candidate cross-entropy.",
+    )
     parser.add_argument("--w_lm", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
     parser.add_argument("--w_coarse_coord", type=float, default=0.5)
     parser.add_argument("--w_deform_coord", type=float, default=0.75)
     parser.add_argument("--w_refine_coords", type=str, default="0.75,1.0,1.25")
-    parser.add_argument("--w_simcc_coarse", type=float, default=0.1)
-    parser.add_argument("--w_simcc_deform", type=float, default=0.15)
-    parser.add_argument("--w_simcc_refine", type=str, default="0.15,0.2,0.25")
-    parser.add_argument("--simcc_sigma", type=float, default=2.0)
+    parser.add_argument("--w_box_objectness", type=float, default=1.0)
+    parser.add_argument("--w_box_l1", type=float, default=5.0)
+    parser.add_argument("--w_box_giou", type=float, default=2.0)
+    parser.add_argument("--w_box_relative", type=float, default=1.0)
+    parser.add_argument("--w_box_dn", type=float, default=1.0)
+    parser.add_argument("--w_keypoint_dn", type=float, default=1.0)
     parser.add_argument(
         "--box_jitter_scale",
         type=float,
@@ -330,27 +487,46 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--box_source",
-        choices=["gt", "qwen_generate", "locate_generate"],
+        choices=["gt", "qwen_generate", "locate_generate", "person_queries"],
         default="gt",
-        help="Box conditions for PoseHead: GT boxes, boxes generated by Qwen, or boxes generated by LocateAnything.",
+        help=(
+            "Box conditions for PoseHead: GT/generated boxes, or unified learned "
+            "person queries that detect every person before RefHuman selection."
+        ),
+    )
+    parser.add_argument(
+        "--num_person_queries",
+        type=int,
+        default=80,
+        help="Number of global detection/pose candidates for --box_source=person_queries.",
     )
     parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
-    parser.add_argument("--locate_box_max_new_tokens", type=int, default=8192)
-    parser.add_argument("--locate_generation_mode", choices=["fast", "slow", "hybrid"], default="hybrid")
+    parser.add_argument("--locate_box_max_new_tokens", type=int, default=512)
+    parser.add_argument(
+        "--locate_generation_mode",
+        choices=["fast", "slow", "hybrid"],
+        default="hybrid",
+    )
     parser.add_argument("--box_match_iou_thresh", type=float, default=0.10)
     parser.add_argument("--box_nms_iou_thresh", type=float, default=0.70)
     parser.add_argument(
         "--disable_pre_pose_nms",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Keep every parsed Locate box until after PoseHead; recommended for crowded people.",
+        help="Keep all parsed LocateAnything boxes until PoseHead processing.",
     )
-    parser.add_argument("--post_pose_nms_iou_thresh", type=float, default=0.95)
+    parser.add_argument(
+        "--locate_generate_refhuman_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "During training, use LocateAnything generated boxes for RefHuman and "
+            "GT boxes for regular pose datasets. This restores the last stable LLM-box recipe."
+        ),
+    )
     parser.add_argument("--w_locate_box_lm", type=float, default=0.0)
-    parser.add_argument("--w_locate_point_lm", type=float, default=0.0)
     parser.add_argument("--locate_lm_loss_every", type=int, default=1)
     parser.add_argument("--locate_lm_max_instances", type=int, default=20)
-    parser.add_argument("--locate_lm_max_points", type=int, default=8)
     parser.add_argument("--disable_locate_grounding_aux", action="store_true")
 
     # ---------------------------------------------------------------------
@@ -372,6 +548,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm_max_answer_instances", type=int, default=10)
     parser.add_argument("--visualize_every", type=int, default=0, help="Save one training visualization every N optimizer steps. Use 0 to disable.")
     parser.add_argument("--visualize_max_instances", type=int, default=8)
+    parser.add_argument(
+        "--visualize_min_gt_area_ratio",
+        type=float,
+        default=0.005,
+        help="Skip training visualizations whose largest pose-annotated person is smaller than this image-area ratio.",
+    )
     args = parser.parse_args()
     if args.backbone == "locatepose":
         args.backbone = "eagle"
@@ -695,15 +877,11 @@ def build_lm_responses(batch: dict, max_instances: int = 10) -> list[str]:
         height = float(target["height"])
         boxes = target["boxes"].detach().cpu()
         task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
-        if task_id == 1:
-            ref_target = int(target["ref_target"].detach().cpu().item())
-            instance_indices = [ref_target] if 0 <= ref_target < int(boxes.shape[0]) else []
-        else:
-            instance_indices = _spatially_sorted_instance_indices(
-                boxes,
-                list(range(int(boxes.shape[0]))),
-                max_instances,
-            )
+        instance_indices = _spatially_sorted_instance_indices(
+            boxes,
+            list(range(int(boxes.shape[0]))),
+            max_instances,
+        )
 
         people = []
         for person_idx in instance_indices:
@@ -719,49 +897,26 @@ def build_lm_responses(batch: dict, max_instances: int = 10) -> list[str]:
             }
             people.append(person)
 
-        if task_id == 1:
-            payload = {"person": people[0] if people else None}
-        else:
-            payload = {"people": people}
+        payload = {"people": people}
         responses.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return responses
 
 
 def _locate_coord_token(value: float, upper: float) -> str:
-    if upper <= 0:
-        scaled = 0
-    else:
-        scaled = int(round(max(0.0, min(float(value), float(upper))) / float(upper) * 1000.0))
-    scaled = max(0, min(scaled, 1000))
-    return "<" + f"{scaled:03d}" + ">"
+    scaled = 0 if upper <= 0 else int(round(max(0.0, min(float(value), float(upper))) / float(upper) * 1000.0))
+    return "<" + f"{max(0, min(scaled, 1000)):03d}" + ">"
 
 
 def build_locate_grounding_responses(
     batch: dict,
     max_instances: int = 20,
-    max_points: int = 8,
-) -> tuple[list[str], list[str]]:
-    box_responses: list[str] = []
-    point_responses: list[str] = []
-    box_start = "<" + "box>"
-    box_end = "<" + "/box>"
+) -> list[str]:
+    """Encode GT person boxes in LocateAnything's native coordinate-token form."""
+    responses: list[str] = []
     for sample_idx, target in enumerate(batch["targets"]):
         width = float(target["width"])
         height = float(target["height"])
         boxes = target["boxes"].detach().cpu()
-        use_points = int(max_points) > 0
-        keypoints = None
-        keypoint_mask = None
-        if use_points:
-            keypoints_value = target.get("keypoints")
-            keypoint_mask_value = target.get("keypoint_valid", target.get("keypoint_mask"))
-            if keypoints_value is None or keypoint_mask_value is None:
-                raise KeyError(
-                    "Locate point-LM supervision requires target['keypoints'] and "
-                    "target['keypoint_valid'] (legacy alias: target['keypoint_mask'])."
-                )
-            keypoints = keypoints_value.detach().cpu()
-            keypoint_mask = keypoint_mask_value.detach().cpu().bool()
         task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
         if task_id == 1:
             ref_target = int(target["ref_target"].detach().cpu().item())
@@ -772,34 +927,19 @@ def build_locate_grounding_responses(
                 list(range(int(boxes.shape[0]))),
                 max_instances,
             )
-        box_chunks: list[str] = []
-        point_chunks: list[str] = []
+        chunks: list[str] = []
         for person_idx in instance_indices:
-            box = boxes[person_idx].tolist()
-            box_chunks.append(
-                box_start
-                + _locate_coord_token(box[0] * width, width)
-                + _locate_coord_token(box[1] * height, height)
-                + _locate_coord_token(box[2] * width, width)
-                + _locate_coord_token(box[3] * height, height)
-                + box_end
+            x1, y1, x2, y2 = boxes[person_idx].tolist()
+            chunks.append(
+                "<box>"
+                + _locate_coord_token(x1 * width, width)
+                + _locate_coord_token(y1 * height, height)
+                + _locate_coord_token(x2 * width, width)
+                + _locate_coord_token(y2 * height, height)
+                + "</box>"
             )
-            if use_points:
-                assert keypoints is not None and keypoint_mask is not None
-                visible_indices = torch.nonzero(
-                    keypoint_mask[person_idx], as_tuple=False
-                ).flatten().tolist()
-                for joint_idx in visible_indices[: int(max_points)]:
-                    xy = keypoints[person_idx, joint_idx].tolist()
-                    point_chunks.append(
-                        box_start
-                        + _locate_coord_token(xy[0] * width, width)
-                        + _locate_coord_token(xy[1] * height, height)
-                        + box_end
-                    )
-        box_responses.append("".join(box_chunks) if box_chunks else "None")
-        point_responses.append("".join(point_chunks) if point_chunks else "None")
-    return box_responses, point_responses
+        responses.append("".join(chunks) if chunks else "None")
+    return responses
 
 
 def _select_target_instances(
@@ -921,6 +1061,42 @@ def prepare_box_conditioning(
     return box_tensor, box_mask, selected_targets
 
 
+def prepare_person_query_conditioning(
+    targets: list[dict[str, torch.Tensor]],
+    task_ids: torch.Tensor,
+    device: torch.device,
+    max_instances: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
+    """Keep every GT person for set prediction while supplying no box prompt.
+
+    The model replaces the returned placeholder with its learned global person
+    queries.  RefHuman keeps all people in the image (not just the referred
+    person), because its supervision is a candidate-selection loss.
+    """
+    selected_targets: list[dict[str, torch.Tensor]] = []
+    limit = max(int(max_instances), 1)
+    for sample_idx, target in enumerate(targets):
+        count = int(target["boxes"].shape[0])
+        indices = list(range(min(count, limit)))
+        task_id = int(task_ids[sample_idx].detach().cpu().item())
+        if task_id == 1 and count > limit:
+            ref_target = int(target["ref_target"].detach().cpu().item())
+            if 0 <= ref_target < count and ref_target not in indices:
+                indices[-1] = ref_target
+        selected = _select_target_instances(target, indices, task_id=0)
+        ref_target = int(target["ref_target"].detach().cpu().item()) if task_id == 1 else -1
+        selected["ref_target"] = torch.tensor(
+            indices.index(ref_target) if ref_target in indices else -1,
+            dtype=torch.long,
+        )
+        selected_targets.append(selected)
+
+    batch_size = len(selected_targets)
+    placeholder_boxes = torch.zeros(batch_size, 1, 4, dtype=torch.float32, device=device)
+    placeholder_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
+    return placeholder_boxes, placeholder_mask, selected_targets
+
+
 def jitter_boxes_xyxy(
     boxes: torch.Tensor,
     scale_jitter: float | torch.Tensor = 0.0,
@@ -959,6 +1135,422 @@ def jitter_boxes_xyxy(
     wh = wh * random_scale.clamp(min=0.5)
     jittered = torch.cat([center - wh * 0.5, center + wh * 0.5], dim=-1)
     return jittered.clamp(0.0, 1.0)
+
+
+def prepare_box_denoising(
+    targets: list[dict[str, torch.Tensor]],
+    device: torch.device,
+    *,
+    max_queries: int = 96,
+    max_groups: int = 4,
+    positive_noise: float = 0.40,
+    negative_noise: float = 1.00,
+    image_size: int = 800,
+) -> dict[str, torch.Tensor] | None:
+    """Build DN-DETR/DINO-style positive and negative box queries.
+
+    Positive queries reconstruct their clean GT box. Negative queries are moved
+    far enough from the source person to supervise background objectness only.
+    """
+    max_queries = max(int(max_queries), 0)
+    max_groups = max(int(max_groups), 1)
+    if max_queries < 2:
+        return None
+    minimum_center_shift = 2.0 / max(float(image_size), 1.0)
+    minimum_box_size = 4.0 / max(float(image_size), 1.0)
+
+    per_sample: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
+    for target in targets:
+        clean_boxes = target["boxes"].to(device=device, dtype=torch.float32)
+        clean_source_indices = torch.arange(
+            clean_boxes.shape[0], device=device, dtype=torch.long
+        )
+        if clean_boxes.numel() == 0:
+            per_sample.append(
+                (
+                    clean_boxes.new_zeros((0, 4)),
+                    clean_boxes.new_zeros((0,)),
+                    clean_boxes.new_zeros((0, 4)),
+                    torch.zeros(0, device=device, dtype=torch.long),
+                    torch.zeros(0, device=device, dtype=torch.long),
+                )
+            )
+            continue
+        matched = target.get("matched_gt_indices")
+        if isinstance(matched, torch.Tensor):
+            positive_source = matched.to(device=device)[: clean_boxes.shape[0]].ge(0)
+            clean_boxes = clean_boxes[positive_source]
+            clean_source_indices = clean_source_indices[positive_source]
+        wh = (clean_boxes[:, 2:] - clean_boxes[:, :2]).clamp(min=minimum_box_size)
+        valid = (wh[:, 0] > 0.0) & (wh[:, 1] > 0.0)
+        clean_boxes = clean_boxes[valid]
+        clean_source_indices = clean_source_indices[valid]
+        if clean_boxes.numel() == 0:
+            per_sample.append(
+                (
+                    clean_boxes.new_zeros((0, 4)),
+                    clean_boxes.new_zeros((0,)),
+                    clean_boxes.new_zeros((0, 4)),
+                    torch.zeros(0, device=device, dtype=torch.long),
+                    torch.zeros(0, device=device, dtype=torch.long),
+                )
+            )
+            continue
+        max_gt = max(max_queries // 2, 1)
+        clean_boxes = clean_boxes[:max_gt]
+        clean_source_indices = clean_source_indices[:max_gt]
+        n = int(clean_boxes.shape[0])
+        groups = min(max_groups, max(max_queries // max(2 * n, 1), 1))
+        noisy_boxes: list[torch.Tensor] = []
+        labels: list[float] = []
+        target_boxes: list[torch.Tensor] = []
+        group_ids: list[int] = []
+        source_indices: list[int] = []
+
+        for group_idx in range(groups):
+            for clean, source_idx_tensor in zip(clean_boxes, clean_source_indices):
+                source_idx = int(source_idx_tensor.item())
+                xy1, xy2 = clean[:2], clean[2:]
+                box_wh = (xy2 - xy1).clamp(min=minimum_box_size)
+                center = (xy1 + xy2) * 0.5
+
+                center_scale = max(float(positive_noise) * 0.5, 0.0)
+                center_shift = (torch.rand(2, device=device) * 2.0 - 1.0) * box_wh * center_scale
+                center_shift = torch.where(
+                    center_shift.abs() < minimum_center_shift,
+                    center_shift.sign().masked_fill(center_shift.eq(0), 1.0) * minimum_center_shift,
+                    center_shift,
+                )
+                size_scale = 1.0 + (torch.rand(2, device=device) * 2.0 - 1.0) * float(positive_noise)
+                positive_wh = (box_wh * size_scale.clamp(min=0.5)).clamp(min=minimum_box_size)
+                positive_center = center + center_shift
+                positive_box = torch.cat(
+                    [positive_center - positive_wh * 0.5, positive_center + positive_wh * 0.5]
+                ).clamp(0.0, 1.0)
+                noisy_boxes.append(positive_box)
+                labels.append(1.0)
+                target_boxes.append(clean)
+                group_ids.append(group_idx)
+                source_indices.append(source_idx)
+
+                negative_box = positive_box
+                best_negative_iou = float("inf")
+                for _ in range(10):
+                    direction = torch.where(
+                        torch.rand(2, device=device) > 0.5,
+                        torch.ones(2, device=device),
+                        -torch.ones(2, device=device),
+                    )
+                    distance = 0.20 + 0.30 * torch.rand(2, device=device)
+                    negative_center = center + direction * distance * box_wh * max(float(negative_noise), 0.0)
+                    negative_scale = 1.0 + (
+                        torch.rand(2, device=device) * 2.0 - 1.0
+                    ) * max(float(negative_noise), 0.0)
+                    negative_wh = (box_wh * negative_scale.clamp(min=0.4, max=2.0)).clamp(
+                        min=minimum_box_size
+                    )
+                    candidate = torch.cat(
+                        [negative_center - negative_wh * 0.5, negative_center + negative_wh * 0.5]
+                    ).clamp(0.0, 1.0)
+                    candidate_iou = float(
+                        box_iou_xyxy(candidate.view(1, 4), clean.view(1, 4))[0, 0]
+                    )
+                    if candidate_iou < best_negative_iou:
+                        best_negative_iou = candidate_iou
+                        negative_box = candidate
+                    if candidate_iou < 0.30:
+                        break
+                noisy_boxes.append(negative_box)
+                labels.append(0.0)
+                target_boxes.append(clean)
+                group_ids.append(group_idx)
+                source_indices.append(source_idx)
+
+        sample_boxes = torch.stack(noisy_boxes[:max_queries], dim=0)
+        sample_labels = torch.tensor(labels[:max_queries], device=device, dtype=torch.float32)
+        sample_targets = torch.stack(target_boxes[:max_queries], dim=0)
+        sample_groups = torch.tensor(group_ids[:max_queries], device=device, dtype=torch.long)
+        sample_sources = torch.tensor(
+            source_indices[:max_queries], device=device, dtype=torch.long
+        )
+        per_sample.append(
+            (sample_boxes, sample_labels, sample_targets, sample_groups, sample_sources)
+        )
+
+    padded_count = max([int(item[0].shape[0]) for item in per_sample] + [0])
+    if padded_count <= 0:
+        return None
+    boxes = torch.zeros(len(per_sample), padded_count, 4, device=device, dtype=torch.float32)
+    mask = torch.zeros(len(per_sample), padded_count, device=device, dtype=torch.bool)
+    labels = torch.zeros(len(per_sample), padded_count, device=device, dtype=torch.float32)
+    target_boxes = torch.zeros(len(per_sample), padded_count, 4, device=device, dtype=torch.float32)
+    group_ids = torch.full(
+        (len(per_sample), padded_count),
+        -1,
+        device=device,
+        dtype=torch.long,
+    )
+    source_indices = torch.full_like(group_ids, -1)
+    for batch_idx, (
+        sample_boxes,
+        sample_labels,
+        sample_targets,
+        sample_groups,
+        sample_sources,
+    ) in enumerate(per_sample):
+        count = int(sample_boxes.shape[0])
+        if count <= 0:
+            continue
+        boxes[batch_idx, :count] = sample_boxes
+        labels[batch_idx, :count] = sample_labels
+        target_boxes[batch_idx, :count] = sample_targets
+        group_ids[batch_idx, :count] = sample_groups
+        source_indices[batch_idx, :count] = sample_sources
+        mask[batch_idx, :count] = True
+    return {
+        "dn_boxes": boxes,
+        "dn_box_mask": mask,
+        "dn_labels": labels,
+        "dn_target_boxes": target_boxes,
+        "dn_group_ids": group_ids,
+        "dn_source_indices": source_indices,
+    }
+
+
+def prepare_keypoint_denoising(
+    targets: list[dict[str, torch.Tensor]],
+    device: torch.device,
+    *,
+    max_queries: int = 16,
+    max_groups: int = 2,
+    positive_ks_min: float = 0.5,
+    positive_ks_max: float = 1.0,
+    negative_ks_min: float = 0.1,
+    negative_ks_max: float = 0.5,
+    image_size: int = 800,
+) -> dict[str, torch.Tensor] | None:
+    """Build box-conditioned DETRPose-style positive/negative pose queries.
+
+    A query here is one complete person skeleton, not one joint token. Positive
+    skeletons reconstruct clean GT joints. Negative skeletons receive only
+    confidence/quality supervision in the loss. In external-box modes, only
+    successfully matched proposals receive pose supervision.
+    """
+    max_queries = max(int(max_queries), 0)
+    max_groups = max(int(max_groups), 1)
+    if max_queries < 2:
+        return None
+    if not (0.0 < positive_ks_min <= positive_ks_max <= 1.0):
+        raise ValueError("Positive keypoint-DN KS range must lie in (0, 1].")
+    if not (0.0 < negative_ks_min <= negative_ks_max <= 1.0):
+        raise ValueError("Negative keypoint-DN KS range must lie in (0, 1].")
+
+    union_count = len(UNION_KEYPOINTS)
+    sigmas = UNION_SIGMAS.to(device=device, dtype=torch.float32).view(1, -1)
+    variances = (2.0 * sigmas).square()
+    pixel_scale = max(float(image_size), 1.0)
+    eps = torch.finfo(torch.float32).eps
+    per_sample: list[dict[str, torch.Tensor]] = []
+
+    for target in targets:
+        clean_keypoints = target["keypoints"].to(device=device, dtype=torch.float32)
+        clean_valid = target["keypoint_valid"].to(device=device).bool()
+        clean_boxes = target.get("loss_boxes", target["boxes"]).to(
+            device=device, dtype=torch.float32
+        )
+        default_areas = (
+            (clean_boxes[:, 2] - clean_boxes[:, 0]).clamp(min=0.0)
+            * (clean_boxes[:, 3] - clean_boxes[:, 1]).clamp(min=0.0)
+        )
+        clean_areas = target.get("loss_areas", default_areas).to(
+            device=device, dtype=torch.float32
+        )
+        candidate = clean_valid.any(dim=-1)
+        matched = target.get("matched_gt_indices")
+        if isinstance(matched, torch.Tensor):
+            candidate = candidate & matched.to(device=device).ge(0)
+        indices = torch.nonzero(candidate, as_tuple=False).flatten()
+        max_people = max(max_queries // 2, 1)
+        indices = indices[:max_people]
+        n = int(indices.numel())
+        if n <= 0:
+            per_sample.append({
+                "noisy": torch.zeros(0, union_count, 2, device=device),
+                "labels": torch.zeros(0, device=device),
+                "targets": torch.zeros(0, union_count, 3, device=device),
+                "valid": torch.zeros(0, union_count, device=device, dtype=torch.bool),
+                "boxes": torch.zeros(0, 4, device=device),
+                "areas": torch.zeros(0, device=device),
+                "sources": torch.zeros(0, device=device, dtype=torch.long),
+                "groups": torch.zeros(0, device=device, dtype=torch.long),
+            })
+            continue
+
+        groups = min(max_groups, max(max_queries // max(2 * n, 1), 1))
+        sample_noisy: list[torch.Tensor] = []
+        sample_labels: list[float] = []
+        sample_targets: list[torch.Tensor] = []
+        sample_valid: list[torch.Tensor] = []
+        sample_boxes: list[torch.Tensor] = []
+        sample_areas: list[torch.Tensor] = []
+        sample_sources: list[int] = []
+        sample_groups: list[int] = []
+
+        for group_idx in range(groups):
+            for label, ks_min, ks_max in (
+                (1.0, positive_ks_min, positive_ks_max),
+                (0.0, negative_ks_min, negative_ks_max),
+            ):
+                for source_idx_tensor in indices:
+                    source_idx = int(source_idx_tensor.item())
+                    target_keypoints = clean_keypoints[source_idx]
+                    valid = clean_valid[source_idx]
+                    area_pixels = clean_areas[source_idx].clamp(min=eps) * pixel_scale * pixel_scale
+                    ks = torch.empty(union_count, device=device).uniform_(
+                        float(ks_min), float(ks_max)
+                    ).clamp(min=eps, max=1.0)
+                    radius_pixels = torch.sqrt(
+                        -2.0 * area_pixels * variances[0] * torch.log(ks)
+                    )
+                    theta = torch.rand(union_count, device=device) * (2.0 * math.pi)
+                    direction = torch.stack([theta.cos(), theta.sin()], dim=-1)
+                    noisy_xy = target_keypoints[..., :2] + (
+                        radius_pixels[:, None] / pixel_scale
+                    ) * direction
+                    noisy_xy = torch.where(
+                        valid[:, None], noisy_xy, target_keypoints[..., :2]
+                    ).clamp(0.0, 1.0)
+                    sample_noisy.append(noisy_xy)
+                    sample_labels.append(label)
+                    sample_targets.append(target_keypoints)
+                    sample_valid.append(valid)
+                    sample_boxes.append(clean_boxes[source_idx])
+                    sample_areas.append(clean_areas[source_idx])
+                    sample_sources.append(source_idx)
+                    sample_groups.append(group_idx)
+
+        count = min(len(sample_noisy), max_queries)
+        per_sample.append({
+            "noisy": torch.stack(sample_noisy[:count]),
+            "labels": torch.tensor(sample_labels[:count], device=device),
+            "targets": torch.stack(sample_targets[:count]),
+            "valid": torch.stack(sample_valid[:count]),
+            "boxes": torch.stack(sample_boxes[:count]),
+            "areas": torch.stack(sample_areas[:count]),
+            "sources": torch.tensor(sample_sources[:count], device=device, dtype=torch.long),
+            "groups": torch.tensor(sample_groups[:count], device=device, dtype=torch.long),
+        })
+
+    padded_count = max([int(sample["noisy"].shape[0]) for sample in per_sample] + [0])
+    if padded_count <= 0:
+        return None
+    batch_size = len(per_sample)
+    noisy = torch.zeros(batch_size, padded_count, union_count, 2, device=device)
+    mask = torch.zeros(batch_size, padded_count, device=device, dtype=torch.bool)
+    labels = torch.zeros(batch_size, padded_count, device=device)
+    target_keypoints = torch.zeros(batch_size, padded_count, union_count, 3, device=device)
+    target_valid = torch.zeros(
+        batch_size, padded_count, union_count, device=device, dtype=torch.bool
+    )
+    target_boxes = torch.zeros(batch_size, padded_count, 4, device=device)
+    target_areas = torch.zeros(batch_size, padded_count, device=device)
+    source_indices = torch.full(
+        (batch_size, padded_count), -1, device=device, dtype=torch.long
+    )
+    group_ids = torch.full(
+        (batch_size, padded_count), -1, device=device, dtype=torch.long
+    )
+    for batch_idx, sample in enumerate(per_sample):
+        count = int(sample["noisy"].shape[0])
+        if count <= 0:
+            continue
+        noisy[batch_idx, :count] = sample["noisy"]
+        labels[batch_idx, :count] = sample["labels"]
+        target_keypoints[batch_idx, :count] = sample["targets"]
+        target_valid[batch_idx, :count] = sample["valid"]
+        target_boxes[batch_idx, :count] = sample["boxes"]
+        target_areas[batch_idx, :count] = sample["areas"]
+        source_indices[batch_idx, :count] = sample["sources"]
+        group_ids[batch_idx, :count] = sample["groups"]
+        mask[batch_idx, :count] = True
+    return {
+        "keypoint_dn_noisy_keypoints": noisy,
+        "keypoint_dn_mask": mask,
+        "keypoint_dn_labels": labels,
+        "keypoint_dn_target_keypoints": target_keypoints,
+        "keypoint_dn_target_valid": target_valid,
+        "keypoint_dn_target_boxes": target_boxes,
+        "keypoint_dn_target_areas": target_areas,
+        "keypoint_dn_source_indices": source_indices,
+        "keypoint_dn_group_ids": group_ids,
+    }
+
+
+def pair_keypoint_denoising_with_box_denoising(
+    box_dn: dict[str, torch.Tensor] | None,
+    keypoint_dn: dict[str, torch.Tensor] | None,
+) -> dict[str, torch.Tensor] | None:
+    """Attach each pose-DN skeleton to its matching positive box-DN query.
+
+    Pairing is exact on ``(batch, source person, DN group)``. Both the positive
+    and negative skeleton for a person use the same positive noisy-box query;
+    negative skeletons remain quality-only examples in the pose-DN loss. Any
+    skeleton without a positive box-DN partner is masked out instead of falling
+    back to a main prediction query.
+    """
+
+    if box_dn is None or keypoint_dn is None:
+        return None
+    required_box = (
+        "dn_box_mask",
+        "dn_labels",
+        "dn_group_ids",
+        "dn_source_indices",
+    )
+    required_pose = (
+        "keypoint_dn_mask",
+        "keypoint_dn_source_indices",
+        "keypoint_dn_group_ids",
+    )
+    if not all(torch.is_tensor(box_dn.get(key)) for key in required_box):
+        return None
+    if not all(torch.is_tensor(keypoint_dn.get(key)) for key in required_pose):
+        return None
+
+    box_mask = box_dn["dn_box_mask"].bool()
+    box_positive = box_dn["dn_labels"].gt(0.5)
+    box_groups = box_dn["dn_group_ids"].long()
+    box_sources = box_dn["dn_source_indices"].long()
+    pose_mask = keypoint_dn["keypoint_dn_mask"].bool()
+    pose_groups = keypoint_dn["keypoint_dn_group_ids"].long()
+    pose_sources = keypoint_dn["keypoint_dn_source_indices"].long()
+    if box_mask.shape[0] != pose_mask.shape[0]:
+        raise ValueError("box-DN and pose-DN batch sizes must match for pairing.")
+
+    box_query_indices = torch.full_like(pose_sources, -1)
+    for batch_idx in range(int(pose_mask.shape[0])):
+        for pose_idx in torch.nonzero(pose_mask[batch_idx], as_tuple=False).flatten():
+            source = pose_sources[batch_idx, pose_idx]
+            group = pose_groups[batch_idx, pose_idx]
+            candidates = (
+                box_mask[batch_idx]
+                & box_positive[batch_idx]
+                & box_sources[batch_idx].eq(source)
+                & box_groups[batch_idx].eq(group)
+            )
+            candidate_indices = torch.nonzero(candidates, as_tuple=False).flatten()
+            if candidate_indices.numel() > 0:
+                box_query_indices[batch_idx, pose_idx] = candidate_indices[0]
+
+    paired_mask = pose_mask & box_query_indices.ge(0)
+    if not paired_mask.any():
+        return None
+    paired = dict(keypoint_dn)
+    paired["keypoint_dn_mask"] = paired_mask
+    paired["keypoint_dn_box_query_indices"] = box_query_indices
+    return paired
 
 
 def box_iou_xyxy(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -1106,6 +1698,8 @@ def align_target_to_predictions(
     selected["boxes"] = pred_boxes.clone()
     selected["loss_boxes"] = pred_boxes.clone()
     selected["loss_areas"] = pred_areas.clone()
+    selected.pop("box_jitter_scale", None)
+    selected.pop("box_jitter_shift", None)
     for key in ("keypoints", "keypoint_valid", "visibility_valid"):
         template = target[key]
         selected[key] = template.new_zeros((count, *template.shape[1:]))
@@ -1114,12 +1708,6 @@ def align_target_to_predictions(
     selected["box_context_scale"] = fallback_context.to(
         device=target_device,
         dtype=torch.float32,
-    )
-    selected["box_jitter_scale"] = torch.zeros(
-        count, device=target_device, dtype=torch.float32
-    )
-    selected["box_jitter_shift"] = torch.zeros(
-        count, device=target_device, dtype=torch.float32
     )
     matched_gt_indices = torch.full(
         (count,), -1, device=target_device, dtype=torch.long
@@ -1134,8 +1722,6 @@ def align_target_to_predictions(
         "keypoint_valid",
         "visibility_valid",
         "box_context_scale",
-        "box_jitter_scale",
-        "box_jitter_shift",
     )
     ref_query = -1
     for pred_idx, local_gt_idx, iou in matches:
@@ -1148,7 +1734,9 @@ def align_target_to_predictions(
         matched_gt_indices[pred_idx] = original_gt_idx
         match_ious[pred_idx] = float(iou)
         if task_id == 1:
-            ref_query = pred_idx
+            original_ref_target = int(target["ref_target"].detach().cpu().item())
+            if original_gt_idx == original_ref_target:
+                ref_query = pred_idx
 
     selected["matched_gt_indices"] = matched_gt_indices
     selected["match_ious"] = match_ious
@@ -1156,6 +1744,53 @@ def align_target_to_predictions(
         ref_query, device=target_device, dtype=torch.long
     )
     return selected
+
+
+def align_targets_to_person_queries(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, Any]],
+    task_ids: torch.Tensor,
+) -> list[dict[str, Any]]:
+    """Hungarian-align global person queries to all GT people in each image.
+
+    Matching is intentionally accepted at any IoU during training.  Early in
+    training the learned references are only a spatial grid; rejecting those
+    matches would remove the box regression signal needed to turn them into a
+    detector.  Unmatched queries remain explicit background negatives.
+    """
+    predicted = outputs["pred_boxes"].detach()
+    query_mask = outputs.get("box_mask")
+    aligned: list[dict[str, Any]] = []
+    for batch_idx, target in enumerate(targets):
+        if query_mask is None:
+            valid_queries = torch.ones(
+                predicted.shape[1], device=predicted.device, dtype=torch.bool
+            )
+        else:
+            valid_queries = query_mask[batch_idx].detach().bool()
+        query_indices = torch.nonzero(valid_queries, as_tuple=False).flatten()
+        sample_predictions = predicted[batch_idx, query_indices]
+        gt_boxes = target.get("loss_boxes", target["boxes"])
+        gt_indices = list(range(int(gt_boxes.shape[0])))
+        local_matches = hungarian_match_boxes(
+            sample_predictions,
+            gt_boxes,
+            iou_thresh=0.0,
+        )
+        matches = [
+            (int(query_indices[pred_idx].item()), gt_idx, iou)
+            for pred_idx, gt_idx, iou in local_matches
+        ]
+        aligned.append(
+            align_target_to_predictions(
+                target,
+                predicted[batch_idx],
+                gt_indices,
+                matches,
+                task_id=int(task_ids[batch_idx].detach().cpu().item()),
+            )
+        )
+    return aligned
 
 
 def _extract_first_json_object(text: str) -> str | None:
@@ -1470,6 +2105,22 @@ def _extract_ref_description_from_prompt(prompt: str) -> str:
     return "person"
 
 
+REFHUMAN_FALLBACK_MARKER = "<refhuman_all_person_fallback>"
+
+
+def build_refhuman_locate_prompt(ref_text: str) -> str:
+    ref_text = str(ref_text).strip() or "person"
+    return f'Locate the person that matches the following description: "{ref_text}".'
+
+
+def build_refhuman_fallback_prompt(ref_text: str) -> str:
+    ref_text = str(ref_text).strip() or "person"
+    return (
+        "Locate all visible people in the image and return every person box. "
+        f'The downstream target description is: "{ref_text}".'
+    )
+
+
 def build_locate_generation_prompts(batch: dict) -> list[str]:
     prompts: list[str] = []
     ref_texts = batch.get("ref_texts") or [""] * len(batch.get("prompts", []))
@@ -1479,7 +2130,7 @@ def build_locate_generation_prompts(batch: dict) -> list[str]:
             ref_text = str(ref_texts[sample_idx]).strip() if sample_idx < len(ref_texts) else ""
             if not ref_text:
                 ref_text = _extract_ref_description_from_prompt(str(source_prompt))
-            prompts.append(f'Locate a single person that matches the following description: "{ref_text}".')
+            prompts.append(build_refhuman_locate_prompt(ref_text))
         else:
             prompts.append("Locate all the instances that match the following description: person.")
     return prompts
@@ -1523,7 +2174,12 @@ def parse_locate_boxes_for_task(
     disable_pre_pose_nms: bool,
 ) -> torch.Tensor:
     """Parse one Locate response with the exact train/eval/infer filtering policy."""
+    is_refhuman_fallback = int(task_id) == 1 and REFHUMAN_FALLBACK_MARKER in str(response)
     boxes = parse_locate_bbox_response(response, max_instances=max_instances)
+    if int(task_id) == 1 and not is_refhuman_fallback:
+        # The direct RefHuman grounding contract is one expression -> one box.
+        # If a model emits extras, generation order is its grounding decision.
+        return boxes[:1]
     if disable_pre_pose_nms:
         boxes = boxes[:max_instances]
     else:
@@ -1532,8 +2188,6 @@ def parse_locate_boxes_for_task(
             iou_thresh=nms_iou_thresh,
             max_boxes=max_instances,
         )
-    if int(task_id) == 1 and int(boxes.shape[0]) > 1:
-        boxes = boxes[:1]
     return boxes
 
 
@@ -1581,16 +2235,33 @@ def _normalize_locate_generate_output(response: object) -> str:
     return str(response).strip()
 
 
+def locate_generation_token_budget(
+    requested_max_new_tokens: int,
+    max_instances: int,
+    *,
+    task_id: int,
+) -> int:
+    """Cap decoding to the number of box tokens the task can actually use.
+
+    A Locate box uses six structural/coordinate tokens. The extra allowance
+    covers termination and an occasional hybrid-mode recovery token without
+    permitting a malformed response to decode to the full model context.
+    """
+
+    expected_instances = 1 if int(task_id) == 1 else max(int(max_instances), 1)
+    task_budget = 8 * expected_instances + 16
+    return max(8, min(max(int(requested_max_new_tokens), 1), task_budget))
+
+
 def generate_locate_bbox_responses(
     training_model: torch.nn.Module,
     processor,
     batch: dict,
     device: torch.device,
     *,
+    max_instances: int,
     max_new_tokens: int,
     generation_mode: str,
-    min_pixels: int | None = None,
-    max_pixels: int | None = None,
     image_token_limit: int | None = None,
 ) -> list[str]:
     module = unwrap_training_model(training_model)
@@ -1617,10 +2288,14 @@ def generate_locate_bbox_responses(
                     [image_path],
                     [prompt],
                     device,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
                     image_token_limit=image_token_limit,
                     image_tensors=None if vision_images is None else [vision_images[sample_idx]],
+                )
+                task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+                sample_max_new_tokens = locate_generation_token_budget(
+                    max_new_tokens,
+                    max_instances,
+                    task_id=task_id,
                 )
                 response = locate_model.generate(
                     pixel_values=inputs["pixel_values"],
@@ -1628,55 +2303,52 @@ def generate_locate_bbox_responses(
                     attention_mask=inputs.get("attention_mask"),
                     image_grid_hws=inputs.get("image_grid_hws"),
                     tokenizer=tokenizer,
-                    max_new_tokens=max(1, int(max_new_tokens)),
+                    max_new_tokens=sample_max_new_tokens,
                     use_cache=True,
                     generation_mode=str(generation_mode),
                     do_sample=False,
                     verbose=False,
                 )
-                responses.append(_normalize_locate_generate_output(response))
+                response_text = _normalize_locate_generate_output(response)
+                if task_id == 1 and parse_locate_bbox_response(response_text, max_instances=1).numel() == 0:
+                    ref_texts = batch.get("ref_texts") or []
+                    ref_text = str(ref_texts[sample_idx]).strip() if sample_idx < len(ref_texts) else ""
+                    if not ref_text:
+                        ref_text = _extract_ref_description_from_prompt(str(batch["prompts"][sample_idx]))
+                    fallback_inputs = build_eagle_inputs(
+                        processor,
+                        [image_path],
+                        [build_refhuman_fallback_prompt(ref_text)],
+                        device,
+                        image_token_limit=image_token_limit,
+                        image_tensors=None if vision_images is None else [vision_images[sample_idx]],
+                    )
+                    fallback_response = locate_model.generate(
+                        pixel_values=fallback_inputs["pixel_values"],
+                        input_ids=fallback_inputs["input_ids"],
+                        attention_mask=fallback_inputs.get("attention_mask"),
+                        image_grid_hws=fallback_inputs.get("image_grid_hws"),
+                        tokenizer=tokenizer,
+                        max_new_tokens=locate_generation_token_budget(
+                            max_new_tokens,
+                            max_instances,
+                            task_id=0,
+                        ),
+                        use_cache=True,
+                        generation_mode=str(generation_mode),
+                        do_sample=False,
+                        verbose=False,
+                    )
+                    response_text = (
+                        REFHUMAN_FALLBACK_MARKER
+                        + "\n"
+                        + _normalize_locate_generate_output(fallback_response)
+                    )
+                responses.append(response_text)
     finally:
         if was_training:
             locate_model.train()
     return responses
-
-
-def prepare_locate_generated_box_conditioning(
-    training_model: torch.nn.Module,
-    processor,
-    batch: dict,
-    device: torch.device,
-    max_instances: int,
-    *,
-    max_new_tokens: int,
-    generation_mode: str,
-    match_iou_thresh: float,
-    nms_iou_thresh: float,
-    min_pixels: int | None = None,
-    max_pixels: int | None = None,
-    image_token_limit: int | None = None,
-    disable_pre_pose_nms: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
-    responses = generate_locate_bbox_responses(
-        training_model,
-        processor,
-        batch,
-        device,
-        max_new_tokens=max_new_tokens,
-        generation_mode=generation_mode,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-        image_token_limit=image_token_limit,
-    )
-    return prepare_locate_generated_box_conditioning_from_responses(
-        responses,
-        batch,
-        device,
-        max_instances=max_instances,
-        match_iou_thresh=match_iou_thresh,
-        nms_iou_thresh=nms_iou_thresh,
-        disable_pre_pose_nms=disable_pre_pose_nms,
-    )
 
 
 def prepare_locate_generated_box_conditioning_from_responses(
@@ -1745,10 +2417,9 @@ def generate_locate_bbox_responses_with_features(
     batch: dict,
     device: torch.device,
     *,
+    max_instances: int,
     max_new_tokens: int,
     generation_mode: str,
-    min_pixels: int | None = None,
-    max_pixels: int | None = None,
     image_token_limit: int | None = None,
     single_pass_prompt: str = "locate",
 ) -> tuple[list[str], torch.Tensor, torch.Tensor]:
@@ -1782,19 +2453,48 @@ def generate_locate_bbox_responses_with_features(
                 [image_path],
                 [prompt],
                 device,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
                 image_token_limit=image_token_limit,
                 image_tensors=None if vision_images is None else [vision_images[sample_idx]],
             )
             response, feature_map, text_embed = module.backbone_extractor.generate_response_with_cached_features(
                 inputs,
                 tokenizer,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=locate_generation_token_budget(
+                    max_new_tokens,
+                    max_instances,
+                    task_id=int(batch["task_ids"][sample_idx].detach().cpu().item()),
+                ),
                 generation_mode=generation_mode,
                 do_sample=False,
                 temperature=0,
             )
+            task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+            if task_id == 1 and parse_locate_bbox_response(response, max_instances=1).numel() == 0:
+                ref_texts = batch.get("ref_texts") or []
+                ref_text = str(ref_texts[sample_idx]).strip() if sample_idx < len(ref_texts) else ""
+                if not ref_text:
+                    ref_text = _extract_ref_description_from_prompt(str(batch["prompts"][sample_idx]))
+                fallback_inputs = build_eagle_inputs(
+                    processor,
+                    [image_path],
+                    [build_refhuman_fallback_prompt(ref_text)],
+                    device,
+                    image_token_limit=image_token_limit,
+                    image_tensors=None if vision_images is None else [vision_images[sample_idx]],
+                )
+                fallback_response, _, _ = module.backbone_extractor.generate_response_with_cached_features(
+                    fallback_inputs,
+                    tokenizer,
+                    max_new_tokens=locate_generation_token_budget(
+                        max_new_tokens,
+                        max_instances,
+                        task_id=0,
+                    ),
+                    generation_mode=generation_mode,
+                    do_sample=False,
+                    temperature=0,
+                )
+                response = REFHUMAN_FALLBACK_MARKER + "\n" + str(fallback_response)
             responses.append(response)
             feature_maps.append(feature_map)
             text_embeds.append(text_embed)
@@ -1805,16 +2505,71 @@ def generate_locate_bbox_responses_with_features(
     return responses, torch.cat(feature_maps, dim=0), torch.cat(text_embeds, dim=0)
 
 
+def parse_layer_selection(spec: str) -> set[int]:
+    """Parse comma-separated layer indices/ranges such as ``15-26,30``."""
+    selected: set[int] = set()
+    for raw_token in str(spec).split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start < 0 or end < start:
+                raise ValueError(f"Invalid layer range: {token!r}")
+            selected.update(range(start, end + 1))
+        else:
+            index = int(token)
+            if index < 0:
+                raise ValueError(f"Invalid layer index: {token!r}")
+            selected.add(index)
+    return selected
+
+
+def parse_module_selection(spec: str) -> set[str]:
+    return {token.strip() for token in str(spec).split(",") if token.strip()}
+
+
+def _adapter_layer_index(name: str, *, vision: bool) -> int | None:
+    pattern = (
+        r"vision_model(?:\.[^.]+)*\.(?:blocks|layers)\.(\d+)\."
+        if vision
+        else r"language_model(?:\.[^.]+)*\.layers\.(\d+)\."
+    )
+    match = re.search(pattern, name)
+    return int(match.group(1)) if match else None
+
+
+def _adapter_projection_name(name: str) -> str | None:
+    match = re.search(r"\.([A-Za-z0-9_]+)\.lora_[AB](?:\.|$)", name)
+    return match.group(1) if match else None
+
+
 def configure_backbone_train_scope(
     model: torch.nn.Module | None,
     scope: str,
     *,
     train_projector: bool = False,
+    llm_layers: str = "32-35",
+    vision_layers: str = "15-26",
+    llm_modules: str = "q_proj,v_proj",
+    vision_modules: str = "wqkv,wo,fc0,fc1",
 ) -> dict[str, int]:
     """Enable exactly the requested pretrained-backbone adapter parameters."""
     scope = str(scope)
-    if scope not in {"frozen", "vision_lora", "all_lora"}:
+    if scope not in {"frozen", "vision_lora", "all_lora", "selective_lora"}:
         raise ValueError(f"Unsupported backbone train scope: {scope!r}")
+    selected_llm_layers = parse_layer_selection(llm_layers)
+    selected_vision_layers = parse_layer_selection(vision_layers)
+    selected_llm_modules = parse_module_selection(llm_modules)
+    selected_vision_modules = parse_module_selection(vision_modules)
+    if scope == "selective_lora":
+        if not selected_llm_layers or not selected_vision_layers:
+            raise ValueError("selective_lora requires non-empty LLM and vision layer selections.")
+        if not selected_llm_modules or not selected_vision_modules:
+            raise ValueError("selective_lora requires non-empty LLM and vision module selections.")
+
     counts = {"vision_lora": 0, "language_lora": 0, "projector": 0}
     if model is None:
         return counts
@@ -1827,6 +2582,19 @@ def configure_backbone_train_scope(
             enabled = is_lora and is_vision
         elif scope == "all_lora":
             enabled = is_lora or (train_projector and is_projector)
+        elif scope == "selective_lora" and is_lora:
+            layer_index = _adapter_layer_index(name, vision=is_vision)
+            projection_name = _adapter_projection_name(name)
+            if is_vision:
+                enabled = (
+                    layer_index in selected_vision_layers
+                    and projection_name in selected_vision_modules
+                )
+            else:
+                enabled = (
+                    layer_index in selected_llm_layers
+                    and projection_name in selected_llm_modules
+                )
         param.requires_grad = bool(enabled)
         if not enabled:
             continue
@@ -1836,6 +2604,15 @@ def configure_backbone_train_scope(
             counts["vision_lora"] += param.numel()
         else:
             counts["language_lora"] += param.numel()
+    if scope == "selective_lora":
+        if counts["vision_lora"] == 0:
+            raise RuntimeError(
+                "selective_lora matched no vision LoRA parameters; check layer/module names."
+            )
+        if counts["language_lora"] == 0:
+            raise RuntimeError(
+                "selective_lora matched no language LoRA parameters; check layer/module names."
+            )
     return counts
 
 
@@ -1857,6 +2634,10 @@ class QwenPoseTrainingModel(torch.nn.Module):
         freeze_backbone: bool = False,
         backbone_train_scope: str = "all_lora",
         train_backbone_projector: bool = False,
+        backbone_llm_layers: str = "32-35",
+        backbone_vision_layers: str = "15-26",
+        backbone_llm_modules: str = "q_proj,v_proj",
+        backbone_vision_modules: str = "wqkv,wo,fc0,fc1",
     ) -> None:
         super().__init__()
         self.pose_model = pose_model
@@ -1884,10 +2665,18 @@ class QwenPoseTrainingModel(torch.nn.Module):
 
         requested_scope = "frozen" if self.freeze_backbone else str(backbone_train_scope)
         self.backbone_train_scope = requested_scope
+        self.backbone_llm_layers = str(backbone_llm_layers)
+        self.backbone_vision_layers = str(backbone_vision_layers)
+        self.backbone_llm_modules = str(backbone_llm_modules)
+        self.backbone_vision_modules = str(backbone_vision_modules)
         self.backbone_trainable_counts = configure_backbone_train_scope(
             self.backbone_model,
             requested_scope,
             train_projector=train_backbone_projector,
+            llm_layers=self.backbone_llm_layers,
+            vision_layers=self.backbone_vision_layers,
+            llm_modules=self.backbone_llm_modules,
+            vision_modules=self.backbone_vision_modules,
         )
         self.freeze_backbone = requested_scope == "frozen"
 
@@ -1905,6 +2694,22 @@ class QwenPoseTrainingModel(torch.nn.Module):
         target_boxes: torch.Tensor | None = None,
         target_box_mask: torch.Tensor | None = None,
         images: torch.Tensor | None = None,
+        dn_boxes: torch.Tensor | None = None,
+        dn_box_mask: torch.Tensor | None = None,
+        dn_labels: torch.Tensor | None = None,
+        dn_target_boxes: torch.Tensor | None = None,
+        dn_group_ids: torch.Tensor | None = None,
+        dn_source_indices: torch.Tensor | None = None,
+        keypoint_dn_noisy_keypoints: torch.Tensor | None = None,
+        keypoint_dn_mask: torch.Tensor | None = None,
+        keypoint_dn_labels: torch.Tensor | None = None,
+        keypoint_dn_target_keypoints: torch.Tensor | None = None,
+        keypoint_dn_target_valid: torch.Tensor | None = None,
+        keypoint_dn_target_boxes: torch.Tensor | None = None,
+        keypoint_dn_target_areas: torch.Tensor | None = None,
+        keypoint_dn_source_indices: torch.Tensor | None = None,
+        keypoint_dn_group_ids: torch.Tensor | None = None,
+        keypoint_dn_box_query_indices: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         extra = {}
         lm_loss = None
@@ -1939,21 +2744,51 @@ class QwenPoseTrainingModel(torch.nn.Module):
                     external_feature_map, external_text_embed = self.backbone_extractor(
                         qwen_inputs,
                         freeze_eagle=self.freeze_backbone,
+                        require_text=bool(task_ids.eq(1).any().item()),
                     )
+                    if qwen_lm_inputs is not None and not self.freeze_backbone:
+                        # LocateAnything's custom top-level forward performs an
+                        # in-place image-token write which is incompatible with
+                        # PEFT's input-gradient hook.  Reuse the extractor's
+                        # clone-based injection path, then project only response
+                        # tokens through lm_head instead of materializing full
+                        # vocabulary logits for the whole prompt.
+                        (
+                            locate_base_model,
+                            lm_input_ids,
+                            lm_attention_mask,
+                            lm_pixel_values,
+                            lm_image_grid_hws,
+                        ) = self.backbone_extractor._prepare_locate_inputs(qwen_lm_inputs)
+                        _, _, projected_visual_tokens = self.backbone_extractor.run_vision_tokens(
+                            lm_pixel_values,
+                            lm_image_grid_hws,
+                        )
+                        lm_hidden = self.backbone_extractor.run_language_hidden(
+                            lm_input_ids,
+                            lm_attention_mask,
+                            projected_visual_tokens,
+                        )
+                        shift_labels = qwen_lm_inputs["labels"][:, 1:].contiguous()
+                        valid_label_mask = shift_labels.ne(-100)
+                        if valid_label_mask.any():
+                            target_hidden = lm_hidden[:, :-1, :][valid_label_mask]
+                            target_labels = shift_labels[valid_label_mask]
+                            target_logits = locate_base_model.language_model.lm_head(
+                                target_hidden
+                            ).float()
+                            lm_loss = F.cross_entropy(
+                                target_logits,
+                                target_labels,
+                                reduction="mean",
+                            )
+                        else:
+                            lm_loss = lm_hidden.new_zeros(())
                 else:
                     external_feature_map, external_text_embed = self.backbone_extractor(
                         qwen_inputs,
                         freeze_qwen=self.freeze_backbone,
                     )
-                if qwen_lm_inputs is not None and not self.freeze_backbone:
-                    if self.backbone_name == "eagle":
-                        allowed = {"pixel_values", "image_grid_hws", "image_flags", "input_ids", "attention_mask"}
-                        lm_forward_inputs = {key: value for key, value in qwen_lm_inputs.items() if key in allowed}
-                    else:
-                        lm_forward_inputs = qwen_forward_kwargs(qwen_lm_inputs)
-                    lm_forward_inputs["labels"] = qwen_lm_inputs["labels"]
-                    lm_outputs = self.backbone_model(**lm_forward_inputs, use_cache=False)
-                    lm_loss = lm_outputs.loss
             extra = {
                 "external_feature_map": external_feature_map,
                 "external_text_embed": external_text_embed,
@@ -1964,6 +2799,22 @@ class QwenPoseTrainingModel(torch.nn.Module):
             images=images,
             target_boxes=target_boxes,
             target_box_mask=target_box_mask,
+            dn_boxes=dn_boxes,
+            dn_box_mask=dn_box_mask,
+            dn_labels=dn_labels,
+            dn_target_boxes=dn_target_boxes,
+            dn_group_ids=dn_group_ids,
+            dn_source_indices=dn_source_indices,
+            keypoint_dn_noisy_keypoints=keypoint_dn_noisy_keypoints,
+            keypoint_dn_mask=keypoint_dn_mask,
+            keypoint_dn_labels=keypoint_dn_labels,
+            keypoint_dn_target_keypoints=keypoint_dn_target_keypoints,
+            keypoint_dn_target_valid=keypoint_dn_target_valid,
+            keypoint_dn_target_boxes=keypoint_dn_target_boxes,
+            keypoint_dn_target_areas=keypoint_dn_target_areas,
+            keypoint_dn_source_indices=keypoint_dn_source_indices,
+            keypoint_dn_group_ids=keypoint_dn_group_ids,
+            keypoint_dn_box_query_indices=keypoint_dn_box_query_indices,
             **extra,
         )
         if lm_loss is not None:
@@ -1975,16 +2826,14 @@ class QwenPoseTrainingModel(torch.nn.Module):
 class LocatePoseUnifiedConfig:
     max_instances: int = 80
     qwen_box_max_new_tokens: int = 4096
-    locate_box_max_new_tokens: int = 8192
+    locate_box_max_new_tokens: int = 512
     locate_generation_mode: str = "hybrid"
     box_match_iou_thresh: float = 0.10
     box_nms_iou_thresh: float = 0.70
     disable_pre_pose_nms: bool = True
-    post_pose_nms_iou_thresh: float = 0.95
+    locate_generate_refhuman_only: bool = True
     qwen_min_pixels: int | None = None
     qwen_max_pixels: int | None = None
-    eagle_min_pixels: int | None = None
-    eagle_max_pixels: int | None = None
     eagle_image_token_limit: int | None = None
     eagle_batch_token_limit: int | None = None
     single_pass_prompt: str = "locate"
@@ -2004,16 +2853,16 @@ class LocatePoseUnifiedConfig:
         return cls(
             max_instances=int(getattr(args, "max_instances", 80)),
             qwen_box_max_new_tokens=int(getattr(args, "qwen_box_max_new_tokens", 4096)),
-            locate_box_max_new_tokens=int(getattr(args, "locate_box_max_new_tokens", 8192)),
+            locate_box_max_new_tokens=int(getattr(args, "locate_box_max_new_tokens", 512)),
             locate_generation_mode=str(getattr(args, "locate_generation_mode", "hybrid")),
             box_match_iou_thresh=float(getattr(args, "box_match_iou_thresh", 0.10)),
             box_nms_iou_thresh=float(getattr(args, "box_nms_iou_thresh", 0.70)),
             disable_pre_pose_nms=bool(getattr(args, "disable_pre_pose_nms", True)),
-            post_pose_nms_iou_thresh=float(getattr(args, "post_pose_nms_iou_thresh", 0.95)),
+            locate_generate_refhuman_only=bool(
+                getattr(args, "locate_generate_refhuman_only", True)
+            ),
             qwen_min_pixels=getattr(args, "qwen_min_pixels", None),
             qwen_max_pixels=getattr(args, "qwen_max_pixels", None),
-            eagle_min_pixels=getattr(args, "eagle_min_pixels", None),
-            eagle_max_pixels=getattr(args, "eagle_max_pixels", None),
             eagle_image_token_limit=getattr(args, "eagle_image_token_limit", None),
             eagle_batch_token_limit=getattr(args, "eagle_batch_token_limit", None),
             single_pass_prompt=str(getattr(args, "single_pass_prompt", "locate")),
@@ -2079,8 +2928,6 @@ class LocatePoseUnifiedRuntime:
                 batch["image_paths"],
                 None if vision_only else batch["prompts"],
                 self.device,
-                min_pixels=config.eagle_min_pixels,
-                max_pixels=config.eagle_max_pixels,
                 image_token_limit=config.eagle_image_token_limit,
                 batch_token_limit=config.eagle_batch_token_limit,
                 image_tensors=batch.get("vision_images"),
@@ -2105,10 +2952,9 @@ class LocatePoseUnifiedRuntime:
                 self.processor,
                 batch,
                 self.device,
+                max_instances=config.max_instances,
                 max_new_tokens=config.locate_box_max_new_tokens,
                 generation_mode=config.locate_generation_mode,
-                min_pixels=config.eagle_min_pixels,
-                max_pixels=config.eagle_max_pixels,
                 image_token_limit=config.eagle_image_token_limit,
                 single_pass_prompt=config.single_pass_prompt,
             )
@@ -2118,10 +2964,9 @@ class LocatePoseUnifiedRuntime:
             self.processor,
             batch,
             self.device,
+            max_instances=config.max_instances,
             max_new_tokens=config.locate_box_max_new_tokens,
             generation_mode=config.locate_generation_mode,
-            min_pixels=config.eagle_min_pixels,
-            max_pixels=config.eagle_max_pixels,
             image_token_limit=config.eagle_image_token_limit,
         )
         return responses, None, None
@@ -2215,6 +3060,47 @@ class LocatePoseUnifiedRuntime:
         *,
         precomputed_locate_responses: list[str] | None = None,
     ) -> LocatePoseUnifiedResult:
+        if bool(self.module.pose_model.config.use_global_person_queries):
+            batch_size = int(batch["schema_ids"].shape[0])
+            placeholder_boxes = torch.zeros(
+                batch_size, 1, 4, device=self.device, dtype=torch.float32
+            )
+            placeholder_mask = torch.zeros(
+                batch_size, 1, device=self.device, dtype=torch.bool
+            )
+            outputs, qwen_inputs = self.forward_pose(
+                batch,
+                placeholder_boxes,
+                placeholder_mask,
+                config,
+            )
+            predicted_boxes = outputs["pred_boxes"]
+            predicted_mask = outputs["box_mask"]
+            predicted_abs: list[list[list[float]]] = []
+            for sample_idx, target in enumerate(batch["targets"]):
+                width = float(target["width"])
+                height = float(target["height"])
+                sample_boxes = predicted_boxes[sample_idx][predicted_mask[sample_idx]]
+                predicted_abs.append(
+                    [
+                        [
+                            float(box[0]) * width,
+                            float(box[1]) * height,
+                            float(box[2]) * width,
+                            float(box[3]) * height,
+                        ]
+                        for box in sample_boxes.detach().cpu().tolist()
+                    ]
+                )
+            return LocatePoseUnifiedResult(
+                outputs=outputs,
+                target_boxes=predicted_boxes,
+                target_box_mask=predicted_mask,
+                locate_responses=None,
+                locate_boxes_abs=predicted_abs,
+                qwen_inputs=qwen_inputs,
+                used_single_pass_features=True,
+            )
         external_feature_map = None
         external_text_embed = None
         if precomputed_locate_responses is None:
@@ -2253,6 +3139,13 @@ class LocatePoseUnifiedRuntime:
         *,
         box_source: str,
     ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
+        if box_source == "person_queries":
+            return prepare_person_query_conditioning(
+                batch["targets"],
+                batch["task_ids"],
+                self.device,
+                max_instances=config.max_instances,
+            )
         if box_source == "qwen_generate":
             return prepare_qwen_generated_box_conditioning(
                 self.model,
@@ -2267,7 +3160,20 @@ class LocatePoseUnifiedRuntime:
                 max_pixels=config.qwen_max_pixels,
             )
         if box_source == "locate_generate":
-            return prepare_locate_generated_box_conditioning(
+            # The restored recipe closed the loop only for RefHuman. Regular
+            # pose datasets keep clean GT box conditioning for PoseHead.
+            if config.locate_generate_refhuman_only and not bool(
+                batch["task_ids"].eq(1).any().item()
+            ):
+                return prepare_box_conditioning(
+                    batch["targets"],
+                    batch["task_ids"],
+                    self.device,
+                    max_instances=config.max_instances,
+                    box_jitter_scale=config.box_jitter_scale,
+                    box_jitter_shift=config.box_jitter_shift,
+                )
+            responses = generate_locate_bbox_responses(
                 self.model,
                 self.processor,
                 batch,
@@ -2275,11 +3181,15 @@ class LocatePoseUnifiedRuntime:
                 max_instances=config.max_instances,
                 max_new_tokens=config.locate_box_max_new_tokens,
                 generation_mode=config.locate_generation_mode,
+                image_token_limit=config.eagle_image_token_limit,
+            )
+            return prepare_locate_generated_box_conditioning_from_responses(
+                responses,
+                batch,
+                self.device,
+                max_instances=config.max_instances,
                 match_iou_thresh=config.box_match_iou_thresh,
                 nms_iou_thresh=config.box_nms_iou_thresh,
-                min_pixels=config.eagle_min_pixels,
-                max_pixels=config.eagle_max_pixels,
-                image_token_limit=config.eagle_image_token_limit,
                 disable_pre_pose_nms=config.disable_pre_pose_nms,
             )
         return prepare_box_conditioning(
@@ -2309,7 +3219,14 @@ class LocatePoseUnifiedRuntime:
         external_text_embed = None
         responses: list[str] | None = None
         locate_boxes_abs: list[list[list[float]]] | None = None
-        if box_source == "qwen_generate":
+        if box_source == "person_queries":
+            target_boxes, target_box_mask, pose_targets = prepare_person_query_conditioning(
+                batch["targets"],
+                batch["task_ids"],
+                self.device,
+                max_instances=config.max_instances,
+            )
+        elif box_source == "qwen_generate":
             target_boxes, target_box_mask, pose_targets = prepare_qwen_generated_box_conditioning(
                 self.model,
                 self.processor,
@@ -2381,6 +3298,12 @@ class LocatePoseUnifiedRuntime:
             external_feature_map=external_feature_map,
             external_text_embed=external_text_embed,
         )
+        if box_source == "person_queries":
+            pose_targets = align_targets_to_person_queries(
+                outputs,
+                pose_targets,
+                batch["task_ids"],
+            )
         return LocatePoseUnifiedResult(
             outputs=outputs,
             target_boxes=target_boxes,
@@ -2465,6 +3388,58 @@ def synchronized_finite_check(
     return False, bad_names
 
 
+def deepspeed_partition_nonfinite_names(
+    active_model: torch.nn.Module,
+    training_model: torch.nn.Module,
+    device: torch.device,
+    *,
+    max_bad_names_per_rank: int = 8,
+) -> list[str]:
+    """Name non-finite ZeRO-1/2 partition gradients before ``step`` clears them.
+
+    ZeRO-2 moves reduced gradients out of ``Parameter.grad`` into
+    ``optimizer.averaged_gradients`` during backward.  Consequently a normal
+    parameter-gradient scan can report no offending name even though
+    DeepSpeed correctly rejects the update.  The lists in
+    ``averaged_gradients`` follow ``params_in_partition``; use that association
+    here and gather the small set of names from every data-parallel rank.
+    """
+    optimizer = getattr(active_model, "optimizer", None)
+    averaged_gradients = getattr(optimizer, "averaged_gradients", None)
+    params_in_partition = getattr(optimizer, "params_in_partition", None)
+    if not isinstance(averaged_gradients, dict) or params_in_partition is None:
+        return []
+
+    parameter_names = {id(parameter): name for name, parameter in training_model.named_parameters()}
+    local_bad: list[str] = []
+    for group_index, partition_parameters in enumerate(params_in_partition):
+        partition_gradients = averaged_gradients.get(group_index)
+        if partition_gradients is None:
+            continue
+        for parameter, gradient in zip(partition_parameters, partition_gradients):
+            if gradient is None or bool(torch.isfinite(gradient.detach()).all().item()):
+                continue
+            name = parameter_names.get(id(parameter), f"optimizer_group_{group_index}.unknown_parameter")
+            local_bad.append(name)
+            if len(local_bad) >= max_bad_names_per_rank:
+                break
+        if len(local_bad) >= max_bad_names_per_rank:
+            break
+
+    any_bad = distributed_any(bool(local_bad), device)
+    if not any_bad:
+        return []
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        gathered: list[list[str] | None] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_bad)
+        return [
+            f"rank{rank}:{name}"
+            for rank, names in enumerate(gathered)
+            for name in (names or [])
+        ]
+    return local_bad
+
+
 def update_progress_bar(progress_bar, postfix: dict[str, object]) -> None:
     if progress_bar is not None:
         progress_bar.set_postfix(postfix, refresh=False)
@@ -2546,6 +3521,7 @@ class HomogeneousDatasetBatchSampler:
         self.balance_vision_tokens = bool(balance_vision_tokens)
         self.vision_token_limit = None if vision_token_limit is None else int(vision_token_limit)
         self.epoch = 0
+        self.start_batch = 0
         self._cached_batches: list[list[int]] | None = None
 
     @staticmethod
@@ -2571,7 +3547,13 @@ class HomogeneousDatasetBatchSampler:
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        self.start_batch = 0
         self._cached_batches = None
+        set_pose_dataset_epoch(self.dataset, self.epoch)
+
+    def set_start_batch(self, start_batch: int) -> None:
+        """Start iteration at a batch offset without materializing dataset samples."""
+        self.start_batch = max(int(start_batch), 0)
 
     def _sample_cost(self, dataset_idx: int, local_linear: int) -> int:
         """Estimate activation cost without opening the image file."""
@@ -2606,13 +3588,27 @@ class HomogeneousDatasetBatchSampler:
         inner_datasets = list(getattr(self.dataset, "datasets"))
         global_batch_size = self.batch_size * self.world_size
         for dataset_idx, inner_dataset in enumerate(inner_datasets):
-            n = len(inner_dataset)
+            n = (
+                int(self.dataset.sample_count_for_epoch(dataset_idx, self.epoch))
+                if hasattr(self.dataset, "sample_count_for_epoch")
+                else len(inner_dataset)
+            )
             if n <= 0:
                 per_dataset_batches.append([])
                 batch_counts.append(0)
                 continue
 
-            local_linear = list(range(n))
+            if hasattr(self.dataset, "sample_linear_indices_for_epoch"):
+                local_linear = list(
+                    self.dataset.sample_linear_indices_for_epoch(dataset_idx, self.epoch)
+                )
+            else:
+                start_offset = (
+                    int(self.dataset.sample_start_for_epoch(dataset_idx, self.epoch))
+                    if hasattr(self.dataset, "sample_start_for_epoch")
+                    else 0
+                )
+                local_linear = list(range(start_offset, start_offset + n))
             dataset_rng = random.Random(self.seed + self.epoch * 1009 + dataset_idx * 9176)
             sample_costs: dict[int, int] = {}
             if self.balance_vision_tokens:
@@ -2712,7 +3708,7 @@ class HomogeneousDatasetBatchSampler:
 
     def __iter__(self):
         self._cached_batches = self._build_batches()
-        yield from self._cached_batches
+        yield from self._cached_batches[self.start_batch :]
 
     def __len__(self) -> int:
         if self._cached_batches is None:
@@ -2747,11 +3743,11 @@ def compute_pose_diagnostics(
             is_ref = int(task_ids[sample_idx].detach().cpu().item()) == 1
             if is_ref:
                 ref_total += 1
-                matched_gt_indices = target.get("matched_gt_indices")
-                if isinstance(matched_gt_indices, torch.Tensor):
-                    ref_matched += int(bool((matched_gt_indices[:n] >= 0).any().item()))
+                ref_target = target.get("ref_target")
+                if isinstance(ref_target, torch.Tensor) and ref_target.numel() == 1:
+                    ref_matched += int(int(ref_target.detach().cpu().item()) >= 0)
                 else:
-                    ref_matched += int(n > 0)
+                    ref_matched += 0
             if n <= 0:
                 continue
 
@@ -2809,7 +3805,7 @@ def compute_pose_diagnostics(
     diagnostics = {
         "metric_image_mae": image_error_sum / denom,
         "metric_box_relative_mae": box_error_sum / denom,
-        "metric_simcc_clipped_ratio": clipped_joint_count / denom,
+        "metric_pose_box_clipped_ratio": clipped_joint_count / denom,
         "metric_valid_joint_count": valid_joint_count,
     }
     if mpii_area_ratio_count > 0:
@@ -2836,10 +3832,17 @@ def update_dataset_metric_ema(
         "loss_coord",
         "loss_image_coord",
         "loss_oks",
-        "loss_vis",
+        "loss_keypoint_confidence",
+        "loss_person_confidence",
+        "loss_ref_match",
+        "ref_match_accuracy",
+        "ref_match_margin",
+        "person_quality_target_mean",
+        "person_confidence_mean",
+        "person_confidence_std",
         "metric_image_mae",
         "metric_box_relative_mae",
-        "metric_simcc_clipped_ratio",
+        "metric_pose_box_clipped_ratio",
         "metric_valid_joint_count",
         "metric_mpii_condition_base_area_ratio",
         "metric_refhuman_match_rate",
@@ -2867,8 +3870,10 @@ def format_dataset_metric_ema(
             ("loss_image_coord", "img_loss"),
             ("metric_image_mae", "img_mae"),
             ("metric_box_relative_mae", "box_mae"),
-            ("metric_simcc_clipped_ratio", "clip"),
-            ("metric_refhuman_match_rate", "match"),
+            ("metric_pose_box_clipped_ratio", "clip"),
+            ("metric_refhuman_match_rate", "proposal_match"),
+            ("ref_match_accuracy", "ref_acc"),
+            ("ref_match_margin", "ref_margin"),
             ("metric_mpii_condition_base_area_ratio", "area_ratio"),
         ):
             if key in metrics:
@@ -2881,18 +3886,40 @@ def build_progress_loss_postfix(
     loss_metrics: dict[str, float],
     weights: LossWeights,
 ) -> dict[str, str]:
-    """Build a compact tqdm postfix from weighted loss contributions."""
+    """Build a compact tqdm postfix from weighted head contributions.
+
+    ``pose`` and ``box`` are the complete non-DN regression-head objectives.
+    Their denoising objectives are deliberately reported as ``posedn`` and
+    ``boxdn`` so a large DN auxiliary cannot be mistaken for main-head error.
+    """
 
     group_totals = _weighted_loss_group_totals(loss_metrics, weights)
     postfix = {"loss": _format_loss_float(loss_metrics.get("loss_total", 0.0))}
-    if group_totals.get("pose", 0.0) > 0.0:
-        postfix["pose"] = _format_loss_float(group_totals["pose"])
-    if group_totals.get("coord_aux", 0.0) > 0.0:
-        postfix["caux"] = _format_loss_float(group_totals["coord_aux"])
-    if group_totals.get("simcc", 0.0) > 0.0:
-        postfix["simcc"] = _format_loss_float(group_totals["simcc"])
+    for group, label in (
+        ("pose", "pose"),
+        ("pose_dn", "posedn"),
+        ("box", "box"),
+        ("box_dn", "boxdn"),
+    ):
+        if group_totals.get(group, 0.0) > 0.0:
+            postfix[label] = _format_loss_float(group_totals[group])
+    if "loss_person_confidence" in loss_metrics:
+        # Quality target statistics remain diagnostics rather than additional
+        # loss fields; the weighted BCE itself is already included in pose.
+        postfix["q"] = _format_loss_float(
+            loss_metrics.get("person_quality_target_mean", 0.0)
+        )
+        postfix["sstd"] = _format_loss_float(
+            loss_metrics.get("person_confidence_std", 0.0)
+        )
+    if group_totals.get("ref", 0.0) > 0.0:
+        postfix["ref"] = _format_loss_float(group_totals["ref"])
+        postfix["racc"] = _format_loss_float(
+            loss_metrics.get("ref_match_accuracy", 0.0)
+        )
     if group_totals.get("lm", 0.0) > 0.0:
         postfix["lm"] = _format_loss_float(group_totals["lm"])
+        postfix["lmraw"] = _format_loss_float(loss_metrics.get("loss_lm", 0.0))
     return postfix
 
 
@@ -2913,15 +3940,47 @@ def _weighted_loss_items(
     add("pose", "coord", "loss_coord", weights.coord)
     add("pose", "img", "loss_image_coord", weights.image_coord)
     add("pose", "hard", "loss_hard_joint", weights.hard_joint)
-    add("pose", "vis", "loss_vis", weights.vis)
-    add("coord_aux", "coarse", "loss_coord_coarse", weights.coarse_coord)
-    add("coord_aux", "deform", "loss_coord_deform", weights.deform_coord)
+    confidence_weight = (
+        weights.keypoint_confidence if weights.vis is None else float(weights.vis)
+    )
+    add(
+        "pose",
+        "conf",
+        "loss_keypoint_confidence",
+        confidence_weight,
+    )
+    add("pose", "pconf", "loss_person_confidence", weights.person_confidence)
+    add("ref", "match", "loss_ref_match", weights.ref_match)
+    add(
+        "pose",
+        "coarse_oks",
+        "loss_oks_coarse",
+        weights.coarse_coord * weights.oks,
+    )
+    add(
+        "pose",
+        "coarse_coord",
+        "loss_coord_coarse",
+        weights.coarse_coord * weights.coord,
+    )
+    add(
+        "pose",
+        "coarse_img",
+        "loss_image_coord_coarse",
+        weights.coarse_coord * weights.image_coord,
+    )
+    add("pose", "deform", "loss_coord_deform", weights.deform_coord)
     for refine_idx, refine_weight in enumerate(parse_float_list(weights.refine_coords), start=1):
-        add("coord_aux", f"ref{refine_idx}", f"loss_coord_refine_{refine_idx}", refine_weight)
-    add("simcc", "coarse", "loss_simcc_coarse", weights.simcc_coarse)
-    add("simcc", "deform", "loss_simcc_deform", weights.simcc_deform)
-    for refine_idx, refine_weight in enumerate(parse_float_list(weights.simcc_refine), start=1):
-        add("simcc", f"ref{refine_idx}", f"loss_simcc_refine_{refine_idx}", refine_weight)
+        add("pose", f"ref{refine_idx}", f"loss_coord_refine_{refine_idx}", refine_weight)
+    add("box", "obj", "loss_box_objectness", weights.box_objectness)
+    add("box", "l1", "loss_box_l1", weights.box_l1)
+    add("box", "giou", "loss_box_giou", weights.box_giou)
+    add("box", "rel", "loss_box_relative", weights.box_relative)
+    add("box_dn", "total", "loss_box_dn", weights.box_dn)
+    # loss_keypoint_dn already contains its internal pose/confidence/deep-
+    # supervision weights. Apply only the outer DN weight here so the displayed
+    # value is exactly its contribution to loss_total.
+    add("pose_dn", "total", "loss_keypoint_dn", weights.keypoint_dn)
     add("lm", "lm", "loss_lm", float(loss_metrics.get("loss_lm_weight", weights.lm)))
     return items
 
@@ -2940,12 +3999,24 @@ def build_detailed_loss_message(
     loss_metrics: dict[str, float],
     weights: LossWeights,
 ) -> str:
+    if "loss_person_confidence" in loss_metrics and "loss_oks" not in loss_metrics:
+        return (
+            "loss_detail "
+            f"total={_format_loss_float(loss_metrics.get('loss_total', 0.0))} "
+            f"person_conf={_format_loss_float(loss_metrics['loss_person_confidence'])} "
+            f"target_mean={_format_loss_float(loss_metrics.get('person_quality_target_mean', 0.0))} "
+            f"target_std={_format_loss_float(loss_metrics.get('person_quality_target_std', 0.0))} "
+            f"score_mean={_format_loss_float(loss_metrics.get('person_confidence_mean', 0.0))} "
+            f"score_std={_format_loss_float(loss_metrics.get('person_confidence_std', 0.0))}"
+        )
     items = _weighted_loss_items(loss_metrics, weights)
     group_totals = _weighted_loss_group_totals(loss_metrics, weights)
     group_names = {
         "pose": "pose",
-        "coord_aux": "coord_aux",
-        "simcc": "simcc",
+        "pose_dn": "posedn",
+        "box": "box",
+        "box_dn": "boxdn",
+        "ref": "ref",
         "lm": "lm",
     }
     summary = [
@@ -2972,19 +4043,23 @@ def build_detailed_loss_message(
 
 def format_loss_weights(weights: LossWeights) -> str:
     coord_refine = ",".join(_format_loss_weight(value) for value in parse_float_list(weights.refine_coords)) or "none"
-    simcc_refine = ",".join(_format_loss_weight(value) for value in parse_float_list(weights.simcc_refine)) or "none"
     return (
         "Loss weights: "
         f"oks={_format_loss_weight(weights.oks)} "
         f"coord={_format_loss_weight(weights.coord)} "
         f"image_coord={_format_loss_weight(weights.image_coord)} "
-        f"vis={_format_loss_weight(weights.vis)} "
+        f"keypoint_confidence={_format_loss_weight(weights.keypoint_confidence if weights.vis is None else weights.vis)} "
+        f"person_confidence={_format_loss_weight(weights.person_confidence)} "
+        f"ref_match={_format_loss_weight(weights.ref_match)} "
         f"hard={_format_loss_weight(weights.hard_joint)} "
-        f"coord_aux(coarse={_format_loss_weight(weights.coarse_coord)},"
+        f"coord_aux(coarse_full_objective_scale={_format_loss_weight(weights.coarse_coord)},"
         f"deform={_format_loss_weight(weights.deform_coord)},refine={coord_refine}) "
-        f"simcc(coarse={_format_loss_weight(weights.simcc_coarse)},"
-        f"deform={_format_loss_weight(weights.simcc_deform)},refine={simcc_refine},"
-        f"sigma={_format_loss_weight(weights.simcc_sigma)},norm=ce/log_bins) "
+        f"box(obj={_format_loss_weight(weights.box_objectness)},"
+        f"l1={_format_loss_weight(weights.box_l1)},"
+        f"giou={_format_loss_weight(weights.box_giou)},"
+        f"relative={_format_loss_weight(weights.box_relative)},"
+        f"dn={_format_loss_weight(weights.box_dn)}) "
+        f"keypoint_dn={_format_loss_weight(weights.keypoint_dn)} "
         f"lm={_format_loss_weight(weights.lm)}"
     )
 
@@ -3120,6 +4195,48 @@ def _draw_pose(
             draw.line([points[a], points[b]], fill=color, width=2)
 
 
+def select_informative_visualization_sample(
+    outputs: dict[str, torch.Tensor],
+    batch: dict,
+    *,
+    min_gt_area_ratio: float = 0.005,
+    min_valid_keypoints: int = 3,
+) -> int | None:
+    """Choose a batch item that will produce a readable pose visualization."""
+
+    box_mask = outputs.get("box_mask")
+    best_sample: int | None = None
+    best_score = -1.0
+    for sample_idx, target in enumerate(batch.get("targets", [])):
+        gt_boxes = target.get("boxes")
+        gt_valid = target.get("keypoint_valid")
+        if not torch.is_tensor(gt_boxes) or not torch.is_tensor(gt_valid):
+            continue
+        if gt_boxes.numel() == 0 or gt_valid.numel() == 0:
+            continue
+        valid_counts = gt_valid.detach().cpu().bool().sum(dim=-1)
+        boxes = gt_boxes.detach().float().cpu()
+        areas = (
+            (boxes[:, 2] - boxes[:, 0]).clamp_min(0.0)
+            * (boxes[:, 3] - boxes[:, 1]).clamp_min(0.0)
+        )
+        informative = (valid_counts >= int(min_valid_keypoints)) & (
+            areas >= float(min_gt_area_ratio)
+        )
+        if not bool(informative.any()):
+            continue
+        if torch.is_tensor(box_mask):
+            if sample_idx >= int(box_mask.shape[0]) or not bool(
+                box_mask[sample_idx].detach().bool().any().item()
+            ):
+                continue
+        sample_score = float(areas[informative].max().item())
+        if sample_score > best_score:
+            best_score = sample_score
+            best_sample = sample_idx
+    return best_sample
+
+
 def save_pose_visualization(
     outputs: dict[str, torch.Tensor],
     batch: dict,
@@ -3146,8 +4263,10 @@ def save_pose_visualization(
     draw = ImageDraw.Draw(canvas)
     width, height = canvas.size
 
+    # Keep training visualizations deliberately minimal. ``boxes`` is the box
+    # regression head output; input Locate/GT boxes and the expanded ROI boxes
+    # remain available in tensors/metrics but are not drawn over the result.
     boxes = outputs["boxes"][sample_idx].detach().float().cpu()
-    pose_boxes = outputs.get("pose_boxes", outputs["boxes"])[sample_idx].detach().float().cpu()
     box_mask = outputs.get("box_mask")
     valid_boxes = (
         box_mask[sample_idx].detach().cpu().bool()
@@ -3172,7 +4291,25 @@ def save_pose_visualization(
             schema_name = ID_TO_SCHEMA.get(int(schema_ids[sample_idx].detach().cpu().item()), "unknown")
         else:
             schema_name = "unknown"
-    task_name = str(target.get("task", "")) or "unknown"
+    task_ids = batch.get("task_ids")
+    task_id = (
+        int(task_ids[sample_idx].detach().cpu().item())
+        if torch.is_tensor(task_ids) and sample_idx < int(task_ids.numel())
+        else -1
+    )
+    task_name = str(target.get("task", "")) or (
+        "REF_POSE" if task_id == 1 else "ALL_POSE" if task_id == 0 else "unknown"
+    )
+    ref_texts = batch.get("ref_texts") or []
+    ref_description = (
+        str(ref_texts[sample_idx]).strip()
+        if sample_idx < len(ref_texts)
+        else ""
+    )
+    if task_name == "REF_POSE" and not ref_description:
+        prompts = batch.get("prompts") or []
+        if sample_idx < len(prompts):
+            ref_description = _extract_ref_description_from_prompt(str(prompts[sample_idx]))
     edge_indices = SCHEMA_POSE_EDGE_INDICES.get(schema_name, DEFAULT_POSE_EDGE_INDICES)
     schema_keypoint_count = int(schema_valid.sum().item())
     gt_boxes = target["boxes"].detach().float().cpu()
@@ -3183,30 +4320,83 @@ def save_pose_visualization(
         if draw_all_schema_keypoints
         else gt_valid & (gt_keypoints[..., 2] > 0.5)
     )
+    matched_gt_indices = target.get("matched_gt_indices")
+    matched_gt_indices = (
+        matched_gt_indices.detach().cpu().long()
+        if torch.is_tensor(matched_gt_indices)
+        else None
+    )
 
     valid_indices = torch.nonzero(valid_boxes, as_tuple=False).flatten()
     if valid_indices.numel() > 0:
         ranked = valid_indices[torch.argsort(scores[valid_indices], descending=True)]
     else:
         ranked = torch.empty(0, dtype=torch.long)
-    selected = ranked[: max(int(max_instances), 0)].tolist()
 
-    for idx in selected:
-        if scores[idx] < score_threshold and len(selected) > 1:
+    # Training-time person quality is intentionally low while pose coordinates
+    # are still inaccurate. Do not let the prediction score threshold hide the
+    # matched GT as well: matched queries are always selected and visualized,
+    # followed by the highest-scoring unmatched predictions.
+    if matched_gt_indices is not None:
+        matched_mask = torch.zeros_like(valid_boxes)
+        matched_count = min(
+            int(matched_gt_indices.numel()),
+            int(matched_mask.numel()),
+        )
+        matched_mask[:matched_count] = matched_gt_indices[:matched_count].ge(0)
+    else:
+        matched_mask = torch.arange(boxes.shape[0]) < int(gt_boxes.shape[0])
+    matched_indices = torch.nonzero(valid_boxes & matched_mask, as_tuple=False).flatten()
+    if matched_indices.numel() > 0:
+        matched_areas = (
+            (gt_boxes[matched_indices, 2] - gt_boxes[matched_indices, 0]).clamp_min(0.0)
+            * (gt_boxes[matched_indices, 3] - gt_boxes[matched_indices, 1]).clamp_min(0.0)
+        )
+        matched_indices = matched_indices[
+            torch.argsort(matched_areas, descending=True)
+        ]
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    for idx in torch.cat((matched_indices, ranked)).tolist():
+        idx = int(idx)
+        if idx in selected_set:
             continue
-        if idx < gt_boxes.shape[0]:
-            _draw_box(draw, gt_boxes[idx], width, height, (50, 200, 80), f"gt {idx}")
+        selected.append(idx)
+        selected_set.add(idx)
+        if len(selected) >= max(int(max_instances), 0):
+            break
+
+    for selection_rank, idx in enumerate(selected):
+        has_gt = bool(matched_mask[idx].item())
+        if has_gt:
+            _draw_box(draw, gt_boxes[idx], width, height, (50, 200, 80), f"GT {idx}")
             _draw_pose(draw, gt_keypoints[idx], gt_draw_valid[idx], width, height, (50, 200, 80), edge_indices)
-        _draw_box(draw, boxes[idx], width, height, (255, 220, 0), f"box {idx}")
-        _draw_box(draw, pose_boxes[idx], width, height, (255, 140, 0), f"pose box {idx}")
-        pred_valid = (
+
+        # Always show predictions paired with GT, and keep at least the top
+        # prediction visible for samples without a matched target. The score
+        # threshold only suppresses additional unmatched low-confidence boxes.
+        if not has_gt and scores[idx] < score_threshold and selection_rank > 0:
+            continue
+        _draw_box(
+            draw,
+            boxes[idx],
+            width,
+            height,
+            (80, 180, 255),
+            f"Pred {idx} score={float(scores[idx]):.2f}",
+        )
+        predicted_valid = (
             schema_valid
             if draw_all_schema_keypoints
             else schema_valid & (keypoints[idx, :, 2] >= score_threshold)
         )
-        _draw_pose(draw, keypoints[idx], pred_valid, width, height, (240, 70, 70), edge_indices)
+        _draw_pose(draw, keypoints[idx], predicted_valid, width, height, (240, 70, 70), edge_indices)
 
-    draw.rectangle([0, 0, min(width, 940), 44], fill=(0, 0, 0))
+    header_width = min(width, 1100)
+    is_refhuman = task_name == "REF_POSE" or bool(ref_description)
+    header_height = 64 if is_refhuman else 44
+    draw.rectangle([0, 0, header_width, header_height], fill=(0, 0, 0))
     draw.text(
         (4, 4),
         f"dataset={dataset_name} schema={schema_name} keypoints={schema_keypoint_count} task={task_name}",
@@ -3214,9 +4404,17 @@ def save_pose_visualization(
     )
     draw.text(
         (4, 24),
-        "green=GT, red=pred keypoints, yellow=input box, orange=expanded pose box",
+        "green=GT box/pose | blue=predicted box | red=predicted pose",
         fill=(255, 255, 255),
     )
+    if is_refhuman:
+        description = " ".join(ref_description.split()) or "person"
+        # The default PIL font is roughly seven pixels per ASCII character.
+        # Truncate long RefHuman captions rather than covering the image.
+        max_chars = max((header_width - 12) // 7, 8)
+        if len(description) > max_chars:
+            description = description[: max(max_chars - 3, 1)].rstrip() + "..."
+        draw.text((4, 44), f"ref: {description}", fill=(255, 230, 120))
     canvas.save(output_path)
 
 
@@ -3484,12 +4682,19 @@ def save_checkpoint(
         )
         feature_config = {
             "output_size": int(module.qwen_extractor.output_size),
-            "feature_source": str(getattr(module.qwen_extractor, "feature_source", "multimodal")),
+            "feature_source": str(getattr(module.qwen_extractor, "feature_source", "raw_visual")),
             "backbone_train_scope": str(getattr(module, "backbone_train_scope", "all_lora")),
+            "backbone_llm_layers": str(getattr(module, "backbone_llm_layers", "")),
+            "backbone_vision_layers": str(getattr(module, "backbone_vision_layers", "")),
+            "backbone_llm_modules": str(getattr(module, "backbone_llm_modules", "")),
+            "backbone_vision_modules": str(getattr(module, "backbone_vision_modules", "")),
             "backbone_load_mode": (
                 "vision_tower_only"
                 if bool(getattr(backbone_base, "is_vision_only_backbone", False))
                 else "full_multimodal"
+            ),
+            "generation_components_pruned": bool(
+                getattr(backbone_base, "generation_components_pruned", False)
             ),
         }
         payload["backbone_feature_config"] = feature_config
@@ -3759,6 +4964,52 @@ def load_training_checkpoint(
     return int(payload.get("step", 0)), optimizer_loaded, scaler_loaded, resolved_path, payload
 
 
+def load_person_confidence_rescue_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Strictly restore every legacy tensor and initialize only the new head."""
+    resolved_path = resolve_training_checkpoint(checkpoint_path)
+    payload_path = resolved_path / CHECKPOINT_PAYLOAD_NAME if resolved_path.is_dir() else resolved_path
+    payload = torch.load(payload_path, map_location="cpu")
+    module = unwrap_training_model(model)
+    incompatible = module.pose_model.load_state_dict(payload["model"], strict=False)
+    expected_missing = {
+        f"person_confidence_head.{key}"
+        for key in module.pose_model.person_confidence_head.state_dict()
+    }
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if missing != expected_missing or unexpected:
+        raise RuntimeError(
+            "Legacy rescue checkpoint is not architecture-compatible: "
+            f"missing={sorted(missing)}, expected_missing={sorted(expected_missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
+
+    backbone_state = payload.get("backbone_trainable", payload.get("qwen_trainable"))
+    if module.qwen_model is not None and backbone_state is not None:
+        module.qwen_model.load_state_dict(backbone_state, strict=False)
+    if module.qwen_extractor is not None and "backbone_extractor" in payload:
+        module.qwen_extractor.load_state_dict(payload["backbone_extractor"], strict=False)
+    if module.qwen_extractor is not None and (
+        "backbone_feature_refiner" in payload or "qwen_feature_refiner" in payload
+    ):
+        refiner_state = (
+            payload["backbone_feature_refiner"]
+            if "backbone_feature_refiner" in payload
+            else payload["qwen_feature_refiner"]
+        )
+        module.qwen_extractor.feature_refiner.load_state_dict(refiner_state, strict=True)
+
+    module.pose_model.initialize_person_confidence_from_visibility()
+    for parameter in module.parameters():
+        parameter.requires_grad = False
+    for parameter in module.pose_model.person_confidence_head.parameters():
+        parameter.requires_grad = True
+    return resolved_path, payload
+
+
 def load_deepspeed_config(path: Path, args: argparse.Namespace, world_size: int) -> dict:
     config = json.load(open(path, encoding="utf-8"))
     config["train_micro_batch_size_per_gpu"] = int(args.batch_size)
@@ -3773,6 +5024,14 @@ def load_deepspeed_config(path: Path, args: argparse.Namespace, world_size: int)
         dtype_str = getattr(args, "qwen_dtype", "bfloat16")
     if "bf16" in config:
         config["bf16"]["enabled"] = dtype_str == "bfloat16"
+        if config["bf16"]["enabled"]:
+            # DeepSpeed defaults this to false for bf16.  With ZeRO-1/2 the
+            # reduced/partitioned gradients live in ``averaged_gradients`` and
+            # are therefore not completely covered by scanning Parameter.grad
+            # from the training loop.  Enabling the optimizer-side check makes
+            # DeepSpeed reject the update before a single bad rank can poison
+            # the fp32 master weights during all-gather.
+            config["bf16"]["check_grad_overflow"] = True
     if "fp16" in config:
         config["fp16"]["enabled"] = dtype_str == "float16"
     config.setdefault("steps_per_print", 100000)
@@ -3817,7 +5076,7 @@ def build_optimizer_param_groups(
         stats[group_name][1] += param.numel()
 
     if backbone_name == "eagle":
-        lora_lr_scale = 1.0
+        lora_lr_scale = getattr(args, "locate_llm_scale", 0.01)
         vision_lr_scale = getattr(args, "locate_vision_scale", args.qwen_vision_lr_scale)
     else:
         lora_lr_scale = args.qwen_lora_lr_scale
@@ -3829,7 +5088,11 @@ def build_optimizer_param_groups(
         "backbone_vision_lora": args.lr * vision_lr_scale,
     }
     param_groups = [
-        {"params": params, "lr": lrs[name]}
+        {
+            "params": params,
+            "lr": lrs[name],
+            "weight_decay": args.weight_decay if name == "pose" else 0.0,
+        }
         for name, params in grouped.items()
         if params
     ]
@@ -3902,47 +5165,127 @@ def main() -> None:
         raise ValueError("--batch_size must be positive.")
     if args.grad_accum_steps <= 0:
         raise ValueError("--grad_accum_steps must be positive.")
+    if args.epochs < 0:
+        raise ValueError("--epochs must be non-negative.")
+    if args.max_steps < 0:
+        raise ValueError("--max_steps must be non-negative.")
+    if args.epochs == 0 and args.max_steps == 0:
+        raise ValueError("At least one of --epochs or --max_steps must be positive.")
     if args.refhuman_max_captions_per_instance < 0:
         raise ValueError("--refhuman_max_captions_per_instance must be >= 0.")
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
+    if args.image_size != 800:
+        raise ValueError("The unified LocatePose architecture requires --image_size 800.")
+    if args.pose_pyramid_channels <= 0 or args.pose_pyramid_blocks <= 0:
+        raise ValueError("Pose pyramid channels and block count must be positive.")
+    if args.human_decoder_layers <= 0 or args.pose_decoder_layers <= 0:
+        raise ValueError("Human and pose decoder layer counts must be positive.")
+    if args.deformable_points <= 0 or args.deformable_min_radius_cells <= 0.0:
+        raise ValueError("Deformable sampling points and minimum radius must be positive.")
+    if args.max_dn_queries < 0 or args.max_dn_groups <= 0:
+        raise ValueError("DN query count must be non-negative and DN groups positive.")
+    if args.dn_positive_noise < 0.0 or args.dn_negative_noise < 0.0:
+        raise ValueError("DN noise scales must be non-negative.")
+    if args.max_keypoint_dn_queries < 0 or args.max_keypoint_dn_groups <= 0:
+        raise ValueError("Keypoint-DN query count must be non-negative and groups positive.")
+    for range_name, lower, upper in (
+        (
+            "positive",
+            args.keypoint_dn_positive_ks_min,
+            args.keypoint_dn_positive_ks_max,
+        ),
+        (
+            "negative",
+            args.keypoint_dn_negative_ks_min,
+            args.keypoint_dn_negative_ks_max,
+        ),
+    ):
+        if not 0.0 < lower <= upper <= 1.0:
+            raise ValueError(
+                f"Keypoint-DN {range_name} KS range must satisfy 0 < min <= max <= 1."
+            )
+    if args.legacy_checkpoint_compat or args.person_confidence_rescue:
+        raise ValueError(
+            "Legacy checkpoint compatibility/rescue is not available after replacing the RGB branches. "
+            "Train a new Stage1 checkpoint."
+        )
     if not 0.0 <= args.pose_dropout < 1.0:
         raise ValueError("--pose_dropout must be in [0, 1).")
-    if args.schema_joint_priors_path and not Path(args.schema_joint_priors_path).is_file():
+    if (
+        args.pose_coordinate_init == "schema_prior"
+        and args.schema_joint_priors_path
+        and not Path(args.schema_joint_priors_path).is_file()
+    ):
         raise FileNotFoundError(
             f"--schema_joint_priors_path does not exist: {args.schema_joint_priors_path}"
         )
     if args.pose_roi_size <= 1:
         raise ValueError("--pose_roi_size must be greater than 1.")
-    if args.simcc_bins < 0 or args.simcc_bins == 1:
-        raise ValueError("--simcc_bins must be 0 to disable SimCC or greater than 1.")
-    if args.simcc_sigma <= 0:
-        raise ValueError("--simcc_sigma must be positive.")
+    if not 0.0 <= args.visualize_min_gt_area_ratio <= 1.0:
+        raise ValueError("--visualize_min_gt_area_ratio must be in [0, 1].")
+    if min(
+        args.w_box_objectness,
+        args.w_box_l1,
+        args.w_box_giou,
+        args.w_box_relative,
+        args.w_box_dn,
+    ) < 0.0:
+        raise ValueError("All box refinement and denoising loss weights must be non-negative.")
+    if args.w_keypoint_confidence < 0.0:
+        raise ValueError("--w_keypoint_confidence must be non-negative.")
+    if args.w_keypoint_dn < 0.0:
+        raise ValueError("--w_keypoint_dn must be non-negative.")
+    if args.w_person_confidence < 0.0:
+        raise ValueError("--w_person_confidence must be non-negative.")
+    if args.w_ref_match < 0.0:
+        raise ValueError("--w_ref_match must be non-negative.")
+    if args.w_locate_box_lm < 0.0:
+        raise ValueError("--w_locate_box_lm must be non-negative.")
+    if args.locate_box_max_new_tokens <= 0:
+        raise ValueError("--locate_box_max_new_tokens must be positive.")
+    if args.locate_lm_loss_every <= 0:
+        raise ValueError("--locate_lm_loss_every must be positive.")
+    if args.locate_lm_max_instances <= 0:
+        raise ValueError("--locate_lm_max_instances must be positive.")
+    if args.ref_text_scale < 0.0:
+        raise ValueError("--ref_text_scale must be non-negative.")
+    if args.locate_vision_scale < 0.0 or args.locate_llm_scale < 0.0:
+        raise ValueError("--locate_vision_scale/--locate_llm_scale must be non-negative.")
+    if args.locate_train_scope == "selective_lora":
+        llm_layers = parse_layer_selection(args.locate_llm_layers)
+        vision_layers = parse_layer_selection(args.locate_vision_layers)
+        llm_modules = parse_module_selection(args.locate_llm_modules)
+        vision_modules = parse_module_selection(args.locate_vision_modules)
+        if not llm_layers or max(llm_layers) >= 36:
+            raise ValueError("--locate_llm_layers must select Qwen2.5 layers in [0, 35].")
+        if not vision_layers or max(vision_layers) >= 27:
+            raise ValueError("--locate_vision_layers must select MoonViT blocks in [0, 26].")
+        if not llm_modules or not vision_modules:
+            raise ValueError("Selective LoRA module selections must be non-empty.")
     if not 0.0 <= args.hard_joint_fraction <= 1.0:
         raise ValueError("--hard_joint_fraction must be in [0, 1].")
     if args.box_jitter_scale < 0.0 or args.box_jitter_shift < 0.0:
         raise ValueError("--box_jitter_scale/--box_jitter_shift must be non-negative.")
     if args.qwen_box_max_new_tokens <= 0:
         raise ValueError("--qwen_box_max_new_tokens must be positive.")
-    if args.locate_box_max_new_tokens <= 0:
-        raise ValueError("--locate_box_max_new_tokens must be positive.")
     if not 0.0 <= args.box_match_iou_thresh <= 1.0:
         raise ValueError("--box_match_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
-    if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
-        raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
-    if args.w_locate_box_lm < 0.0 or args.w_locate_point_lm < 0.0:
-        raise ValueError("Locate grounding LM weights must be non-negative.")
-    if args.w_locate_box_lm > 0.0 and args.w_locate_point_lm > 0.0:
+    if args.prune_locate_generation and args.backbone != "eagle":
+        raise ValueError("--prune_locate_generation is only supported by LocateAnything/eagle.")
+    if args.box_source == "locate_generate" and args.backbone != "eagle":
+        raise ValueError("--box_source=locate_generate requires --backbone eagle/locatepose.")
+    if args.prune_locate_generation and (
+        args.box_source == "locate_generate" or args.w_locate_box_lm > 0.0
+    ):
         raise ValueError(
-            "Box and point Locate LM losses require separate forward passes; enable only one. "
-            "The LocatePose recipe uses --w_locate_box_lm > 0 and --w_locate_point_lm 0."
+            "LocateAnything generation/LM supervision requires its lm_head; "
+            "use --no-prune_locate_generation."
         )
     if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
-    if args.box_source == "locate_generate" and args.backbone != "eagle":
-        raise ValueError("--box_source=locate_generate currently requires --backbone eagle/locatepose.")
     if args.qwen_min_pixels is not None and args.qwen_min_pixels <= 0:
         raise ValueError("--qwen_min_pixels must be positive when set.")
     if args.qwen_max_pixels is not None and args.qwen_max_pixels <= 0:
@@ -3953,10 +5296,6 @@ def main() -> None:
         and args.qwen_max_pixels < args.qwen_min_pixels
     ):
         raise ValueError("--qwen_max_pixels must be >= --qwen_min_pixels.")
-    if args.eagle_min_pixels is not None and args.eagle_min_pixels <= 0:
-        raise ValueError("--eagle_min_pixels must be positive when set.")
-    if args.eagle_max_pixels is not None and args.eagle_max_pixels <= 0:
-        raise ValueError("--eagle_max_pixels must be positive when set.")
     if args.eagle_image_token_limit is not None and args.eagle_image_token_limit <= 0:
         raise ValueError("--locate_image_token_limit/--eagle_image_token_limit must be positive when set.")
     if args.eagle_batch_token_limit is not None and args.eagle_batch_token_limit <= 0:
@@ -3984,12 +5323,6 @@ def main() -> None:
         raise ValueError("--augment_blur_sigma_min/max must satisfy 0 <= min <= max.")
     if not 0.0 <= args.augment_erase_area_min <= args.augment_erase_area_max <= 1.0:
         raise ValueError("--augment_erase_area_min/max must satisfy 0 <= min <= max <= 1.")
-    if (
-        args.eagle_min_pixels is not None
-        and args.eagle_max_pixels is not None
-        and args.eagle_max_pixels < args.eagle_min_pixels
-    ):
-        raise ValueError("--eagle_max_pixels must be >= --eagle_min_pixels.")
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     use_deepspeed = args.deepspeed_config is not None
@@ -4027,23 +5360,12 @@ def main() -> None:
     if args.locate_feature_source == "vision_only" and "refhuman" in dataset_names:
         raise ValueError(
             "--locate_feature_source=vision_only cannot train RefHuman text conditioning. "
-            "Use pose-only datasets in Stage 1 and add RefHuman in multimodal Stage 2."
-        )
-    if args.locate_feature_source == "vision_only" and args.box_source == "locate_generate":
-        raise ValueError(
-            "--locate_feature_source=vision_only requires --box_source=gt because no tokenizer "
-            "or language model is loaded for Locate generation."
-        )
-    if args.locate_feature_source == "vision_only" and (
-        float(args.w_locate_box_lm) > 0.0 or float(args.w_locate_point_lm) > 0.0
-    ):
-        raise ValueError(
-            "Locate grounding LM auxiliary losses must be zero in vision-only Stage 1."
+            "Use pose-only datasets in Stage 1 and add RefHuman in raw_visual Stage 3."
         )
     if args.pose_augment and args.locate_feature_source != "vision_only":
         raise ValueError(
             "--pose_augment is restricted to vision-only Stage 1 so geometric transforms "
-            "cannot contradict RefHuman left/right language in multimodal Stage 2."
+            "cannot contradict RefHuman left/right language in the full-model stages."
         )
     augment_config = PoseAugmentConfig(
         enabled=bool(args.pose_augment),
@@ -4165,10 +5487,14 @@ def main() -> None:
         if is_main_process():
             source_batch_counts = [
                 math.ceil(
-                    len(inner_dataset)
+                    (
+                        dataset.sample_count_for_epoch(dataset_idx, 0)
+                        if hasattr(dataset, "sample_count_for_epoch")
+                        else len(inner_dataset)
+                    )
                     / max(int(args.batch_size) * max(int(world_size), 1), 1)
                 )
-                for inner_dataset in getattr(dataset, "datasets", [])
+                for dataset_idx, inner_dataset in enumerate(getattr(dataset, "datasets", []))
             ]
             total_source_batches = max(sum(source_batch_counts), 1)
             source_batch_desc = ",".join(
@@ -4228,6 +5554,7 @@ def main() -> None:
                 dtype=args.eagle_dtype,
                 attn_implementation=args.eagle_attn_implementation,
                 gradient_checkpointing=args.eagle_gradient_checkpointing,
+                prune_generation=bool(args.prune_locate_generation),
             )
         )
         backbone_model.to(device)
@@ -4242,6 +5569,14 @@ def main() -> None:
                 else "full_multimodal"
             )
             print(f"Eagle load mode: {load_mode}")
+            print(
+                "Eagle generation components: "
+                + (
+                    "pruned (lm_head checkpoint tensor skipped; KV cache disabled)"
+                    if bool(getattr(eagle_base, "generation_components_pruned", False))
+                    else "available"
+                )
+            )
             print(f"Eagle LoRA parameters available before stage scope: {bb_trainable:,} / {bb_total:,}")
     else:
         qwen_init_source = detect_qwen_initialization_source(args.qwen_model_path)
@@ -4288,8 +5623,38 @@ def main() -> None:
         if qwenpose_init_payload is None and qwen_init_source.pose_checkpoint_path is not None:
             qwenpose_init_payload = _load_local_torch_payload(qwen_init_source.pose_checkpoint_path)
 
+    if args.init_from_checkpoint is not None:
+        init_payload_path = resolve_training_checkpoint(args.init_from_checkpoint)
+        if init_payload_path.is_dir():
+            init_payload_path = init_payload_path / CHECKPOINT_PAYLOAD_NAME
+        qwenpose_init_payload = _load_local_torch_payload(init_payload_path)
     saved_pose_config = qwenpose_init_payload.get("pose_config") if qwenpose_init_payload is not None else None
     if saved_pose_config is not None:
+        if "pose_pyramid_channels" not in saved_pose_config or int(saved_pose_config.get("rgb_input_size", 0)) != 800:
+            raise ValueError(
+                "The initialization checkpoint predates the unified 800x800 pose pyramid and cannot be loaded. "
+                "Train a new Stage1 checkpoint, then use it for Stage2/Stage3."
+            )
+        if (
+            "enable_keypoint_denoising" not in saved_pose_config
+            and not args.disable_keypoint_denoising
+        ):
+            raise ValueError(
+                "The initialization checkpoint predates keypoint denoising. "
+                "For fully matched Stage1/Stage2 training, retrain Stage1 with "
+                "the current script. To intentionally keep the legacy graph, "
+                "pass --disable_keypoint_denoising."
+            )
+        saved_coordinate_init = str(
+            saved_pose_config.get("pose_coordinate_init", "schema_prior")
+        ).strip().lower()
+        if saved_coordinate_init != args.pose_coordinate_init:
+            raise ValueError(
+                "Pose coordinate initialization must match between stages/checkpoints: "
+                f"checkpoint={saved_coordinate_init}, requested={args.pose_coordinate_init}. "
+                "Retrain Stage1 with learned_spread for the new image-conditioned path; "
+                "schema_prior is legacy-only."
+            )
         model_config = QwenPoseConfig(
             hidden_dim=int(saved_pose_config.get("hidden_dim", args.hidden_dim)),
             external_dim=external_dim,
@@ -4300,7 +5665,43 @@ def main() -> None:
             box_condition_scale=float(saved_pose_config.get("box_condition_scale", args.box_condition_scale)),
             pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
-            simcc_bins=int(saved_pose_config.get("simcc_bins", args.simcc_bins)),
+            rgb_input_size=int(saved_pose_config.get("rgb_input_size", 800)),
+            pose_pyramid_channels=int(saved_pose_config.get("pose_pyramid_channels", args.pose_pyramid_channels)),
+            pose_pyramid_blocks=int(saved_pose_config.get("pose_pyramid_blocks", args.pose_pyramid_blocks)),
+            human_decoder_layers=int(saved_pose_config.get("human_decoder_layers", args.human_decoder_layers)),
+            deformable_points=int(saved_pose_config.get("deformable_points", args.deformable_points)),
+            deformable_min_radius_cells=float(
+                saved_pose_config.get("deformable_min_radius_cells", args.deformable_min_radius_cells)
+            ),
+            enable_box_denoising=bool(
+                saved_pose_config.get("enable_box_denoising", not args.disable_box_denoising)
+            ),
+            enable_keypoint_denoising=bool(
+                saved_pose_config.get(
+                    "enable_keypoint_denoising", not args.disable_keypoint_denoising
+                )
+            ),
+            ref_text_scale=float(
+                saved_pose_config.get("ref_text_scale", args.ref_text_scale)
+            ),
+            enable_ref_visual_modulation=bool(
+                saved_pose_config.get(
+                    "enable_ref_visual_modulation",
+                    not args.disable_ref_visual_modulation,
+                )
+            ),
+            legacy_checkpoint_compat=False,
+            enable_person_confidence_head=bool(
+                saved_pose_config.get("enable_person_confidence_head", True)
+            ),
+            person_confidence_rescue=False,
+            use_global_person_queries=bool(
+                saved_pose_config.get("use_global_person_queries", False)
+            ),
+            num_person_queries=int(
+                saved_pose_config.get("num_person_queries", args.num_person_queries)
+            ),
+            pose_coordinate_init=saved_coordinate_init,
             schema_joint_priors_path=str(
                 saved_pose_config.get(
                     "schema_joint_priors_path", args.schema_joint_priors_path
@@ -4318,8 +5719,47 @@ def main() -> None:
             box_condition_scale=args.box_condition_scale,
             pose_roi_size=args.pose_roi_size,
             use_refinement=not args.disable_refinement,
-            simcc_bins=args.simcc_bins,
+            rgb_input_size=args.image_size,
+            pose_pyramid_channels=args.pose_pyramid_channels,
+            pose_pyramid_blocks=args.pose_pyramid_blocks,
+            human_decoder_layers=args.human_decoder_layers,
+            deformable_points=args.deformable_points,
+            deformable_min_radius_cells=args.deformable_min_radius_cells,
+            enable_box_denoising=not args.disable_box_denoising,
+            enable_keypoint_denoising=not args.disable_keypoint_denoising,
+            ref_text_scale=args.ref_text_scale,
+            enable_ref_visual_modulation=not args.disable_ref_visual_modulation,
+            legacy_checkpoint_compat=False,
+            enable_person_confidence_head=bool(args.enable_person_confidence_head),
+            person_confidence_rescue=False,
+            use_global_person_queries=args.box_source == "person_queries",
+            num_person_queries=args.num_person_queries,
+            pose_coordinate_init=args.pose_coordinate_init,
             schema_joint_priors_path=args.schema_joint_priors_path,
+        )
+    requested_person_queries = args.box_source == "person_queries"
+    if bool(model_config.use_global_person_queries) != requested_person_queries:
+        raise ValueError(
+            "Initialization checkpoint and --box_source disagree about global person queries: "
+            f"checkpoint={model_config.use_global_person_queries}, box_source={args.box_source}."
+        )
+    if requested_person_queries and int(model_config.num_person_queries) != int(args.num_person_queries):
+        raise ValueError(
+            "--num_person_queries must match the initialization checkpoint: "
+            f"checkpoint={model_config.num_person_queries}, requested={args.num_person_queries}."
+        )
+    person_head_enabled = bool(
+        model_config.enable_person_confidence_head
+        or model_config.person_confidence_rescue
+    )
+    if not args.person_confidence_rescue and person_head_enabled and args.w_person_confidence <= 0.0:
+        raise ValueError(
+            "A person confidence head is enabled but --w_person_confidence is zero. "
+            "Refusing to train a head that would later become the official COCO ranking score."
+        )
+    if args.w_person_confidence > 0.0 and not person_head_enabled:
+        raise ValueError(
+            "--w_person_confidence > 0 requires an enabled person confidence head."
         )
     model = QwenPoseModel(model_config).to(device)
     trainable, total = count_trainable_parameters(model)
@@ -4376,7 +5816,41 @@ def main() -> None:
         freeze_backbone=freeze_backbone,
         backbone_train_scope=args.locate_train_scope,
         train_backbone_projector=args.train_locate_projector,
+        backbone_llm_layers=args.locate_llm_layers,
+        backbone_vision_layers=args.locate_vision_layers,
+        backbone_llm_modules=args.locate_llm_modules,
+        backbone_vision_modules=args.locate_vision_modules,
     ).to(device)
+    if args.person_confidence_rescue:
+        if args.init_from_checkpoint is None:
+            raise ValueError("--person_confidence_rescue requires --init_from_checkpoint.")
+        if args.resume_from_checkpoint is not None:
+            raise ValueError(
+                "Start confidence rescue with --init_from_checkpoint; reserve "
+                "--resume_from_checkpoint for checkpoints created by the rescue run."
+            )
+        if args.box_source != "gt":
+            raise ValueError("Initial confidence rescue is defined for --box_source gt only.")
+        rescue_checkpoint, _ = load_person_confidence_rescue_checkpoint(
+            training_model,
+            args.init_from_checkpoint,
+        )
+        rescue_trainable, rescue_total = count_trainable_parameters(training_model)
+        expected_trainable = sum(
+            parameter.numel()
+            for parameter in training_model.pose_model.person_confidence_head.parameters()
+        )
+        if rescue_trainable != expected_trainable:
+            raise RuntimeError(
+                "Confidence rescue freeze invariant failed: "
+                f"trainable={rescue_trainable:,}, expected={expected_trainable:,}."
+            )
+        if is_main_process():
+            print(
+                "Initialized legacy confidence rescue from "
+                f"{rescue_checkpoint}; trainable={rescue_trainable:,}/{rescue_total:,} "
+                "(person_confidence_head only)."
+            )
     if backbone_name == "qwen3vl" and qwen_init_source is not None and qwen_init_source.pose_checkpoint_path is not None:
         _, _, _, init_checkpoint, _ = load_training_checkpoint(
             training_model,
@@ -4394,8 +5868,6 @@ def main() -> None:
         if backbone_name == "eagle":
             print(
                 "Locate image budget: "
-                f"min_pixels={args.eagle_min_pixels}, "
-                f"max_pixels={args.eagle_max_pixels}, "
                 f"image_token_limit={args.eagle_image_token_limit}, "
                 f"batch_token_limit={args.eagle_batch_token_limit}"
             )
@@ -4413,25 +5885,60 @@ def main() -> None:
         )
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
-        print(f"SimCC bins: {model_config.simcc_bins}, sigma={args.simcc_sigma}")
+        print(
+            "Unified pose pyramid: "
+            f"input={model_config.rgb_input_size}x{model_config.rgb_input_size}, "
+            f"channels={model_config.pose_pyramid_channels}, "
+            f"grids={model_config.rgb_input_size // 4}x{model_config.rgb_input_size // 4}/"
+            f"{model_config.rgb_input_size // 8}x{model_config.rgb_input_size // 8}/"
+            f"{model_config.rgb_input_size // 16}x{model_config.rgb_input_size // 16}, "
+            f"blocks={model_config.pose_pyramid_blocks}, "
+            f"human_decoder_layers={model_config.human_decoder_layers}, "
+            f"pose_decoder_layers={model_config.pose_decoder_layers}"
+        )
+        print(
+            "Box denoising: "
+            f"enabled={model_config.enable_box_denoising}, "
+            f"max_queries={args.max_dn_queries}, groups={args.max_dn_groups}, "
+            f"positive_noise={args.dn_positive_noise}, negative_noise={args.dn_negative_noise}"
+        )
+        print(
+            "Keypoint denoising: "
+            f"enabled={model_config.enable_keypoint_denoising}, "
+            f"max_queries={args.max_keypoint_dn_queries}, "
+            f"groups={args.max_keypoint_dn_groups}, "
+            f"positive_ks=[{args.keypoint_dn_positive_ks_min},{args.keypoint_dn_positive_ks_max}], "
+            f"negative_ks=[{args.keypoint_dn_negative_ks_min},{args.keypoint_dn_negative_ks_max}], "
+            f"weight={args.w_keypoint_dn}"
+        )
+        if model_config.pose_coordinate_init == "learned_spread":
+            coordinate_message = (
+                "mode=learned_spread, main_reference=trainable_nonsemantic_halton, "
+                "deform_reference=detached_coarse"
+            )
+        elif model_config.pose_coordinate_init == "box_center":
+            coordinate_message = (
+                "mode=box_center (ablation), main_reference=box_center, "
+                "deform_reference=detached_coarse"
+            )
+        else:
+            coordinate_message = "mode=schema_prior (legacy)"
+        print(f"Pose coordinate initialization: {coordinate_message}")
+        print(
+            "RefHuman conditioning: "
+            f"text_scale={model_config.ref_text_scale}, "
+            f"visual_modulation={model_config.enable_ref_visual_modulation and not model_config.use_global_person_queries}, "
+            f"match_loss_weight={args.w_ref_match}"
+        )
         print(f"Box source: {args.box_source}")
-        print(f"Box jitter: scale={args.box_jitter_scale}, shift={args.box_jitter_shift}")
+        if args.box_source != "person_queries":
+            print(f"Box jitter: scale={args.box_jitter_scale}, shift={args.box_jitter_shift}")
         if args.box_source == "qwen_generate":
             print(
                 "Qwen generated-box loop: "
                 f"max_new_tokens={args.qwen_box_max_new_tokens}, "
                 f"match_iou_thresh={args.box_match_iou_thresh}, "
                 f"nms_iou_thresh={args.box_nms_iou_thresh}"
-            )
-        if args.box_source == "locate_generate":
-            print(
-                "LocateAnything generated-box loop: "
-                f"generation_mode={args.locate_generation_mode}, "
-                f"max_new_tokens={args.locate_box_max_new_tokens}, "
-                f"match_iou_thresh={args.box_match_iou_thresh}, "
-                f"disable_pre_pose_nms={args.disable_pre_pose_nms}, "
-                f"pre_nms_iou_thresh={args.box_nms_iou_thresh}, "
-                f"post_nms_iou_thresh={args.post_pose_nms_iou_thresh}"
             )
         print(
             "Qwen feature refiner: "
@@ -4478,9 +5985,23 @@ def main() -> None:
         device,
         backbone_name=backbone_name,
     )
-    total_epochs = max(int(args.epochs), 1)
     max_steps = int(args.max_steps)
     steps_per_epoch = math.ceil(len(loader) / max(int(args.grad_accum_steps), 1))
+    if int(args.epochs) > 0:
+        total_epochs = int(args.epochs)
+        step_only_training = False
+    else:
+        # Optimizer-step-only mode. The accumulation cursor is global across
+        # epoch boundaries, so derive a conservative epoch count from micro
+        # batches and let max_steps stop the loop exactly at the requested step.
+        total_epochs = max(
+            math.ceil(
+                max_steps * max(int(args.grad_accum_steps), 1)
+                / max(len(loader), 1)
+            ),
+            1,
+        )
+        step_only_training = True
     scheduler_total_steps = max_steps if max_steps > 0 else steps_per_epoch * total_epochs
     scheduler = build_cosine_scheduler(
         optimizer,
@@ -4492,23 +6013,34 @@ def main() -> None:
         oks=args.w_oks,
         coord=args.w_coord,
         image_coord=args.w_image_coord,
-        vis=args.w_vis,
-        lm=args.w_lm,
+        keypoint_confidence=args.w_keypoint_confidence,
+        person_confidence=args.w_person_confidence,
+        ref_match=args.w_ref_match,
+        lm=(0.0 if backbone_name == "eagle" else args.w_lm),
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
+        box_objectness=args.w_box_objectness,
+        box_l1=args.w_box_l1,
+        box_giou=args.w_box_giou,
+        box_relative=args.w_box_relative,
+        box_dn=args.w_box_dn,
+        keypoint_dn=args.w_keypoint_dn,
         coarse_coord=args.w_coarse_coord,
         deform_coord=args.w_deform_coord,
         refine_coords=parse_float_list(args.w_refine_coords),
-        simcc_coarse=args.w_simcc_coarse,
-        simcc_deform=args.w_simcc_deform,
-        simcc_refine=parse_float_list(args.w_simcc_refine),
-        simcc_sigma=args.simcc_sigma,
     )
     if is_main_process():
+        duration = (
+            f"optimizer_steps={max_steps}, derived_epoch_limit={total_epochs}"
+            if step_only_training
+            else f"epochs={total_epochs}, max_steps={max_steps or 'disabled'}"
+        )
+        print(f"Training duration: {duration}")
         print(format_loss_weights(weights))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     global_step = 0
     micro_step = 0
+    last_saved_step = -1
     resume_epoch = 0
     resume_batch_in_epoch = 0
     resume_rng_state: dict[str, object] | None = None
@@ -4604,6 +6136,14 @@ def main() -> None:
     #    phases; batches are sampled from the mixed dataset directly.
     # ------------------------------------------------------------------
     active_model.train()
+    grad_diagnostics = os.environ.get("QWENPOSE_GRAD_DIAGNOSTICS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if grad_diagnostics and is_main_process():
+        print("Per-micro-step ZeRO/output gradient diagnostics enabled.")
     if not use_deepspeed:
         optimizer.zero_grad(set_to_none=True)
     stop_training = False
@@ -4631,6 +6171,7 @@ def main() -> None:
     for epoch in range(resume_epoch, total_epochs):
         if stop_training:
             break
+        set_pose_dataset_epoch(dataset, epoch)
         if batch_sampler is not None:
             batch_sampler.set_epoch(epoch)
         if sampler is not None:
@@ -4665,8 +6206,10 @@ def main() -> None:
             )
         last_iter_end = time.perf_counter()
         timing_sums = {"data": 0.0, "prep": 0.0, "fwd": 0.0, "bwd": 0.0, "micro": 0}
+        if batch_sampler is not None:
+            batch_sampler.set_start_batch(batches_to_skip)
         batch_iterator = iter(loader)
-        if batches_to_skip > 0:
+        if batches_to_skip > 0 and batch_sampler is None:
             for skipped_idx in range(batches_to_skip):
                 try:
                     next(batch_iterator)
@@ -4705,6 +6248,38 @@ def main() -> None:
                     unified_config,
                     box_source=args.box_source,
                 )
+                dn_batch: dict[str, torch.Tensor] = {}
+                box_dn_batch: dict[str, torch.Tensor] | None = None
+                if not args.disable_box_denoising:
+                    box_dn_batch = prepare_box_denoising(
+                        pose_targets,
+                        device,
+                        max_queries=args.max_dn_queries,
+                        max_groups=args.max_dn_groups,
+                        positive_noise=args.dn_positive_noise,
+                        negative_noise=args.dn_negative_noise,
+                        image_size=args.image_size,
+                    )
+                    if box_dn_batch is not None:
+                        dn_batch.update(box_dn_batch)
+                if not args.disable_keypoint_denoising and box_dn_batch is not None:
+                    keypoint_dn_batch = prepare_keypoint_denoising(
+                        pose_targets,
+                        device,
+                        max_queries=args.max_keypoint_dn_queries,
+                        max_groups=args.max_keypoint_dn_groups,
+                        positive_ks_min=args.keypoint_dn_positive_ks_min,
+                        positive_ks_max=args.keypoint_dn_positive_ks_max,
+                        negative_ks_min=args.keypoint_dn_negative_ks_min,
+                        negative_ks_max=args.keypoint_dn_negative_ks_max,
+                        image_size=args.image_size,
+                    )
+                    keypoint_dn_batch = pair_keypoint_denoising_with_box_denoising(
+                        box_dn_batch,
+                        keypoint_dn_batch,
+                    )
+                    if keypoint_dn_batch is not None:
+                        dn_batch.update(keypoint_dn_batch)
                 if backbone_processor is None:
                     qwen_inputs = None
                 elif backbone_name == "eagle":
@@ -4713,34 +6288,21 @@ def main() -> None:
                         batch["image_paths"],
                         None if args.locate_feature_source == "vision_only" else batch["prompts"],
                         device,
-                        min_pixels=args.eagle_min_pixels,
-                        max_pixels=args.eagle_max_pixels,
                         image_token_limit=args.eagle_image_token_limit,
                         batch_token_limit=args.eagle_batch_token_limit,
                         image_tensors=batch.get("vision_images"),
                     )
-                    locate_aux_weight = float(args.w_locate_box_lm) + float(args.w_locate_point_lm)
                     use_lm_loss = (
-                        locate_aux_weight > 0.0
+                        args.w_locate_box_lm > 0.0
                         and not args.disable_locate_grounding_aux
                         and not args.freeze_eagle
                         and args.locate_lm_loss_every > 0
                         and micro_step % args.locate_lm_loss_every == 0
                     )
                     if use_lm_loss:
-                        if build_eagle_lm_inputs is None:
-                            raise RuntimeError(
-                                "Locate grounding LM auxiliary training requires build_eagle_lm_inputs in qwenpose.eagle_lora."
-                            )
-                        box_responses, point_responses = build_locate_grounding_responses(
+                        locate_responses = build_locate_grounding_responses(
                             batch,
                             max_instances=args.locate_lm_max_instances,
-                            max_points=(args.locate_lm_max_points if args.w_locate_point_lm > 0.0 else 0),
-                        )
-                        locate_responses = (
-                            box_responses
-                            if args.w_locate_box_lm > 0.0
-                            else point_responses
                         )
                         qwen_lm_inputs = build_eagle_lm_inputs(
                             backbone_processor,
@@ -4748,8 +6310,6 @@ def main() -> None:
                             build_locate_generation_prompts(batch),
                             locate_responses,
                             device,
-                            min_pixels=args.eagle_min_pixels,
-                            max_pixels=args.eagle_max_pixels,
                             image_token_limit=args.eagle_image_token_limit,
                             image_tensors=batch.get("vision_images"),
                         )
@@ -4801,6 +6361,7 @@ def main() -> None:
                         target_boxes=target_boxes,
                         target_box_mask=target_box_mask,
                         images=batch.get("images"),
+                        **dn_batch,
                     )
                     outputs_finite, bad_output_names = synchronized_finite_check(
                         iter_named_floating_tensors(outputs),
@@ -4811,23 +6372,55 @@ def main() -> None:
                         raise FloatingPointError(
                             f"Non-finite model output before loss at step={global_step} micro={micro_step}: {local_detail}"
                         )
-                    loss, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
+                    if args.box_source == "person_queries":
+                        pose_targets = align_targets_to_person_queries(
+                            outputs,
+                            pose_targets,
+                            batch["task_ids"],
+                        )
+                    diagnostic_output_tensors: list[tuple[str, torch.Tensor]] = []
+                    if grad_diagnostics:
+                        diagnostic_output_tensors = [
+                            (name, tensor)
+                            for name, tensor in iter_named_floating_tensors(outputs)
+                            if tensor.requires_grad
+                        ]
+                        for _, tensor in diagnostic_output_tensors:
+                            tensor.retain_grad()
+                    if args.person_confidence_rescue:
+                        loss, loss_dict = compute_person_confidence_quality_loss(
+                            outputs,
+                            pose_targets,
+                        )
+                    else:
+                        loss, loss_dict = compute_pose_losses(
+                            outputs,
+                            pose_targets,
+                            batch["task_ids"],
+                            weights,
+                        )
                     loss_dict.update(
                         compute_pose_diagnostics(outputs, pose_targets, batch["task_ids"])
                     )
                     if "lm_loss" in outputs:
                         lm_loss = outputs["lm_loss"].float()
-                        lm_weight = weights.lm
-                        if backbone_name == "eagle":
-                            lm_weight = (
-                                float(args.w_locate_box_lm)
-                                if args.w_locate_box_lm > 0.0
-                                else float(args.w_locate_point_lm)
-                            )
+                        lm_weight = (
+                            float(args.w_locate_box_lm)
+                            if backbone_name == "eagle"
+                            else weights.lm
+                        )
                         loss = loss + lm_weight * lm_loss
                         loss_dict["loss_lm"] = lm_loss
                         loss_dict["loss_lm_weight"] = torch.as_tensor(lm_weight, device=loss.device)
                         loss_dict["loss_total"] = loss
+                        if is_main_process():
+                            progress_write(
+                                progress_bar,
+                                f"{'locate_box_lm' if backbone_name == 'eagle' else 'qwen_lm'} micro_step={micro_step} "
+                                f"raw={float(lm_loss.detach()):.6f} "
+                                f"weight={lm_weight:g} "
+                                f"contribution={float((lm_weight * lm_loss).detach()):.6f}",
+                            )
 
                 # --- Synchronized loss spike detection ---
                 loss_val = float(loss.detach())
@@ -4869,6 +6462,38 @@ def main() -> None:
                 elif use_deepspeed:
                     boundary = active_model.is_gradient_accumulation_boundary()
                     active_model.backward(loss)
+                    zero_bad_gradient_names = (
+                        deepspeed_partition_nonfinite_names(
+                            active_model,
+                            training_model,
+                            device,
+                        )
+                        if boundary or grad_diagnostics
+                        else []
+                    )
+                    if grad_diagnostics:
+                        output_gradients_finite, bad_output_gradient_names = synchronized_finite_check(
+                            (
+                                (name, tensor.grad)
+                                for name, tensor in diagnostic_output_tensors
+                                if tensor.grad is not None
+                            ),
+                            device,
+                            max_bad_names=12,
+                        )
+                        if zero_bad_gradient_names or not output_gradients_finite:
+                            source_names = ",".join(
+                                str(target.get("dataset", "unknown"))
+                                for target in pose_targets
+                            )
+                            if is_main_process():
+                                progress_write(
+                                    progress_bar,
+                                    f"[GRAD_DIAGNOSTIC] step={global_step} micro={micro_step} "
+                                    f"boundary={int(boundary)} src={source_names} lm={int(use_lm_loss)} "
+                                    f"bad_outputs={','.join(bad_output_gradient_names) or 'none'} "
+                                    f"bad_zero={','.join(zero_bad_gradient_names) or 'none'}",
+                                )
                     gradients_finite, bad_gradient_names = synchronized_finite_check(
                         (
                             (name, parameter.grad)
@@ -4877,21 +6502,50 @@ def main() -> None:
                         ),
                         device,
                     )
-                    if not gradients_finite:
+                    # Always let DeepSpeed finish the micro step.  In bf16
+                    # ZeRO-2 its optimizer-side overflow check inspects the
+                    # actual reduced/partitioned gradients and, on overflow,
+                    # clears both Parameter.grad and averaged_gradients without
+                    # touching the fp32 master weights.  Calling zero_grad()
+                    # here would only clear the former and could leave a bad
+                    # ZeRO gradient buffered for the next update.
+                    active_model.step()
+                    optimizer_overflow = bool(
+                        boundary
+                        and getattr(getattr(active_model, "optimizer", None), "overflow", False)
+                    )
+                    if optimizer_overflow:
                         skip_batch = True
                         loss_spike_count += 1
-                        active_model.zero_grad()
                         if is_main_process():
-                            local_detail = ", ".join(bad_gradient_names) if bad_gradient_names else "nonfinite gradients reported by another rank"
+                            local_detail = (
+                                ", ".join(zero_bad_gradient_names or bad_gradient_names)
+                                if zero_bad_gradient_names or bad_gradient_names
+                                else "nonfinite reduced/partitioned ZeRO gradients"
+                            )
                             progress_write(
                                 progress_bar,
-                                f"[NONFINITE_GRAD] step={global_step} micro={micro_step} {local_detail} — optimizer step skipped on all ranks",
+                                f"[NONFINITE_GRAD] step={global_step} micro={micro_step} "
+                                f"{local_detail} — DeepSpeed rejected the optimizer update on all ranks",
                             )
                         if loss_spike_count >= loss_spike_max:
                             stop_training = True
+                    elif boundary and not gradients_finite:
+                        # This should be unreachable with bf16
+                        # check_grad_overflow enabled.  Fail before incrementing
+                        # our scheduler/global-step counters if a future
+                        # DeepSpeed version no longer honors that contract.
+                        local_detail = (
+                            ", ".join(bad_gradient_names)
+                            if bad_gradient_names
+                            else "nonfinite gradients reported by another rank"
+                        )
+                        raise FloatingPointError(
+                            "DeepSpeed did not reject non-finite gradients at "
+                            f"step={global_step} micro={micro_step}: {local_detail}"
+                        )
                     else:
                         loss_spike_count = 0
-                        active_model.step()
                         did_update = bool(boundary)
                 else:
                     scaler.scale(loss / args.grad_accum_steps).backward()
@@ -5073,31 +6727,43 @@ def main() -> None:
                 if is_main_process() and args.visualize_every > 0 and (
                     global_step % args.visualize_every == 0 or global_step == 1
                 ):
-                    vis_target = pose_targets[0]
-                    vis_source_datasets = batch.get("source_datasets", [])
-                    vis_dataset_name = (
-                        vis_source_datasets[0]
-                        if vis_source_datasets
-                        else vis_target.get("dataset", "unknown")
+                    visualization_batch = {**batch, "targets": pose_targets}
+                    vis_sample_idx = select_informative_visualization_sample(
+                        outputs,
+                        visualization_batch,
+                        min_gt_area_ratio=args.visualize_min_gt_area_ratio,
                     )
-                    vis_dataset = _safe_vis_tag(vis_dataset_name)
-                    vis_schema = _safe_vis_tag(vis_target.get("schema", "unknown"))
-                    vis_path = args.output_dir / "visualizations" / f"train_step_{global_step:08d}_{vis_dataset}_{vis_schema}.jpg"
-                    try:
-                        save_pose_visualization(
-                            outputs,
-                            {**batch, "targets": pose_targets},
-                            vis_path,
-                            sample_idx=0,
-                            max_instances=args.visualize_max_instances,
-                            draw_all_schema_keypoints=True,
-                        )
-                        progress_write(progress_bar, f"saved_visualization={vis_path}")
-                    except Exception as vis_exc:
+                    if vis_sample_idx is None:
                         progress_write(
                             progress_bar,
-                            f"[WARN] step={global_step} visualization skipped: {type(vis_exc).__name__}: {vis_exc}",
+                            f"visualization_skipped=step_{global_step}:no_readable_pose_target",
                         )
+                    else:
+                        vis_target = pose_targets[vis_sample_idx]
+                        vis_source_datasets = batch.get("source_datasets", [])
+                        vis_dataset_name = (
+                            vis_source_datasets[vis_sample_idx]
+                            if vis_sample_idx < len(vis_source_datasets)
+                            else vis_target.get("dataset", "unknown")
+                        )
+                        vis_dataset = _safe_vis_tag(vis_dataset_name)
+                        vis_schema = _safe_vis_tag(vis_target.get("schema", "unknown"))
+                        vis_path = args.output_dir / "visualizations" / f"train_step_{global_step:08d}_{vis_dataset}_{vis_schema}.jpg"
+                        try:
+                            save_pose_visualization(
+                                outputs,
+                                visualization_batch,
+                                vis_path,
+                                sample_idx=vis_sample_idx,
+                                max_instances=args.visualize_max_instances,
+                                draw_all_schema_keypoints=True,
+                            )
+                            progress_write(progress_bar, f"saved_visualization={vis_path}")
+                        except Exception as vis_exc:
+                            progress_write(
+                                progress_bar,
+                                f"[WARN] step={global_step} visualization skipped: {type(vis_exc).__name__}: {vis_exc}",
+                            )
 
                 if args.save_every > 0 and global_step % args.save_every == 0:
                     training_state = build_training_state(
@@ -5127,6 +6793,7 @@ def main() -> None:
                         scaler=scaler,
                         training_state=training_state,
                     )
+                    last_saved_step = global_step
 
                 if max_steps > 0 and global_step >= max_steps:
                     stop_training = True
@@ -5197,18 +6864,19 @@ def main() -> None:
         loss_ema=loss_ema,
         loss_spike_count=loss_spike_count,
     )
-    save_checkpoint(
-        active_model,
-        optimizer,
-        global_step,
-        args.output_dir,
-        save_total_limit=args.save_total_limit,
-        include_optimizer=include_optimizer_in_checkpoint,
-        qwen_processor=backbone_processor,
-        save_deepspeed=use_deepspeed,
-        scaler=scaler,
-        training_state=training_state,
-    )
+    if last_saved_step != global_step:
+        save_checkpoint(
+            active_model,
+            optimizer,
+            global_step,
+            args.output_dir,
+            save_total_limit=args.save_total_limit,
+            include_optimizer=include_optimizer_in_checkpoint,
+            qwen_processor=backbone_processor,
+            save_deepspeed=use_deepspeed,
+            scaler=scaler,
+            training_state=training_state,
+        )
     final_module = unwrap_training_model(active_model)
     if is_main_process() and final_module.backbone_model is not None and hasattr(final_module.backbone_model, "save_pretrained"):
         adapter_dir_name = f"{backbone_name}_lora_adapter"

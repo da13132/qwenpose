@@ -84,9 +84,12 @@ def prediction_rows_to_instances(rows: Iterable[dict[str, Any]]) -> list[PredIns
                 continue
             coords = kpts[:, :2].astype(np.float64)
             scores = kpts[:, 2].astype(np.float64)
-            person_score = float(pred.get("person_score", pred.get("score", 0.0)))
-            mean_kpt_score = float(np.mean(np.clip(scores, 0.0, 1.0))) if scores.size else 0.0
-            score = person_score * max(mean_kpt_score, 1e-3)
+            if "score" not in pred:
+                raise KeyError(
+                    "Prediction is missing the canonical instance score required "
+                    "for OKS AP ranking."
+                )
+            score = float(pred["score"])
             preds.append(
                 PredInstance(
                     dataset=dataset,

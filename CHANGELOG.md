@@ -2,6 +2,16 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
+## Unreleased - unified 800 LocatePose
+
+- Replaced the legacy 256/640 dual-RGB branches with one 800×800 P2/P3/P4 pose pyramid at 200×200, 100×100, and 50×50, shared without architectural changes across Stage 1/2.
+- Removed every SimCC training, decoding, evaluation, inference, and shell configuration path. Keypoint coordinates now come only from direct regression with coordinate deep supervision.
+- Added a two-layer human box refinement decoder, explicit person objectness, refined-box export, relative/L1/GIoU box losses, and DN-DETR/DINO-style positive/negative box denoising queries that never enter the keypoint decoder.
+- Kept the Pose visual input identical across stages by using normalized raw MoonViT features. The merged Stage 2 retains the full LLM for grounding and RefHuman text conditioning without an LLM-image feature-fusion branch.
+- Reworked RefHuman to use LocateAnything's native referring-expression grounding directly: the primary prompt returns one target box, target-only box LM/matching supervises it, and an all-person generation plus `ref_match_head` is retained only as the empty-result fallback. The existing regression head locally refines the grounded box; inference restores the Locate box if a RefHuman refinement drifts below 0.30 IoU.
+- Added strict checkpoint guards: checkpoints from the dual-RGB/SimCC architecture are incompatible and must be replaced by a newly trained Stage 1 checkpoint before Stage 2.
+- Merged the old LocatePose Stage 2/3 runs into one 13-epoch Stage 2 over COCO, MPII, CrowdPose, and RefHuman; added per-dataset traversal multipliers with a `3,3,3,1` default, zero disabling, and deterministic cross-epoch continuation for fractional values.
+
 ## v2.3 - 2026-07-12
 
 - Reworked LocatePose Stage 2 into trainable human grounding: LocateAnything LoRA and vision LoRA are unfrozen, bbox grounding LM supervision is enabled at `0.10`, point-token supervision is disabled, and the same native Locate prompt is used for generation, multimodal features, and LM training. RefHuman retains single-person referring-expression grounding while AIC remains available but disabled in the default dataset lists.

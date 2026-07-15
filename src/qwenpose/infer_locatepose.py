@@ -9,7 +9,6 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -29,11 +28,15 @@ from qwenpose.data import (
     pose_collate,
 )
 from qwenpose.eval_pose import load_eval_model, resolve_checkpoint, tensor_to_prediction_rows
-from qwenpose.schemas import SCHEMA_INDICES, SCHEMA_KEYPOINTS, SCHEMA_TO_ID, UNION_KEYPOINTS
+from qwenpose.model import apply_keypoint_decode_mode
+from qwenpose.schemas import SCHEMA_INDICES, SCHEMA_KEYPOINTS, UNION_KEYPOINTS
 from qwenpose.train_pose import (
+    REFHUMAN_FALLBACK_MARKER,
     LocatePoseUnifiedConfig,
     LocatePoseUnifiedRuntime,
     _context_scale_for_indices,
+    build_refhuman_fallback_prompt,
+    build_refhuman_locate_prompt,
     expand_boxes_xyxy_per_box,
     move_batch_to_device,
     parse_locate_bbox_response,
@@ -108,14 +111,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_dtype", "--eagle_dtype", dest="eagle_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16", help="LocateAnything PyTorch dtype。")
     # --locate_attn_implementation：Locate vision tower attention 实现；默认 flash_attention_2 更省显存更快。
     parser.add_argument("--locate_attn_implementation", "--eagle_attn_implementation", dest="eagle_attn_implementation", type=str, default="flash_attention_2", help="Locate vision attention 实现。")
-    # --locate_min_pixels：兼容参数；LocateAnything processor 通常不使用 Qwen-style min_pixels。
-    parser.add_argument("--locate_min_pixels", "--eagle_min_pixels", dest="eagle_min_pixels", type=int, default=None, help="Locate 最小像素预算兼容参数。")
-    # --locate_max_pixels：Locate 图像最大像素预算；会转成 processor 支持的图像限制逻辑。
-    parser.add_argument("--locate_max_pixels", "--eagle_max_pixels", dest="eagle_max_pixels", type=int, default=None, help="Locate 最大像素预算。")
     # --locate_image_token_limit：Locate 原生图像 token 上限；和训练/eval 入口保持同名同义。
     parser.add_argument("--locate_image_token_limit", "--eagle_image_token_limit", dest="eagle_image_token_limit", type=int, default=None, help="Locate 原生图像 token 上限；空表示不覆盖 processor 默认。")
+    parser.add_argument("--locate_batch_token_limit", "--eagle_batch_token_limit", dest="eagle_batch_token_limit", type=int, default=None, help="完整 micro batch 的 Locate raw patch token 预算。")
     # --locate_feature_size：Locate token 特征投影后的空间特征图边长；需与 checkpoint 配置一致。
-    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=64, help="Locate 特征图输出边长。")
+    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=100, help="统一 800 架构的 raw MoonViT 特征图边长。")
     # --locate_feature_refiner_layers：Locate feature refiner 层数；加载 checkpoint 时会优先使用保存配置。
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=2, help="Locate feature refiner 层数。")
     # --locate_feature_refiner_bottleneck_dim：feature refiner bottleneck 维度；需与训练配置匹配。
@@ -137,8 +137,13 @@ def parse_args() -> argparse.Namespace:
 
     # --locate_generation_backend：Locate 生成框后端；默认 transformers，可复用 PoseHead 特征。
     parser.add_argument("--locate_generation_backend", choices=["vllm", "transformers", "auto"], default="transformers", help="Locate 生成框后端；默认 transformers，可复用 PoseHead 特征。")
-    # --box_source：PoseHead 条件框来源；默认闭环使用 Locate 生成框，gt 用于诊断 stage1 的 GT-box 上限。
-    parser.add_argument("--box_source", choices=["locate_generate", "gt"], default="locate_generate", help="PoseHead 条件框来源：locate_generate 或 gt。")
+    # --box_source：留空时从 checkpoint 架构自动选择统一 person queries 或旧 Locate 生成框。
+    parser.add_argument(
+        "--box_source",
+        choices=["locate_generate", "gt", "person_queries"],
+        default=None,
+        help="PoseHead 框来源；默认按 checkpoint 自动选择。",
+    )
     # --disable_vllm_fallback：vLLM 初始化/生成失败时不回退 transformers，直接抛错。
     parser.add_argument("--disable_vllm_fallback", action="store_true", help="禁用 vLLM 失败后的 transformers 回退。")
     # --gpu：指定可见 GPU，例如 0、1 或 0,1；会设置 CUDA_VISIBLE_DEVICES。
@@ -208,6 +213,19 @@ def parse_args() -> argparse.Namespace:
         help="默认保留全部 Locate 框进入 PoseHead。",
     )
     parser.add_argument("--post_pose_nms_iou_thresh", type=float, default=0.95, help="PoseHead 输出后的高阈值去重。")
+    # --ref_pose_quality_alpha：RefHuman 排序时姿态质量的指数；越小越强调文本匹配。
+    parser.add_argument(
+        "--ref_pose_quality_alpha",
+        type=float,
+        default=0.25,
+        help="RefHuman 候选排序中 pose quality 的指数，0 表示只按指代匹配。",
+    )
+    parser.add_argument(
+        "--keypoint_decode_mode",
+        choices=["regression"],
+        default="regression",
+        help="最终关键点坐标仅使用直接回归头。",
+    )
     # --score_threshold：可视化和结果筛选的关键点/person score 阈值。
     parser.add_argument("--score_threshold", type=float, default=0.05, help="预测分数阈值。")
     # --max_predictions_per_image：每张图最多写出多少个预测实例。
@@ -542,9 +560,15 @@ def export_schema_results(rows: list[dict[str, Any]], output_path: Path) -> None
             bbox_xywh = []
             if len(bbox) == 4:
                 bbox_xywh = [bbox[0], bbox[1], max(bbox[2] - bbox[0], 0.0), max(bbox[3] - bbox[1], 0.0)]
+            if "score" not in pred:
+                raise KeyError(
+                    "Prediction is missing the canonical instance score."
+                )
             compact_preds.append(
                 {
-                    "score": float(pred.get("person_score", 0.0)),
+                    "score": float(pred["score"]),
+                    "person_score": float(pred.get("person_score", 0.0)),
+                    "pose_score": float(pred.get("pose_score", 0.0)),
                     "ref_score": float(pred.get("ref_score", 0.0)),
                     "bbox_xyxy": bbox,
                     "bbox_xywh": bbox_xywh,
@@ -590,7 +614,7 @@ def locate_generation_prompt_for_record(record: PoseRecord) -> str:
     """Build the same Locate bbox prompt as train_pose.build_locate_generation_prompts."""
     if record.task == "REF_POSE":
         ref_text = str(record.ref_text or "").strip() or "person"
-        return f'Locate a single person that matches the following description: "{ref_text}".'
+        return build_refhuman_locate_prompt(ref_text)
     return "Locate all the instances that match the following description: person."
 
 
@@ -705,7 +729,7 @@ class VLLMLocateBBoxGenerator:
     def __init__(self, args: argparse.Namespace, checkpoint_path: Path) -> None:
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        os.environ["QWENPOSE_VLLM_FEATURE_SIZE"] = str(int(getattr(args, "eagle_feature_size", 64)))
+        os.environ["QWENPOSE_VLLM_FEATURE_SIZE"] = str(int(getattr(args, "eagle_feature_size", 100)))
         os.environ["QWENPOSE_VLLM_FEATURE_REFINER_LAYERS"] = str(int(getattr(args, "eagle_feature_refiner_layers", 2)))
         os.environ["QWENPOSE_VLLM_FEATURE_REFINER_BOTTLENECK_DIM"] = str(int(getattr(args, "eagle_feature_refiner_bottleneck_dim", 256)))
         os.environ["QWENPOSE_VLLM_FEATURE_REFINER_INIT_SCALE"] = str(float(getattr(args, "eagle_feature_refiner_init_scale", 0.1)))
@@ -842,14 +866,14 @@ class VLLMLocateBBoxGenerator:
             )
         return f"<image>\n{prompt}"
 
-    def generate(self, records: list[PoseRecord]) -> list[str]:
+    def _generate_with_prompts(self, records: list[PoseRecord], prompts: list[str]) -> list[str]:
         requests = []
-        for record in records:
+        for record, prompt in zip(records, prompts):
             with Image.open(record.image_path) as image:
                 pil_image = image.convert("RGB").copy()
             requests.append(
                 {
-                    "prompt": self._format_prompt(locate_generation_prompt_for_record(record)),
+                    "prompt": self._format_prompt(prompt),
                     "multi_modal_data": {"image": pil_image},
                 }
             )
@@ -867,15 +891,57 @@ class VLLMLocateBBoxGenerator:
                 responses.append("")
         return responses
 
+    def generate(self, records: list[PoseRecord], *, allow_refhuman_fallback: bool = True) -> list[str]:
+        prompts = [locate_generation_prompt_for_record(record) for record in records]
+        responses = self._generate_with_prompts(records, prompts)
+        if not allow_refhuman_fallback:
+            return responses
+        fallback_indices = [
+            idx
+            for idx, (record, response) in enumerate(zip(records, responses))
+            if record.task == "REF_POSE"
+            and parse_locate_bbox_response(response, max_instances=1).numel() == 0
+        ]
+        if not fallback_indices:
+            return responses
+        fallback_records = [records[idx] for idx in fallback_indices]
+        fallback_prompts = [
+            build_refhuman_fallback_prompt(str(record.ref_text or "").strip() or "person")
+            for record in fallback_records
+        ]
+        fallback_responses = self._generate_with_prompts(fallback_records, fallback_prompts)
+        for idx, response in zip(fallback_indices, fallback_responses):
+            responses[idx] = REFHUMAN_FALLBACK_MARKER + "\n" + response
+        return responses
+
     def generate_with_features(self, records: list[PoseRecord]) -> tuple[list[str], torch.Tensor, torch.Tensor]:
         self.vllm_model.reset_qwenpose_feature_cache()
-        responses = self.generate(records)
+        responses = self.generate(records, allow_refhuman_fallback=False)
         feature_map, text_embed = self.vllm_model.pop_qwenpose_feature_cache()
         if int(feature_map.shape[0]) != len(records) or int(text_embed.shape[0]) != len(records):
             raise RuntimeError(
                 "vLLM qwenpose feature cache batch mismatch: "
                 f"features={int(feature_map.shape[0])}, texts={int(text_embed.shape[0])}, records={len(records)}."
             )
+        fallback_indices = [
+            idx
+            for idx, (record, response) in enumerate(zip(records, responses))
+            if record.task == "REF_POSE"
+            and parse_locate_bbox_response(response, max_instances=1).numel() == 0
+        ]
+        if fallback_indices:
+            fallback_records = [records[idx] for idx in fallback_indices]
+            fallback_prompts = [
+                build_refhuman_fallback_prompt(str(record.ref_text or "").strip() or "person")
+                for record in fallback_records
+            ]
+            self.vllm_model.set_qwenpose_feature_capture(False)
+            try:
+                fallback_responses = self._generate_with_prompts(fallback_records, fallback_prompts)
+            finally:
+                self.vllm_model.set_qwenpose_feature_capture(True)
+            for idx, response in zip(fallback_indices, fallback_responses):
+                responses[idx] = REFHUMAN_FALLBACK_MARKER + "\n" + response
         return responses, feature_map, text_embed
 
     @torch.inference_mode()
@@ -1043,8 +1109,8 @@ def maybe_precompute_locate_responses(
     args: argparse.Namespace,
     checkpoint_path: Path,
 ) -> list[str] | None:
-    if args.box_source == "gt":
-        print("[Locate generation] skipped because BOX_SOURCE=gt.", flush=True)
+    if args.box_source in {"gt", "person_queries"}:
+        print(f"[Locate generation] skipped because BOX_SOURCE={args.box_source}.", flush=True)
         return None
     backend = str(args.locate_generation_backend or "transformers").lower()
     if backend == "vllm" and not bool(args.disable_single_pass_features):
@@ -1094,6 +1160,8 @@ def main() -> None:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
         raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
+    if args.ref_pose_quality_alpha < 0.0:
+        raise ValueError("--ref_pose_quality_alpha must be non-negative.")
     if args.locate_box_max_new_tokens <= 0:
         raise ValueError("--locate_box_max_new_tokens must be positive.")
     if args.vllm_tensor_parallel_size <= 0:
@@ -1112,28 +1180,36 @@ def main() -> None:
         raise ValueError("--vllm_max_num_seqs must be positive after auto sync.")
     if args.vllm_max_num_batched_tokens <= 0:
         raise ValueError("--vllm_max_num_batched_tokens must be positive after auto sync.")
-    if args.eagle_min_pixels is not None and args.eagle_min_pixels <= 0:
-        raise ValueError("--locate_min_pixels must be positive when set.")
-    if args.eagle_max_pixels is not None and args.eagle_max_pixels <= 0:
-        raise ValueError("--locate_max_pixels must be positive when set.")
     if args.eagle_image_token_limit is not None and args.eagle_image_token_limit <= 0:
         raise ValueError("--locate_image_token_limit must be positive when set.")
-    if (
-        args.eagle_min_pixels is not None
-        and args.eagle_max_pixels is not None
-        and args.eagle_max_pixels < args.eagle_min_pixels
-    ):
-        raise ValueError("--locate_max_pixels must be >= --locate_min_pixels.")
+    if args.eagle_batch_token_limit is not None and args.eagle_batch_token_limit <= 0:
+        raise ValueError("--locate_batch_token_limit must be positive when set.")
 
     apply_gpu_selection(args)
     started = time.perf_counter()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     records = apply_record_parts(build_records(args), args)
     checkpoint_path = resolve_checkpoint(args.checkpoint)
+    checkpoint_metadata = torch.load(checkpoint_path, map_location="cpu")
+    if args.box_source is None:
+        pose_config = checkpoint_metadata.get("pose_config") or {}
+        args.box_source = (
+            "person_queries"
+            if bool(pose_config.get("use_global_person_queries", False))
+            else "locate_generate"
+        )
+    pose_image_size = int(
+        (checkpoint_metadata.get("pose_config") or {}).get("rgb_input_size", 640)
+    )
     backend = str(args.locate_generation_backend or "transformers").lower()
     use_vllm_integrated = args.box_source == "locate_generate" and backend == "vllm"
     precomputed_locate_responses = None if use_vllm_integrated else maybe_precompute_locate_responses(records, args, checkpoint_path)
-    dataset = PoseRecordDataset(records, max_instances=args.max_instances, load_image_tensors=True)
+    dataset = PoseRecordDataset(
+        records,
+        max_instances=args.max_instances,
+        image_size=pose_image_size,
+        load_image_tensors=True,
+    )
     loader_kwargs: dict[str, Any] = {
         "batch_size": args.batch_size,
         "shuffle": False,
@@ -1166,8 +1242,7 @@ def main() -> None:
             use_vllm_integrated = False
             precomputed_locate_responses = None
     if not use_vllm_integrated:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        model, backbone_processor = load_eval_model(args, checkpoint, device)
+        model, backbone_processor = load_eval_model(args, checkpoint_metadata, device)
         if backbone_processor is None:
             raise ValueError("LocatePose inference requires a LocateAnything processor.")
     use_single_pass_features = (
@@ -1280,8 +1355,14 @@ def main() -> None:
                         actual_single_pass_features_used = (
                             actual_single_pass_features_used or unified_result.used_single_pass_features
                         )
-                    rows = tensor_to_prediction_rows(
+                    prediction_outputs = apply_keypoint_decode_mode(
                         outputs,
+                        mode=args.keypoint_decode_mode,
+                    )
+                    prediction_outputs = dict(prediction_outputs)
+                    prediction_outputs["keypoint_decode_mode"] = args.keypoint_decode_mode
+                    rows = tensor_to_prediction_rows(
+                        prediction_outputs,
                         batch,
                         args,
                         raw_boxes_abs=locate_boxes_abs,
@@ -1302,7 +1383,7 @@ def main() -> None:
                             safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in source_name)[:80]
                             vis_path = visualization_dir / f"infer_{samples + local_idx:06d}_{safe_name}.jpg"
                             save_pose_visualization(
-                                outputs,
+                                prediction_outputs,
                                 batch,
                                 vis_path,
                                 sample_idx=local_idx,
@@ -1346,6 +1427,7 @@ def main() -> None:
         "vllm_integrated_features_used": vllm_integrated_features_used,
         "single_pass_features_used": actual_single_pass_features_used,
         "single_pass_prompt": args.single_pass_prompt,
+        "keypoint_decode_mode": args.keypoint_decode_mode,
         "gpu": str(args.gpu or os.environ.get("CUDA_VISIBLE_DEVICES", "")),
         "format": args.format,
         "schema": FORMAT_TO_SCHEMA[args.format],

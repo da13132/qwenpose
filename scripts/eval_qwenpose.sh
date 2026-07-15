@@ -285,8 +285,8 @@ QWEN_VISION_LORA_DROPOUT="${QWEN_VISION_LORA_DROPOUT:-0.05}"
 # DEVICE：验证设备。正式验证用 cuda；CPU 上加载 Qwen3-VL 很慢且占内存，不建议。
 DEVICE="${DEVICE:-cuda}"
 
-# SCORE_THRESHOLD：兼容导出逻辑；box-conditioned 路径中有效框固定为高分。
-SCORE_THRESHOLD="${SCORE_THRESHOLD:-0.05}"
+# SCORE_THRESHOLD：官方 COCO AP 前不预删候选，由 evaluator 自行排序并保留 top-20。
+SCORE_THRESHOLD="${SCORE_THRESHOLD:-0.0}"
 
 # MAX_PREDICTIONS_PER_IMAGE：单图最多导出的 box-conditioned pose 数量，避免 predictions.jsonl 过大。
 MAX_PREDICTIONS_PER_IMAGE="${MAX_PREDICTIONS_PER_IMAGE:-100}"
@@ -446,7 +446,7 @@ ARGS=(
   --decoder_heads "${DECODER_HEADS}"
   # --device：验证设备。
   --device "${DEVICE}"
-  # --score_threshold：兼容导出逻辑；box-conditioned 有效框固定高分。
+  # --score_threshold：官方评估默认 0，不在 COCO evaluator 前预删候选。
   --score_threshold "${SCORE_THRESHOLD}"
   # --max_predictions_per_image：单图最多导出的预测人数。
   --max_predictions_per_image "${MAX_PREDICTIONS_PER_IMAGE}"

@@ -10,7 +10,7 @@ set -Eeuo pipefail
 #   3. 随机 random_n 张图；
 #   4. coco / mpii / crowdpose / refhuman / aic 输出格式；
 #   5. RefHuman 任意图片 caption 推理，以及 RefHuman train/val 标注 split 推理；
-#   6. 默认使用 integrated vLLM：LocateAnything 生成框，PoseHead 复用同一次 vLLM 图像特征；
+#   6. 默认单次前向使用 person queries；旧生成框 checkpoint 仍可选择 vLLM/Transformers；
 #   7. 可通过 GPU/CUDA_VISIBLE_DEVICES 指定推理 GPU；
 #   8. 保存 predictions.jsonl、predictions.json、格式化预测 JSON、manifest 和可视化。
 ###############################################################################
@@ -30,7 +30,7 @@ Required:
 
 Common examples:
   # COCO17 格式，推理文件夹前 20 张图
-  ${SCRIPT_PATH_REL} --checkpoint outputs/locatepose/.../stage2_locate_box_closed_loop --input demo/images --format coco --end_index 20
+  ${SCRIPT_PATH_REL} --checkpoint outputs/locatepose/.../stage2_unfreeze_locate_person_queries --input demo/images --format coco --end_index 20
 
   # 随机 10 张 CrowdPose14 格式图片
   ${SCRIPT_PATH_REL} --checkpoint CKPT --input demo/images --format crowdpose --random_n 10 --seed 123
@@ -72,8 +72,8 @@ RefHuman variables:
 Backend variables:
   BATCH_SIZE            PyTorch batch size; default 1
   NUM_WORKERS           DataLoader workers; default 0
-  BOX_SOURCE            locate_generate|gt；默认闭环生成框，gt 用于诊断 stage1 的 GT-box 上限
-  LOCATE_GENERATION_BACKEND  vllm|transformers|auto；默认 vllm，使用 integrated vLLM 路径
+  BOX_SOURCE            person_queries|locate_generate|gt；统一模型默认 person_queries
+  LOCATE_GENERATION_BACKEND  仅 BOX_SOURCE=locate_generate 生效；vllm|transformers|auto
   SINGLE_PASS_PROMPT     locate|pose；transformers 单次复用时使用纯定位 prompt 或 PoseHead prompt
   DISABLE_SINGLE_PASS_FEATURES 1 表示禁用 transformers 特征复用，回退两次前向
   LOCATE_BOX_MAX_NEW_TOKENS  Locate bbox max new tokens; default 8192
@@ -111,7 +111,10 @@ is_supported_cli_var_name() {
   local normalized_name
   normalized_name="$(normalize_cli_var_name "$1")"
   case "${normalized_name}" in
-    PROJECT_ROOT|PYTHON|RUN_TS|CHECKPOINT|FORMAT|SPLIT|OUTPUT_ROOT|RUN_NAME|OUTPUT_DIR|LOG_DIR|LOG_FILE|INPUT|IMAGE|IMAGES|IMAGE_PATHS|RECURSIVE|START_INDEX|END_INDEX|NUM_IMAGES|RANDOM_N|SEED|NUM_PARTS|PART_INDEX|WORKER_INDEX|CAPTION|CAPTION_FILE|INTERACTIVE_CAPTIONS|REFHUMAN_ROOT|REFHUMAN_MAX_CAPTIONS_PER_IMAGE|LOCATE_MODEL_PATH|LOCATE_DTYPE|LOCATE_ATTN_IMPLEMENTATION|LOCATE_MIN_PIXELS|LOCATE_MAX_PIXELS|LOCATE_IMAGE_TOKEN_LIMIT|LOCATE_FEATURE_SIZE|LOCATE_FEATURE_REFINER_LAYERS|LOCATE_FEATURE_REFINER_BOTTLENECK_DIM|LOCATE_FEATURE_REFINER_INIT_SCALE|LOCATE_LORA_R|LOCATE_LORA_ALPHA|LOCATE_LORA_DROPOUT|LOCATE_VISION_LORA_R|LOCATE_VISION_LORA_ALPHA|LOCATE_VISION_LORA_DROPOUT|HIDDEN_DIM|POSE_DECODER_LAYERS|REFINEMENT_STEPS|DECODER_HEADS|BOX_CONDITION_SCALE|POSE_ROI_SIZE|DISABLE_REFINEMENT|GPU|BOX_SOURCE|LOCATE_GENERATION_BACKEND|SINGLE_PASS_PROMPT|DISABLE_SINGLE_PASS_FEATURES|DISABLE_VLLM_FALLBACK|VLLM_TENSOR_PARALLEL_SIZE|VLLM_GPU_MEMORY_UTILIZATION|VLLM_CPU_OFFLOAD_GB|VLLM_ENFORCE_EAGER|VLLM_MAX_NUM_SEQS|VLLM_MAX_NUM_BATCHED_TOKENS|VLLM_MAX_MODEL_LEN|VLLM_BATCH_SIZE|VLLM_MODEL_IMPL|VLLM_LORA_ADAPTER|VLLM_MAX_LORA_RANK|VLLM_TRUST_REMOTE_CODE|DEVICE|BATCH_SIZE|NUM_WORKERS|PREFETCH_FACTOR|MAX_INSTANCES|LOCATE_GENERATION_MODE|LOCATE_BOX_MAX_NEW_TOKENS|BOX_NMS_IOU_THRESH|DISABLE_PRE_POSE_NMS|POST_POSE_NMS_IOU_THRESH|SCORE_THRESHOLD|MAX_PREDICTIONS_PER_IMAGE|VISUALIZE_MAX_SAMPLES|VISUALIZE_MAX_INSTANCES|PROGRESS_BAR)
+    LOCATE_BATCH_TOKEN_LIMIT)
+      return 0
+      ;;
+    PROJECT_ROOT|PYTHON|RUN_TS|CHECKPOINT|FORMAT|SPLIT|OUTPUT_ROOT|RUN_NAME|OUTPUT_DIR|LOG_DIR|LOG_FILE|INPUT|IMAGE|IMAGES|IMAGE_PATHS|RECURSIVE|START_INDEX|END_INDEX|NUM_IMAGES|RANDOM_N|SEED|NUM_PARTS|PART_INDEX|WORKER_INDEX|CAPTION|CAPTION_FILE|INTERACTIVE_CAPTIONS|REFHUMAN_ROOT|REFHUMAN_MAX_CAPTIONS_PER_IMAGE|LOCATE_MODEL_PATH|LOCATE_DTYPE|LOCATE_ATTN_IMPLEMENTATION|LOCATE_IMAGE_TOKEN_LIMIT|LOCATE_FEATURE_SIZE|LOCATE_FEATURE_REFINER_LAYERS|LOCATE_FEATURE_REFINER_BOTTLENECK_DIM|LOCATE_FEATURE_REFINER_INIT_SCALE|LOCATE_LORA_R|LOCATE_LORA_ALPHA|LOCATE_LORA_DROPOUT|LOCATE_VISION_LORA_R|LOCATE_VISION_LORA_ALPHA|LOCATE_VISION_LORA_DROPOUT|HIDDEN_DIM|POSE_DECODER_LAYERS|REFINEMENT_STEPS|DECODER_HEADS|BOX_CONDITION_SCALE|POSE_ROI_SIZE|DISABLE_REFINEMENT|GPU|BOX_SOURCE|LOCATE_GENERATION_BACKEND|SINGLE_PASS_PROMPT|DISABLE_SINGLE_PASS_FEATURES|DISABLE_VLLM_FALLBACK|VLLM_TENSOR_PARALLEL_SIZE|VLLM_GPU_MEMORY_UTILIZATION|VLLM_CPU_OFFLOAD_GB|VLLM_ENFORCE_EAGER|VLLM_MAX_NUM_SEQS|VLLM_MAX_NUM_BATCHED_TOKENS|VLLM_MAX_MODEL_LEN|VLLM_BATCH_SIZE|VLLM_MODEL_IMPL|VLLM_LORA_ADAPTER|VLLM_MAX_LORA_RANK|VLLM_TRUST_REMOTE_CODE|DEVICE|BATCH_SIZE|NUM_WORKERS|PREFETCH_FACTOR|MAX_INSTANCES|LOCATE_GENERATION_MODE|LOCATE_BOX_MAX_NEW_TOKENS|BOX_NMS_IOU_THRESH|DISABLE_PRE_POSE_NMS|POST_POSE_NMS_IOU_THRESH|REF_POSE_QUALITY_ALPHA|KEYPOINT_DECODE_MODE|SCORE_THRESHOLD|MAX_PREDICTIONS_PER_IMAGE|VISUALIZE_MAX_SAMPLES|VISUALIZE_MAX_INSTANCES|PROGRESS_BAR)
       return 0
       ;;
     *)
@@ -247,14 +250,10 @@ LOCATE_MODEL_PATH="${LOCATE_MODEL_PATH:-weights/LocateAnything-3B}"
 LOCATE_DTYPE="${LOCATE_DTYPE:-bfloat16}"
 # LOCATE_ATTN_IMPLEMENTATION：Locate vision tower attention；默认 flash_attention_2 更快更省显存。
 LOCATE_ATTN_IMPLEMENTATION="${LOCATE_ATTN_IMPLEMENTATION:-flash_attention_2}"
-# LOCATE_MIN_PIXELS：兼容参数；LocateAnything 通常不消费 Qwen-style min_pixels。
-LOCATE_MIN_PIXELS="${LOCATE_MIN_PIXELS:-}"
-# LOCATE_MAX_PIXELS：Locate 图像最大像素预算；空表示不额外限制。
-LOCATE_MAX_PIXELS="${LOCATE_MAX_PIXELS:-}"
 # LOCATE_IMAGE_TOKEN_LIMIT：LocateAnything 原生 raw MoonViT patch token 上限；默认 4096，和训练脚本保持一致。
 LOCATE_IMAGE_TOKEN_LIMIT="${LOCATE_IMAGE_TOKEN_LIMIT:-4096}"
-# LOCATE_FEATURE_SIZE：Locate 特征图边长；应与 checkpoint 保存配置一致。
-LOCATE_FEATURE_SIZE="${LOCATE_FEATURE_SIZE:-64}"
+# LOCATE_FEATURE_SIZE：统一 800 架构使用 100x100 raw MoonViT 特征。
+LOCATE_FEATURE_SIZE="${LOCATE_FEATURE_SIZE:-100}"
 # LOCATE_FEATURE_REFINER_LAYERS：Locate feature refiner 层数；checkpoint 内有配置时会优先使用。
 LOCATE_FEATURE_REFINER_LAYERS="${LOCATE_FEATURE_REFINER_LAYERS:-2}"
 # LOCATE_FEATURE_REFINER_BOTTLENECK_DIM：Locate feature refiner bottleneck 维度。
@@ -301,9 +300,14 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 # PREFETCH_FACTOR：DataLoader 预取因子；仅 NUM_WORKERS>0 时生效。
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
-# BOX_SOURCE：PoseHead 条件框来源。locate_generate 为闭环推理；gt 用于查看 stage1/GT-box 上限。
-BOX_SOURCE="${BOX_SOURCE:-locate_generate}"
-# LOCATE_GENERATION_BACKEND：Locate 生成框后端；默认 vLLM，走 LocateAnything+PoseHead integrated vLLM 路径。
+# BOX_SOURCE：统一模型默认直接使用 person queries；旧 checkpoint 可改为 locate_generate 或 gt。
+BOX_SOURCE="${BOX_SOURCE:-person_queries}"
+if [[ "${BOX_SOURCE}" == "gt" ]]; then
+  LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-$((BATCH_SIZE * 3072))}"
+else
+  LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-$((BATCH_SIZE * 4096))}"
+fi
+# LOCATE_GENERATION_BACKEND：仅 BOX_SOURCE=locate_generate 时生效的旧生成框后端。
 LOCATE_GENERATION_BACKEND="${LOCATE_GENERATION_BACKEND:-vllm}"
 # SINGLE_PASS_PROMPT：单次特征复用时使用的 prompt。locate 更贴近纯框生成；pose 更贴近 PoseHead 训练文本。
 SINGLE_PASS_PROMPT="${SINGLE_PASS_PROMPT:-locate}"
@@ -313,7 +317,7 @@ DISABLE_SINGLE_PASS_FEATURES="${DISABLE_SINGLE_PASS_FEATURES:-0}"
 ###############################################################################
 # integrated vLLM 参数
 #
-# 默认 vLLM custom model 会在同一个 vLLM 模型对象内加载 LocateAnything、
+# 旧生成框路径的 vLLM custom model 会在同一个 vLLM 模型对象内加载 LocateAnything、
 # Locate LoRA、PoseHead 和 feature adapter；Locate 生成 boxes 后，PoseHead
 # 复用同一次 vLLM prefill 缓存的图像特征输出 keypoints。
 ###############################################################################
@@ -362,6 +366,10 @@ BOX_NMS_IOU_THRESH="${BOX_NMS_IOU_THRESH:-0.70}"
 DISABLE_PRE_POSE_NMS="${DISABLE_PRE_POSE_NMS:-1}"
 # POST_POSE_NMS_IOU_THRESH：PoseHead 输出后的高阈值重复框去重。
 POST_POSE_NMS_IOU_THRESH="${POST_POSE_NMS_IOU_THRESH:-0.95}"
+# REF_POSE_QUALITY_ALPHA：RefHuman 排序中 pose quality 的指数；0 只按文本匹配，默认 0.25。
+REF_POSE_QUALITY_ALPHA="${REF_POSE_QUALITY_ALPHA:-0.25}"
+# KEYPOINT_DECODE_MODE：关键点坐标只使用直接回归头。
+KEYPOINT_DECODE_MODE="${KEYPOINT_DECODE_MODE:-regression}"
 # SCORE_THRESHOLD：结果筛选和可视化关键点/person score 阈值。
 SCORE_THRESHOLD="${SCORE_THRESHOLD:-0.05}"
 # MAX_PREDICTIONS_PER_IMAGE：每张图最多写出的预测实例数量。
@@ -374,15 +382,15 @@ VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-8}"
 PROGRESS_BAR="${PROGRESS_BAR:-1}"
 
 if [[ -z "${CHECKPOINT}" ]]; then
-  echo "CHECKPOINT is required. Example: --checkpoint outputs/locatepose/.../stage2_locate_box_closed_loop" >&2
+  echo "CHECKPOINT is required. Example: --checkpoint outputs/locatepose/.../stage2_unfreeze_locate_person_queries" >&2
   exit 1
 fi
 if [[ -z "${INPUT}" && -z "${IMAGE}" && -z "${IMAGE_PATHS}" && -z "${REFHUMAN_ROOT}" ]]; then
   echo "At least one of INPUT, IMAGE, IMAGE_PATHS, or REFHUMAN_ROOT is required." >&2
   exit 1
 fi
-if [[ "${BOX_SOURCE}" != "locate_generate" && "${BOX_SOURCE}" != "gt" ]]; then
-  echo "BOX_SOURCE must be locate_generate or gt, got: ${BOX_SOURCE}" >&2
+if [[ "${BOX_SOURCE}" != "person_queries" && "${BOX_SOURCE}" != "locate_generate" && "${BOX_SOURCE}" != "gt" ]]; then
+  echo "BOX_SOURCE must be person_queries, locate_generate, or gt, got: ${BOX_SOURCE}" >&2
   exit 1
 fi
 
@@ -458,6 +466,8 @@ args=(
   --locate_box_max_new_tokens "${LOCATE_BOX_MAX_NEW_TOKENS}"
   --box_nms_iou_thresh "${BOX_NMS_IOU_THRESH}"
   --post_pose_nms_iou_thresh "${POST_POSE_NMS_IOU_THRESH}"
+  --ref_pose_quality_alpha "${REF_POSE_QUALITY_ALPHA}"
+  --keypoint_decode_mode "${KEYPOINT_DECODE_MODE}"
   --score_threshold "${SCORE_THRESHOLD}"
   --max_predictions_per_image "${MAX_PREDICTIONS_PER_IMAGE}"
   --visualize_max_samples "${VISUALIZE_MAX_SAMPLES}"
@@ -474,9 +484,8 @@ add_opt args --random_n "${RANDOM_N}"
 add_opt args --caption "${CAPTION}"
 add_opt args --caption_file "${CAPTION_FILE}"
 add_opt args --refhuman_root "${REFHUMAN_ROOT}"
-add_opt args --locate_min_pixels "${LOCATE_MIN_PIXELS}"
-add_opt args --locate_max_pixels "${LOCATE_MAX_PIXELS}"
 add_opt args --locate_image_token_limit "${LOCATE_IMAGE_TOKEN_LIMIT}"
+add_opt args --locate_batch_token_limit "${LOCATE_BATCH_TOKEN_LIMIT}"
 
 if is_enabled "${RECURSIVE}"; then
   args+=(--recursive)
@@ -526,6 +535,7 @@ echo "GPU=${GPU}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 echo "LOCATE_ATTN_IMPLEMENTATION=${LOCATE_ATTN_IMPLEMENTATION}"
 echo "LOCATE_IMAGE_TOKEN_LIMIT=${LOCATE_IMAGE_TOKEN_LIMIT}"
+echo "LOCATE_BATCH_TOKEN_LIMIT=${LOCATE_BATCH_TOKEN_LIMIT}"
 echo "BOX_SOURCE=${BOX_SOURCE}"
 echo "LOCATE_GENERATION_BACKEND=${LOCATE_GENERATION_BACKEND}"
 echo "LOCATE_GENERATION_MODE=${LOCATE_GENERATION_MODE}"
@@ -533,6 +543,8 @@ echo "SINGLE_PASS_PROMPT=${SINGLE_PASS_PROMPT}"
 echo "DISABLE_SINGLE_PASS_FEATURES=${DISABLE_SINGLE_PASS_FEATURES}"
 echo "DISABLE_PRE_POSE_NMS=${DISABLE_PRE_POSE_NMS}"
 echo "POST_POSE_NMS_IOU_THRESH=${POST_POSE_NMS_IOU_THRESH}"
+echo "REF_POSE_QUALITY_ALPHA=${REF_POSE_QUALITY_ALPHA}"
+echo "KEYPOINT_DECODE_MODE=${KEYPOINT_DECODE_MODE}"
 echo "VLLM_TENSOR_PARALLEL_SIZE=${VLLM_TENSOR_PARALLEL_SIZE}"
 echo "VLLM_BATCH_SIZE=${VLLM_BATCH_SIZE}"
 echo "VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS}"

@@ -4,9 +4,9 @@ import argparse
 import json
 import time
 from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader
 
@@ -17,7 +17,12 @@ except Exception:  # pragma: no cover - tqdm is optional for minimal envs.
 
 from qwenpose.data import build_datasets, pose_collate
 from qwenpose.losses import LossWeights, compute_pose_losses
-from qwenpose.model import QwenPoseConfig, QwenPoseModel
+from qwenpose.model import (
+    QwenPoseConfig,
+    QwenPoseModel,
+    apply_keypoint_decode_mode,
+    topk_keypoint_confidence,
+)
 from qwenpose.qwen_lora import (
     QwenLoRAConfig,
     load_qwen_model,
@@ -26,6 +31,7 @@ from qwenpose.qwen_lora import (
 )
 from qwenpose.eagle_lora import (
     EagleLoRAConfig,
+    load_eagle_vision_only_with_lora,
     load_eagle_with_lora,
     eagle_hidden_size,
 )
@@ -143,9 +149,7 @@ def predictions_to_coco_results(
         if image_id_str not in image_id_map:
             continue
         img_id = image_id_map[image_id_str]
-        w = float(row.get("width", 0))
-        h = float(row.get("height", 0))
-        # If width/height not in row, try to get from first prediction's bbox
+        # Keypoints are already in absolute image coordinates.
         for pred in row["predictions"]:
             person_score = float(pred["person_score"])
             all_kpts = pred["keypoints"]  # [U, 3] with x, y, vis in absolute coords
@@ -159,10 +163,11 @@ def predictions_to_coco_results(
                 kvis = float(all_kpts[kpt_idx][2])
                 coco_kpts.extend([kx, ky, kvis])
 
-            # Score: person_score * mean visible keypoint confidence
-            vis_values = [float(all_kpts[int(ki)][2]) for ki in COCO_KPT_INDICES.tolist()]
-            mean_vis = sum(vis_values) / max(len(vis_values), 1)
-            score = person_score * max(mean_vis, 0.01)
+            if "score" not in pred:
+                raise KeyError(
+                    "COCO prediction is missing the canonical instance score."
+                )
+            score = float(pred["score"])
 
             results.append({
                 "image_id": img_id,
@@ -221,6 +226,70 @@ def compute_coco_keypoint_ap(
     return metrics
 
 
+def compute_official_coco_keypoint_ap(
+    prediction_rows: list[dict],
+    dataset_root: Path,
+    split: str,
+) -> dict[str, float]:
+    """Evaluate exported instance scores against the official COCO GT file."""
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    coco_split = split if split.endswith("2017") else f"{split}2017"
+    annotation_path = (
+        dataset_root / "coco" / "annotations" / f"person_keypoints_{coco_split}.json"
+    )
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"Official COCO keypoint annotations not found: {annotation_path}")
+
+    results: list[dict] = []
+    image_ids: set[int] = set()
+    for row in prediction_rows:
+        if row.get("dataset") != "coco":
+            continue
+        image_id = int(row["image_id"])
+        image_ids.add(image_id)
+        for prediction in row.get("predictions", []):
+            union_keypoints = prediction["keypoints"]
+            coco_keypoints: list[float] = []
+            for union_idx in COCO_KPT_INDICES.tolist():
+                x, y, visibility = union_keypoints[int(union_idx)][:3]
+                coco_keypoints.extend([float(x), float(y), float(visibility)])
+            results.append(
+                {
+                    "image_id": image_id,
+                    "category_id": _coco_cat_id(),
+                    "keypoints": coco_keypoints,
+                    # One learned person/pose-quality score is used for ranking;
+                    # per-keypoint quality is not multiplied into the COCO score.
+                    "score": float(prediction["score"]),
+                }
+            )
+    if not image_ids or not results:
+        return {
+            "AP": 0.0,
+            "AP50": 0.0,
+            "AP75": 0.0,
+            "APm": 0.0,
+            "APl": 0.0,
+            "AR": 0.0,
+            "AR50": 0.0,
+            "AR75": 0.0,
+            "ARm": 0.0,
+            "ARl": 0.0,
+        }
+
+    coco_gt = COCO(str(annotation_path))
+    coco_dt = coco_gt.loadRes(results)
+    evaluator = COCOeval(coco_gt, coco_dt, "keypoints")
+    evaluator.params.imgIds = sorted(image_ids)
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
+    names = ["AP", "AP50", "AP75", "APm", "APl", "AR", "AR50", "AR75", "ARm", "ARl"]
+    return {name: float(evaluator.stats[index]) for index, name in enumerate(names)}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate QwenPose checkpoints.")
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -257,10 +326,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_model_path", "--eagle_model_path", dest="eagle_model_path", type=str, default="weights/LocateAnything-3B")
     parser.add_argument("--locate_dtype", "--eagle_dtype", dest="eagle_dtype", choices=["bfloat16", "float16", "float32", "auto", "none"], default="bfloat16")
     parser.add_argument("--locate_attn_implementation", "--eagle_attn_implementation", dest="eagle_attn_implementation", type=str, default="sdpa")
-    parser.add_argument("--locate_min_pixels", "--eagle_min_pixels", dest="eagle_min_pixels", type=int, default=None)
-    parser.add_argument("--locate_max_pixels", "--eagle_max_pixels", dest="eagle_max_pixels", type=int, default=None)
     parser.add_argument("--locate_image_token_limit", "--eagle_image_token_limit", dest="eagle_image_token_limit", type=int, default=None)
-    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=32)
+    parser.add_argument("--locate_batch_token_limit", "--eagle_batch_token_limit", dest="eagle_batch_token_limit", type=int, default=None)
+    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=100)
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
     parser.add_argument(
         "--locate_feature_refiner_bottleneck_dim",
@@ -284,12 +352,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_vision_lora_dropout", "--eagle_vision_lora_dropout", dest="eagle_vision_lora_dropout", type=float, default=0.05)
 
     parser.add_argument("--hidden_dim", type=int, default=448)
-    parser.add_argument("--pose_decoder_layers", type=int, default=1)
+    parser.add_argument("--pose_decoder_layers", type=int, default=3)
     parser.add_argument("--refinement_steps", type=int, default=3)
     parser.add_argument("--decoder_heads", type=int, default=8)
-    parser.add_argument("--box_condition_scale", type=float, default=1.2)
+    parser.add_argument("--box_condition_scale", type=float, default=1.25)
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--box_source", choices=["gt", "qwen_generate", "locate_generate"], default=None)
+    parser.add_argument(
+        "--box_source",
+        choices=["gt", "qwen_generate", "locate_generate", "person_queries"],
+        default=None,
+    )
     parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
     parser.add_argument("--locate_box_max_new_tokens", type=int, default=8192)
     parser.add_argument("--locate_generation_mode", choices=["fast", "slow", "hybrid"], default="hybrid")
@@ -319,17 +391,49 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--post_pose_nms_iou_thresh", type=float, default=0.95)
+    parser.add_argument(
+        "--ref_pose_quality_alpha",
+        type=float,
+        default=0.25,
+        help="Exponent applied to pose quality when ranking RefHuman candidates.",
+    )
+    parser.add_argument(
+        "--keypoint_decode_mode",
+        choices=["regression"],
+        default="regression",
+        help="Final keypoint coordinates use the direct regression head.",
+    )
+    parser.add_argument(
+        "--keypoint_decode_modes",
+        type=str,
+        default="",
+        help="Compatibility option; only regression is supported.",
+    )
     parser.add_argument("--disable_refinement", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    parser.add_argument("--score_threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--score_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Pre-COCO filtering threshold. Official evaluation defaults to zero "
+            "so pycocotools performs the ranking and per-image top-20 truncation."
+        ),
+    )
     parser.add_argument("--max_predictions_per_image", type=int, default=100)
     parser.add_argument("--visualize_max_samples", type=int, default=100)
     parser.add_argument("--visualize_max_instances", type=int, default=8)
 
     parser.add_argument("--w_oks", type=float, default=0.5)
     parser.add_argument("--w_coord", type=float, default=3.0)
-    parser.add_argument("--w_vis", type=float, default=0.05)
+    parser.add_argument(
+        "--w_keypoint_confidence",
+        "--w_vis",
+        dest="w_keypoint_confidence",
+        type=float,
+        default=0.1,
+    )
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
     return parser.parse_args()
@@ -361,9 +465,23 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
     external_dim = None
     backbone_name = getattr(args, "backbone", "qwen3vl")
     backbone_merged = bool(checkpoint.get("backbone_merged", False))
+    feature_config = checkpoint.get("backbone_feature_config", checkpoint.get("qwen_feature_config", {}))
+    saved_feature_source = str(feature_config.get("feature_source", "raw_visual"))
+    saved_pose_config = checkpoint.get("pose_config") or {}
+    prune_locate_generation = bool(
+        feature_config.get(
+            "generation_components_pruned",
+            saved_pose_config.get("use_global_person_queries", False),
+        )
+    ) and str(getattr(args, "box_source", "")) != "locate_generate"
 
     if backbone_name == "eagle":
-        backbone_model, backbone_processor = load_eagle_with_lora(
+        eagle_loader = (
+            load_eagle_vision_only_with_lora
+            if saved_feature_source == "vision_only"
+            else load_eagle_with_lora
+        )
+        backbone_model, backbone_processor = eagle_loader(
             EagleLoRAConfig(
                 model_path=args.eagle_model_path,
                 lora_r=args.eagle_lora_r,
@@ -374,6 +492,7 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
                 vision_lora_dropout=args.eagle_vision_lora_dropout,
                 dtype=args.eagle_dtype,
                 attn_implementation=args.eagle_attn_implementation,
+                prune_generation=prune_locate_generation,
             )
         )
         if "backbone_trainable" in checkpoint or "qwen_trainable" in checkpoint:
@@ -418,6 +537,14 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
         default_refiner_init_scale = args.qwen_feature_refiner_init_scale
 
     saved_pose_config = checkpoint.get("pose_config")
+    if saved_pose_config is not None and (
+        "pose_pyramid_channels" not in saved_pose_config
+        or int(saved_pose_config.get("rgb_input_size", 0)) != 800
+    ):
+        raise ValueError(
+            "This checkpoint predates the unified 800x800 pose pyramid and cannot be evaluated "
+            "with the new architecture. Train a new Stage1 checkpoint first."
+        )
     pose_config_kwargs = (
         {
             "hidden_dim": args.hidden_dim,
@@ -436,11 +563,24 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
             if key in saved_pose_config
         }
     )
+    # Keypoint DN is training-only. Old unified-pyramid checkpoints do not own
+    # its tiny type embedding, so keep their inference graph parameter-exact.
+    if saved_pose_config is not None and "enable_keypoint_denoising" not in saved_pose_config:
+        pose_config_kwargs["enable_keypoint_denoising"] = False
+    # Checkpoints created before the center-reference migration used the
+    # persistent schema skeleton in both query PE and coordinate residuals.
+    if saved_pose_config is not None and "pose_coordinate_init" not in saved_pose_config:
+        pose_config_kwargs["pose_coordinate_init"] = "schema_prior"
     pose_config_kwargs["external_dim"] = external_dim
     pose_model = QwenPoseModel(QwenPoseConfig(**pose_config_kwargs))
     pose_model.load_state_dict(checkpoint["model"], strict=True)
+    if pose_model.person_confidence_head is None:
+        raise RuntimeError(
+            "This checkpoint has no trained person confidence head. Official COCO "
+            "pose AP requires one canonical instance score per pose; run the "
+            "confidence-rescue migration before evaluation."
+        )
     refiner_config = checkpoint.get("backbone_feature_refiner_config", checkpoint.get("qwen_feature_refiner_config", {}))
-    feature_config = checkpoint.get("backbone_feature_config", checkpoint.get("qwen_feature_config", {}))
     has_refiner_checkpoint = "backbone_feature_refiner" in checkpoint or "qwen_feature_refiner" in checkpoint
     feature_size = int(feature_config.get("output_size", default_feature_size))
     refiner_layers = int(refiner_config.get("layers", default_refiner_layers)) if has_refiner_checkpoint else 0
@@ -456,6 +596,7 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
             refiner_layers=refiner_layers,
             refiner_bottleneck_dim=refiner_bottleneck_dim,
             refiner_init_scale=refiner_init_scale,
+            feature_source=saved_feature_source,
         )
     else:
         from qwenpose.qwen_lora import QwenFeatureExtractor
@@ -486,13 +627,48 @@ def tensor_to_prediction_rows(
     raw_boxes_abs: list[list[list[float]]] | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
-    person_scores = outputs["person_logits"].sigmoid().detach().cpu()
+    if not bool(outputs.get("person_confidence_head_available", False)):
+        raise RuntimeError(
+            "Official COCO pose evaluation requires a trained person confidence "
+            "head. Refusing to rank poses with fixed person logits or an implicit "
+            "keypoint-confidence fallback."
+        )
+    detection_scores = outputs["person_logits"].sigmoid().detach().cpu()
     ref_logits = outputs["ref_logits"].detach().cpu()
+    pose_quality_logits = outputs.get("pose_quality_logits")
+    pose_quality_scores = (
+        pose_quality_logits.sigmoid().detach().cpu()
+        if torch.is_tensor(pose_quality_logits)
+        else detection_scores
+    )
+    ref_match_scores = ref_logits.sigmoid()
+    ref_quality_alpha = max(float(getattr(args, "ref_pose_quality_alpha", 0.25)), 0.0)
+    ref_final_scores = ref_match_scores * pose_quality_scores.clamp_min(1e-6).pow(
+        ref_quality_alpha
+    )
     box_mask = outputs.get("box_mask")
-    box_mask_cpu = box_mask.detach().cpu().bool() if box_mask is not None else torch.ones_like(person_scores, dtype=torch.bool)
+    box_mask_cpu = box_mask.detach().cpu().bool() if box_mask is not None else torch.ones_like(detection_scores, dtype=torch.bool)
+    refinement_fallback = outputs.get("ref_box_refinement_fallback_mask")
+    refinement_fallback_cpu = (
+        refinement_fallback.detach().cpu().bool()
+        if torch.is_tensor(refinement_fallback)
+        else torch.zeros_like(box_mask_cpu)
+    )
     boxes = outputs["boxes"].detach().cpu()
     pose_boxes = outputs.get("pose_boxes", outputs["boxes"]).detach().cpu()
     keypoints = outputs["keypoints"].detach().cpu()
+    schema_valid_output = outputs.get("keypoint_valid_mask")
+    if torch.is_tensor(schema_valid_output):
+        pose_scores_all = topk_keypoint_confidence(
+            keypoints,
+            schema_valid_output.detach().cpu().bool(),
+            fraction=0.5,
+        ).cpu()
+    else:
+        pose_scores_all = keypoints[..., 2].mean(dim=-1)
+    # Canonical COCO ranking score: one learned scalar per pose query. Joint
+    # quality remains diagnostic metadata and is never multiplied into score.
+    final_scores = detection_scores
     for b, target in enumerate(batch["targets"]):
         width = float(target["width"])
         height = float(target["height"])
@@ -503,57 +679,43 @@ def tensor_to_prediction_rows(
             if raw_boxes_abs is not None and b < len(raw_boxes_abs)
             else []
         )
-        for query_idx, raw_box in enumerate(sample_raw_boxes[: int(detection_boxes.shape[0])]):
-            if len(raw_box) != 4:
-                continue
-            detection_boxes[query_idx] = torch.tensor(
-                [
-                    float(raw_box[0]) / max(width, 1.0),
-                    float(raw_box[1]) / max(height, 1.0),
-                    float(raw_box[2]) / max(width, 1.0),
-                    float(raw_box[3]) / max(height, 1.0),
-                ],
-                dtype=detection_boxes.dtype,
-            ).clamp(0.0, 1.0)
         valid = torch.nonzero(box_mask_cpu[b], as_tuple=False).flatten()
+        direct_refhuman = task_id == 1 and valid.numel() == 1
         if task_id == 1:
-            selected = [int(valid[0].item())] if valid.numel() > 0 else []
+            if valid.numel() > 0:
+                best_local = int(torch.argmax(ref_final_scores[b, valid]).item())
+                selected = [int(valid[best_local].item())]
+            else:
+                selected = []
         else:
-            keep = valid[person_scores[b, valid] >= args.score_threshold] if valid.numel() > 0 else valid
+            keep = valid[final_scores[b, valid] >= args.score_threshold] if valid.numel() > 0 else valid
             if keep.numel() == 0 and valid.numel() > 0:
                 keep = valid[:1]
-            if keep.numel() > 0:
-                schema_valid = outputs.get("keypoint_valid_mask")
-                if schema_valid is not None:
-                    valid_joints = schema_valid[b].detach().cpu().bool()
-                    valid_count = valid_joints.float().sum().clamp(min=1.0)
-                    pose_scores = (
-                        keypoints[b, keep, :, 2] * valid_joints.float().view(1, -1)
-                    ).sum(dim=-1) / valid_count
-                else:
-                    pose_scores = keypoints[b, keep, :, 2].mean(dim=-1)
+            nms_scores = final_scores[b, keep] if keep.numel() > 0 else torch.zeros(0)
+            if str(getattr(args, "box_source", "")).lower() == "gt":
+                # GT-box evaluation already has one query per annotated person;
+                # box NMS could incorrectly remove distinct crowded instances.
+                order = torch.argsort(nms_scores, descending=True)
+                order = order[: max(int(args.max_predictions_per_image), 0)]
+                selected = [int(keep[idx].item()) for idx in order.tolist()]
             else:
-                pose_scores = torch.zeros(0)
-            kept_local = nms_box_indices_xyxy(
-                detection_boxes[keep],
-                pose_scores,
-                iou_thresh=float(getattr(args, "post_pose_nms_iou_thresh", 0.95)),
-                max_boxes=args.max_predictions_per_image,
-            )
-            selected = [int(keep[idx].item()) for idx in kept_local]
+                kept_local = nms_box_indices_xyxy(
+                    detection_boxes[keep],
+                    nms_scores,
+                    iou_thresh=float(getattr(args, "post_pose_nms_iou_thresh", 0.95)),
+                    max_boxes=args.max_predictions_per_image,
+                )
+                selected = [int(keep[idx].item()) for idx in kept_local]
 
         predictions = []
         for query_idx in selected:
             box = detection_boxes[query_idx].tolist()
-            if query_idx < len(sample_raw_boxes) and len(sample_raw_boxes[query_idx]) == 4:
-                box_abs = [float(value) for value in sample_raw_boxes[query_idx]]
-            else:
-                box_abs = [
-                    box[0] * width,
-                    box[1] * height,
-                    box[2] * width,
-                    box[3] * height,
-                ]
+            box_abs = [
+                box[0] * width,
+                box[1] * height,
+                box[2] * width,
+                box[3] * height,
+            ]
             pose_box = pose_boxes[b, query_idx].tolist()
             pose_box_abs = [
                 pose_box[0] * width,
@@ -564,16 +726,35 @@ def tensor_to_prediction_rows(
             kp = keypoints[b, query_idx].clone()
             kp[:, 0] *= width
             kp[:, 1] *= height
-            predictions.append(
-                {
-                    "query": query_idx,
-                    "person_score": float(person_scores[b, query_idx].item()),
-                    "ref_score": float(ref_logits[b, query_idx].sigmoid().item()),
-                    "bbox_2d": box_abs,
-                    "pose_bbox_2d": pose_box_abs,
-                    "keypoints": kp.tolist(),
-                }
+            prediction_score = (
+                pose_quality_scores[b, query_idx]
+                if direct_refhuman
+                else ref_final_scores[b, query_idx]
+                if task_id == 1
+                else final_scores[b, query_idx]
             )
+            prediction = {
+                "query": query_idx,
+                "person_score": float(detection_scores[b, query_idx].item()),
+                "pose_score": float(pose_scores_all[b, query_idx].item()),
+                "pose_quality_score": float(pose_quality_scores[b, query_idx].item()),
+                "score": float(prediction_score.item()),
+                "ref_score": float(ref_match_scores[b, query_idx].item()),
+                "ref_grounding_mode": (
+                    "direct" if direct_refhuman else "candidate_fallback"
+                ) if task_id == 1 else None,
+                "ref_box_refinement_fallback": bool(
+                    refinement_fallback_cpu[b, query_idx].item()
+                ),
+                "bbox_2d": box_abs,
+                "pose_bbox_2d": pose_box_abs,
+                "keypoints": kp.tolist(),
+            }
+            if query_idx < len(sample_raw_boxes) and len(sample_raw_boxes[query_idx]) == 4:
+                prediction["input_bbox_2d"] = [
+                    float(value) for value in sample_raw_boxes[query_idx]
+                ]
+            predictions.append(prediction)
         rows.append(
             {
                 "dataset": target["dataset"],
@@ -584,6 +765,7 @@ def tensor_to_prediction_rows(
                 "task_id": task_id,
                 "schema": target["schema"],
                 "prompt": batch["prompts"][b],
+                "keypoint_decode_mode": str(getattr(args, "keypoint_decode_mode", "regression")),
                 "num_gt": int(target["boxes"].shape[0]),
                 "predictions": predictions,
             }
@@ -599,6 +781,21 @@ def target_to_metric_target(target: dict) -> dict:
         if isinstance(value, torch.Tensor):
             copied[key] = value.detach().cpu()
     return copied
+
+
+def requested_keypoint_decode_modes(args: argparse.Namespace) -> list[str]:
+    raw = str(getattr(args, "keypoint_decode_modes", "") or "").strip()
+    values = raw.split(",") if raw else [str(args.keypoint_decode_mode)]
+    modes: list[str] = []
+    for value in values:
+        mode = value.strip().lower()
+        if mode != "regression":
+            raise ValueError(
+                f"Unsupported keypoint decode mode {mode!r}; only regression is available."
+            )
+        if mode not in modes:
+            modes.append(mode)
+    return modes
 
 
 def dataset_records_in_order(dataset) -> list:
@@ -621,8 +818,6 @@ def main() -> None:
     args = parse_args()
     if args.backbone == "locatepose":
         args.backbone = "eagle"
-    if args.box_source is None:
-        args.box_source = "locate_generate" if args.backbone == "eagle" else "qwen_generate"
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
     if args.pose_roi_size <= 1:
@@ -643,6 +838,8 @@ def main() -> None:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
         raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
+    if args.ref_pose_quality_alpha < 0.0:
+        raise ValueError("--ref_pose_quality_alpha must be non-negative.")
     if args.box_source == "qwen_generate" and args.backbone != "qwen3vl":
         raise ValueError("--box_source=qwen_generate currently requires --backbone qwen3vl.")
     if args.box_source == "locate_generate" and args.backbone != "eagle":
@@ -669,28 +866,29 @@ def main() -> None:
         and args.qwen_max_pixels < args.qwen_min_pixels
     ):
         raise ValueError("--qwen_max_pixels must be >= --qwen_min_pixels.")
-    if args.eagle_min_pixels is not None and args.eagle_min_pixels <= 0:
-        raise ValueError("--eagle_min_pixels must be positive when set.")
-    if args.eagle_max_pixels is not None and args.eagle_max_pixels <= 0:
-        raise ValueError("--eagle_max_pixels must be positive when set.")
-    if (
-        args.eagle_min_pixels is not None
-        and args.eagle_max_pixels is not None
-        and args.eagle_max_pixels < args.eagle_min_pixels
-    ):
-        raise ValueError("--eagle_max_pixels must be >= --eagle_min_pixels.")
     if args.eagle_image_token_limit is not None and args.eagle_image_token_limit <= 0:
         raise ValueError("--locate_image_token_limit/--eagle_image_token_limit must be positive when set.")
+    if args.eagle_batch_token_limit is not None and args.eagle_batch_token_limit <= 0:
+        raise ValueError("--locate_batch_token_limit/--eagle_batch_token_limit must be positive when set.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = resolve_checkpoint(args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if args.box_source is None:
+        pose_config = checkpoint.get("pose_config") or {}
+        args.box_source = (
+            "person_queries"
+            if bool(pose_config.get("use_global_person_queries", False))
+            else ("locate_generate" if args.backbone == "eagle" else "qwen_generate")
+        )
     device = torch.device(args.device)
+    pose_image_size = int((checkpoint.get("pose_config") or {}).get("rgb_input_size", 640))
 
     dataset_names = [name.strip() for name in args.datasets.split(",") if name.strip()]
     dataset = build_datasets(
         dataset_root=args.dataset_root,
         names=dataset_names,
         max_instances=args.max_instances,
+        image_size=pose_image_size,
         split=args.split,
         max_samples_per_dataset=args.max_samples_per_dataset,
         mixing_strategy="concat_shuffle",
@@ -766,7 +964,7 @@ def main() -> None:
     weights = LossWeights(
         oks=args.w_oks,
         coord=args.w_coord,
-        vis=args.w_vis,
+        keypoint_confidence=args.w_keypoint_confidence,
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
     )
@@ -774,24 +972,36 @@ def main() -> None:
     totals: dict[str, float] = {}
     batches = 0
     samples = 0
-    predictions_path = args.output_dir / "predictions.jsonl"
-    visualization_dir = args.output_dir / "visualizations"
+    decode_modes = requested_keypoint_decode_modes(args)
+    sweep_enabled = len(decode_modes) > 1
+    mode_output_dirs = {
+        mode: args.output_dir / mode if sweep_enabled else args.output_dir
+        for mode in decode_modes
+    }
+    predictions_paths = {mode: path / "predictions.jsonl" for mode, path in mode_output_dirs.items()}
+    visualization_dirs = {mode: path / "visualizations" for mode, path in mode_output_dirs.items()}
+    for path in mode_output_dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
     if args.visualize_max_samples > 0:
-        visualization_dir.mkdir(parents=True, exist_ok=True)
-    visualized_samples = 0
+        for path in visualization_dirs.values():
+            path.mkdir(parents=True, exist_ok=True)
+    visualized_samples = {mode: 0 for mode in decode_modes}
 
     # Collect GT and predictions for AP computation
     all_gt_targets: list[dict] = []
-    all_predictions_rows: list[dict] = []
+    all_predictions_rows = {mode: [] for mode in decode_modes}
     # Per-dataset tracking
     dataset_gt: dict[str, list[dict]] = defaultdict(list)
-    dataset_preds: dict[str, list[dict]] = defaultdict(list)
     actual_single_pass_features_used = False
     actual_vllm_integrated_features_used = False
     response_offset = 0
 
     try:
-        with predictions_path.open("w", encoding="utf-8") as f:
+        with ExitStack() as stack:
+            prediction_writers = {
+                mode: stack.enter_context(path.open("w", encoding="utf-8"))
+                for mode, path in predictions_paths.items()
+            }
             with torch.inference_mode():
                 progress_bar = None
                 if not args.disable_progress and tqdm is not None:
@@ -867,18 +1077,32 @@ def main() -> None:
                             actual_single_pass_features_used or unified_result.used_single_pass_features
                         )
                     _, loss_dict = compute_pose_losses(outputs, pose_targets, batch["task_ids"], weights)
+                    decoded_outputs = {
+                        mode: apply_keypoint_decode_mode(outputs, mode=mode)
+                        for mode in decode_modes
+                    }
+                    for mode in decode_modes:
+                        decoded_outputs[mode] = dict(decoded_outputs[mode])
+                        decoded_outputs[mode]["keypoint_decode_mode"] = mode
                     forward_time = time.perf_counter() - forward_started
                     for key, value in loss_dict.items():
                         totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
 
-                    rows = tensor_to_prediction_rows(
-                        outputs,
-                        {**batch, "targets": gt_targets_for_eval},
-                        args,
-                        raw_boxes_abs=raw_boxes_abs_for_rows,
-                    )
-                    for local_idx, row in enumerate(rows):
-                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    rows_by_mode: dict[str, list[dict]] = {}
+                    for mode in decode_modes:
+                        args.keypoint_decode_mode = mode
+                        rows_by_mode[mode] = tensor_to_prediction_rows(
+                            decoded_outputs[mode],
+                            {**batch, "targets": gt_targets_for_eval},
+                            args,
+                            raw_boxes_abs=raw_boxes_abs_for_rows,
+                        )
+                        for row in rows_by_mode[mode]:
+                            prediction_writers[mode].write(json.dumps(row, ensure_ascii=False) + "\n")
+                            all_predictions_rows[mode].append(row)
+
+                    reference_rows = rows_by_mode[decode_modes[0]]
+                    for local_idx, row in enumerate(reference_rows):
                         ds_name = row.get("dataset", "unknown")
                         target_for_gt = gt_targets_for_eval[local_idx] if local_idx < len(gt_targets_for_eval) else {
                             "dataset": ds_name,
@@ -893,24 +1117,23 @@ def main() -> None:
                         target_for_gt = target_to_metric_target(target_for_gt)
                         all_gt_targets.append(target_for_gt)
                         dataset_gt[ds_name].append(target_for_gt)
-                        all_predictions_rows.append(row)
-                        dataset_preds[ds_name].append(row)
 
-                    if args.visualize_max_samples > 0 and visualized_samples < args.visualize_max_samples:
+                    if args.visualize_max_samples > 0:
                         eval_batch = {**batch, "targets": pose_targets}
                         batch_size = len(batch["schema_ids"])
-                        for local_idx in range(batch_size):
-                            if visualized_samples >= args.visualize_max_samples:
-                                break
-                            vis_path = visualization_dir / f"eval_{samples + local_idx:06d}.jpg"
-                            save_pose_visualization(
-                                outputs,
-                                eval_batch,
-                                vis_path,
-                                sample_idx=local_idx,
-                                max_instances=args.visualize_max_instances,
-                            )
-                            visualized_samples += 1
+                        for mode in decode_modes:
+                            for local_idx in range(batch_size):
+                                if visualized_samples[mode] >= args.visualize_max_samples:
+                                    break
+                                vis_path = visualization_dirs[mode] / f"eval_{samples + local_idx:06d}.jpg"
+                                save_pose_visualization(
+                                    decoded_outputs[mode],
+                                    eval_batch,
+                                    vis_path,
+                                    sample_idx=local_idx,
+                                    max_instances=args.visualize_max_instances,
+                                )
+                                visualized_samples[mode] += 1
                     batches += 1
                     samples += len(batch["schema_ids"])
                     last_iter_end = time.perf_counter()
@@ -937,22 +1160,75 @@ def main() -> None:
     print("Computing dataset-specific pose metrics...")
     print("=" * 60)
 
-    pose_metrics = compute_pose_metrics_from_targets(
-        all_predictions_rows,
-        all_gt_targets,
-        dataset_root=args.dataset_root,
-        split=args.split,
-    )
+    pose_metrics_by_mode = {
+        mode: compute_pose_metrics_from_targets(
+            all_predictions_rows[mode],
+            all_gt_targets,
+            dataset_root=args.dataset_root,
+            split=args.split,
+        )
+        for mode in decode_modes
+    }
+    official_coco_metrics_by_mode: dict[str, dict[str, float]] = {}
+    if "coco" in dataset_names:
+        print("Computing official pycocotools COCO keypoint AP...")
+        official_coco_metrics_by_mode = {
+            mode: compute_official_coco_keypoint_ap(
+                all_predictions_rows[mode],
+                args.dataset_root,
+                args.split,
+            )
+            for mode in decode_modes
+        }
+    print(json.dumps(pose_metrics_by_mode, ensure_ascii=False, indent=2))
+    if official_coco_metrics_by_mode:
+        print(json.dumps({"official_coco": official_coco_metrics_by_mode}, ensure_ascii=False, indent=2))
+
+    predictions_json_paths = {
+        mode: mode_output_dirs[mode] / "predictions.json"
+        for mode in decode_modes
+    }
+    for mode in decode_modes:
+        predictions_json_paths[mode].write_text(
+            json.dumps(all_predictions_rows[mode], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    primary_mode = decode_modes[0]
+    args.keypoint_decode_mode = primary_mode
+    pose_metrics = pose_metrics_by_mode[primary_mode]
     ap_metrics_all = pose_metrics.get("overall_ap", {})
     ap_metrics_per_dataset = pose_metrics.get("per_dataset", {})
-    print(json.dumps(pose_metrics, ensure_ascii=False, indent=2))
+    predictions_path = predictions_paths[primary_mode]
+    predictions_json_path = predictions_json_paths[primary_mode]
+    visualization_dir = visualization_dirs[primary_mode]
 
-    # ── Export predictions JSON ────────────────────────────────────────────
-    predictions_json_path = args.output_dir / "predictions.json"
-    predictions_json_path.write_text(
-        json.dumps(all_predictions_rows, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    mode_summaries: dict[str, dict] = {}
+    for mode in decode_modes:
+        metrics = pose_metrics_by_mode[mode]
+        mode_summary = {
+            "checkpoint": str(checkpoint_path),
+            "backbone": args.backbone,
+            "box_source": args.box_source,
+            "keypoint_decode_mode": mode,
+            "datasets": dataset_names,
+            "split": args.split,
+            "samples": samples,
+            "batches": batches,
+            "pose_metrics": metrics,
+            "ap_metrics": metrics.get("overall_ap", {}),
+            "ap_metrics_per_dataset": metrics.get("per_dataset", {}),
+            "official_coco_keypoint_metrics": official_coco_metrics_by_mode.get(mode),
+            "predictions_jsonl": str(predictions_paths[mode]),
+            "predictions_json": str(predictions_json_paths[mode]),
+            "visualizations_dir": str(visualization_dirs[mode]) if args.visualize_max_samples > 0 else None,
+            "visualized_samples": visualized_samples[mode],
+        }
+        mode_summaries[mode] = mode_summary
+        (mode_output_dirs[mode] / "summary.json").write_text(
+            json.dumps(mode_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     # ── Summary ────────────────────────────────────────────────────────────
     summary = {
@@ -963,6 +1239,7 @@ def main() -> None:
         "vllm_integrated_features_used": actual_vllm_integrated_features_used,
         "single_pass_features_used": actual_single_pass_features_used,
         "single_pass_prompt": args.single_pass_prompt,
+        "keypoint_decode_mode": args.keypoint_decode_mode,
         "datasets": dataset_names,
         "split": args.split,
         "samples": samples,
@@ -971,10 +1248,11 @@ def main() -> None:
         "pose_metrics": pose_metrics,
         "ap_metrics": ap_metrics_all,
         "ap_metrics_per_dataset": ap_metrics_per_dataset,
+        "official_coco_keypoint_metrics": official_coco_metrics_by_mode.get(primary_mode),
         "predictions_jsonl": str(predictions_path),
         "predictions_json": str(predictions_json_path),
         "visualizations_dir": str(visualization_dir) if args.visualize_max_samples > 0 else None,
-        "visualized_samples": visualized_samples,
+        "visualized_samples": visualized_samples[primary_mode],
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -989,6 +1267,7 @@ def main() -> None:
         f"- vllm_integrated_features_used: `{actual_vllm_integrated_features_used}`",
         f"- single_pass_features_used: `{actual_single_pass_features_used}`",
         f"- single_pass_prompt: `{args.single_pass_prompt}`",
+        f"- keypoint_decode_mode: `{args.keypoint_decode_mode}`",
         f"- datasets: `{','.join(dataset_names)}`",
         f"- split: `{args.split}`",
         f"- samples: `{samples}`",
@@ -1010,6 +1289,14 @@ def main() -> None:
     else:
         report.append("No metrics available.")
 
+    official_coco_metrics = summary.get("official_coco_keypoint_metrics")
+    if official_coco_metrics:
+        report.extend(["", "## Official COCO Keypoint Metrics (pycocotools)", ""])
+        report.append("| Metric | Value |")
+        report.append("|--------|-------|")
+        for key, value in official_coco_metrics.items():
+            report.append(f"| {key} | {float(value):.4f} |")
+
     for ds_name, ds_metrics in sorted(ap_metrics_per_dataset.items()):
         report.extend(["", f"## Pose Metrics ({ds_name})", ""])
         if ds_metrics:
@@ -1030,6 +1317,17 @@ def main() -> None:
     if args.visualize_max_samples > 0:
         report.extend([f"Visualizations: `{visualization_dir}`", ""])
     (args.output_dir / "report.md").write_text("\n".join(report), encoding="utf-8")
+    if sweep_enabled:
+        sweep_summary = {
+            "checkpoint": str(checkpoint_path),
+            "box_source": args.box_source,
+            "decode_modes": decode_modes,
+            "modes": mode_summaries,
+        }
+        (args.output_dir / "decode_sweep_summary.json").write_text(
+            json.dumps(sweep_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

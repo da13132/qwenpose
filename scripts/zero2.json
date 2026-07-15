@@ -8,8 +8,10 @@
     "min_loss_scale": 1
   },
   "bf16": {
-    "enabled": true
+    "enabled": true,
+    "check_grad_overflow": true
   },
+  "communication_data_type": "fp32",
   "train_micro_batch_size_per_gpu": 1,
   "train_batch_size": 4,
   "gradient_accumulation_steps": 4,

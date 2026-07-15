@@ -6,10 +6,10 @@ set -Eeuo pipefail
 #
 # 默认行为：
 #   1. 自动定位 outputs/locatepose 下最近一次 run；
-#   2. 优先选择 stage2_unfreeze_locate_person_queries 的最新 checkpoint；
-#   3. 默认单次前向评估 person-query 检测、RefHuman 匹配与 PoseHead；
+#   2. 优先选择 stage2_locate_box_closed_loop 的最新 checkpoint；
+#   3. 默认由 LocateAnything 生成框，再评估 PoseHead；
 #   4. 导出 summary.json、predictions.jsonl、predictions.json、report.md。
-#   5. 仅旧 BOX_SOURCE=locate_generate checkpoint 才使用 vLLM/Transformers 生成后端。
+#   5. BOX_SOURCE=locate_generate 使用 vLLM/Transformers 生成后端。
 #
 # 如需查看 GT-box-conditioned 上限，可设置 BOX_SOURCE=gt。
 ###############################################################################
@@ -66,10 +66,10 @@ dir_has_checkpoints() {
 
 resolve_default_checkpoint_target() {
   local run_dir="$1"
-  local stage2_dir="${run_dir}/stage2_unfreeze_locate_person_queries"
-  local stage1_dir="${run_dir}/stage1_freeze_locate_person_queries"
-  local legacy_stage2_dir="${run_dir}/stage2_locate_box_closed_loop"
-  local legacy_stage1_dir="${run_dir}/stage1_freeze_locate_gt_box"
+  local stage2_dir="${run_dir}/stage2_locate_box_closed_loop"
+  local stage1_dir="${run_dir}/stage1_freeze_locate_gt_box"
+  local legacy_stage2_dir="${run_dir}/stage2_unfreeze_locate_person_queries"
+  local legacy_stage1_dir="${run_dir}/stage1_freeze_locate_person_queries"
   if dir_has_checkpoints "${stage2_dir}"; then
     printf '%s\n' "${stage2_dir}"
   elif dir_has_checkpoints "${stage1_dir}"; then
@@ -95,7 +95,7 @@ TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/locatepose}"
 DEFAULT_TRAIN_OUTPUT_DIR="$(resolve_latest_train_dir "${TRAIN_OUTPUT_ROOT}")"
 # TRAIN_OUTPUT_DIR：要验证的训练 run 目录；也决定默认输出目录位置。
 TRAIN_OUTPUT_DIR="${TRAIN_OUTPUT_DIR:-${DEFAULT_TRAIN_OUTPUT_DIR}}"
-# DEFAULT_CHECKPOINT_TARGET：默认优先当前 person-query Stage2，其次当前 Stage1；仍兼容旧目录名。
+# DEFAULT_CHECKPOINT_TARGET：默认优先 Locate 生成框 Stage2，其次 GT 框 Stage1；仍兼容旧目录名。
 DEFAULT_CHECKPOINT_TARGET="$(resolve_default_checkpoint_target "${TRAIN_OUTPUT_DIR}")"
 # CHECKPOINT：checkpoint 文件、checkpoint-* 目录、stage 目录或 run 目录；也可用第一个位置参数传入。
 CHECKPOINT="${CHECKPOINT:-${1:-${DEFAULT_CHECKPOINT_TARGET}}}"
@@ -185,15 +185,15 @@ POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
 # 条件框来源、单次复用与 Locate 生成参数
 ###############################################################################
 
-# BOX_SOURCE：统一模型直接用 person queries；旧 checkpoint 可显式改为 locate_generate 或 gt。
-BOX_SOURCE="${BOX_SOURCE:-person_queries}"
+# BOX_SOURCE：默认由 LocateAnything 生成人体框；gt 仅用于查看条件框上限。
+BOX_SOURCE="${BOX_SOURCE:-locate_generate}"
 # LOCATE_BATCH_TOKEN_LIMIT：与训练一致的本地 micro-batch raw patch token 预算。
 if [[ "${BOX_SOURCE}" == "gt" ]]; then
   LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-$((BATCH_SIZE * 3072))}"
 else
   LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-$((BATCH_SIZE * 4096))}"
 fi
-# LOCATE_GENERATION_BACKEND：仅 BOX_SOURCE=locate_generate 时生效的旧生成框后端。
+# LOCATE_GENERATION_BACKEND：BOX_SOURCE=locate_generate 时使用的生成框后端。
 LOCATE_GENERATION_BACKEND="${LOCATE_GENERATION_BACKEND:-vllm}"
 # GPU：vLLM 推理使用的可见 GPU；默认单卡 GPU 0。
 GPU="${GPU:-0}"

@@ -10,7 +10,7 @@ set -Eeuo pipefail
 #   3. 随机 random_n 张图；
 #   4. coco / mpii / crowdpose / refhuman / aic 输出格式；
 #   5. RefHuman 任意图片 caption 推理，以及 RefHuman train/val 标注 split 推理；
-#   6. 默认单次前向使用 person queries；旧生成框 checkpoint 仍可选择 vLLM/Transformers；
+#   6. 默认由 LocateAnything 生成框，可选择 vLLM/Transformers；
 #   7. 可通过 GPU/CUDA_VISIBLE_DEVICES 指定推理 GPU；
 #   8. 保存 predictions.jsonl、predictions.json、格式化预测 JSON、manifest 和可视化。
 ###############################################################################
@@ -30,7 +30,7 @@ Required:
 
 Common examples:
   # COCO17 格式，推理文件夹前 20 张图
-  ${SCRIPT_PATH_REL} --checkpoint outputs/locatepose/.../stage2_unfreeze_locate_person_queries --input demo/images --format coco --end_index 20
+  ${SCRIPT_PATH_REL} --checkpoint outputs/locatepose/.../stage2_locate_box_closed_loop --input demo/images --format coco --end_index 20
 
   # 随机 10 张 CrowdPose14 格式图片
   ${SCRIPT_PATH_REL} --checkpoint CKPT --input demo/images --format crowdpose --random_n 10 --seed 123
@@ -72,7 +72,7 @@ RefHuman variables:
 Backend variables:
   BATCH_SIZE            PyTorch batch size; default 1
   NUM_WORKERS           DataLoader workers; default 0
-  BOX_SOURCE            person_queries|locate_generate|gt；统一模型默认 person_queries
+  BOX_SOURCE            locate_generate|gt；默认 locate_generate
   LOCATE_GENERATION_BACKEND  仅 BOX_SOURCE=locate_generate 生效；vllm|transformers|auto
   SINGLE_PASS_PROMPT     locate|pose；transformers 单次复用时使用纯定位 prompt 或 PoseHead prompt
   DISABLE_SINGLE_PASS_FEATURES 1 表示禁用 transformers 特征复用，回退两次前向
@@ -300,14 +300,14 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 # PREFETCH_FACTOR：DataLoader 预取因子；仅 NUM_WORKERS>0 时生效。
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
-# BOX_SOURCE：统一模型默认直接使用 person queries；旧 checkpoint 可改为 locate_generate 或 gt。
-BOX_SOURCE="${BOX_SOURCE:-person_queries}"
+# BOX_SOURCE：默认由 LocateAnything 生成人体框；gt 仅用于调试条件框上限。
+BOX_SOURCE="${BOX_SOURCE:-locate_generate}"
 if [[ "${BOX_SOURCE}" == "gt" ]]; then
   LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-$((BATCH_SIZE * 3072))}"
 else
   LOCATE_BATCH_TOKEN_LIMIT="${LOCATE_BATCH_TOKEN_LIMIT:-$((BATCH_SIZE * 4096))}"
 fi
-# LOCATE_GENERATION_BACKEND：仅 BOX_SOURCE=locate_generate 时生效的旧生成框后端。
+# LOCATE_GENERATION_BACKEND：BOX_SOURCE=locate_generate 时使用的生成框后端。
 LOCATE_GENERATION_BACKEND="${LOCATE_GENERATION_BACKEND:-vllm}"
 # SINGLE_PASS_PROMPT：单次特征复用时使用的 prompt。locate 更贴近纯框生成；pose 更贴近 PoseHead 训练文本。
 SINGLE_PASS_PROMPT="${SINGLE_PASS_PROMPT:-locate}"
@@ -382,7 +382,7 @@ VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-8}"
 PROGRESS_BAR="${PROGRESS_BAR:-1}"
 
 if [[ -z "${CHECKPOINT}" ]]; then
-  echo "CHECKPOINT is required. Example: --checkpoint outputs/locatepose/.../stage2_unfreeze_locate_person_queries" >&2
+  echo "CHECKPOINT is required. Example: --checkpoint outputs/locatepose/.../stage2_locate_box_closed_loop" >&2
   exit 1
 fi
 if [[ -z "${INPUT}" && -z "${IMAGE}" && -z "${IMAGE_PATHS}" && -z "${REFHUMAN_ROOT}" ]]; then

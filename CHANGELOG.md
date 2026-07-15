@@ -4,6 +4,7 @@ All notable changes to this repository are recorded here, with the newest releas
 
 ## Unreleased - unified 800 LocatePose
 
+- Restored LocateAnything autoregressive box generation as the only default LocatePose training path: `scripts/locatepose.sh` now runs frozen-GT Stage 1 followed by generated-box/coordinate-token-LM Stage 2; the temporary `locatepose4llm.sh` wrapper was removed.
 - Replaced the legacy 256/640 dual-RGB branches with one 800×800 P2/P3/P4 pose pyramid at 200×200, 100×100, and 50×50, shared without architectural changes across Stage 1/2.
 - Removed every SimCC training, decoding, evaluation, inference, and shell configuration path. Keypoint coordinates now come only from direct regression with coordinate deep supervision.
 - Added a two-layer human box refinement decoder, explicit person objectness, refined-box export, relative/L1/GIoU box losses, and DN-DETR/DINO-style positive/negative box denoising queries that never enter the keypoint decoder.

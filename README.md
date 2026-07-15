@@ -6,7 +6,7 @@ English | [中文说明](README_zh.md)
 
 This repository is a public training snapshot for box-conditioned human pose estimation. It contains two maintained workflows built on the same pose head, data pipeline, and evaluation code:
 
-- `LocatePose`: a LocateAnything-3B-based two-stage person-query recipe
+- `LocatePose`: a LocateAnything-3B-based two-stage autoregressive box recipe
 - `QwenPose`: a Qwen3-VL-4B-Instruct-based two-stage closed-loop recipe
 
 The public documentation below is ordered in the same way: shared setup first, `LocatePose` first, `QwenPose` second.
@@ -209,7 +209,7 @@ The public code supports `coco`, `aic`, `mpii`, `crowdpose`, and `refhuman`.
 Important defaults:
 
 - both LocatePose stages use `coco,mpii,crowdpose,refhuman` with raw multimodal features
-- RefHuman trains from Stage 1 through the person-query match and shared pose heads
+- RefHuman trains from Stage 1; Stage 2 uses LocateAnything-generated boxes and the shared pose head
 - `QwenPose` stage 1 and stage 2 use `coco` by default
 - `RefHuman` requires the LLM text path, which is loaded but frozen in LocatePose Stage 1
 
@@ -312,16 +312,14 @@ The repository includes three shared DeepSpeed configs:
 - `scripts/zero3.json`: use when GPU memory is tighter and pure ZeRO-3 is preferred
 - `scripts/zero3_offload.json`: use when GPU memory is very limited and CPU offload is acceptable
 
-Training scripts expose the preset through `ZERO_STAGE`:
+The QwenPose training script exposes the preset through `ZERO_STAGE`:
 
 ```bash
-ZERO_STAGE=zero2 bash scripts/locatepose.sh
 ZERO_STAGE=zero3 bash scripts/train_qwenpose_two_stage.sh
-ZERO_STAGE=zero3_offload bash scripts/locatepose.sh
 ZERO_STAGE=none bash scripts/train_qwenpose_two_stage.sh
 ```
 
-The current LocatePose recipe uses person queries in both stages. The legacy QwenPose generated-box recipe supports `ZERO_STAGE=zero2` or `ZERO_STAGE=none`.
+The current LocatePose recipe uses a single-GPU safe autoregressive generation loop. Select the physical GPU with `LOCATEPOSE_CUDA_VISIBLE_DEVICES`.
 
 ## LocatePose
 
@@ -331,17 +329,17 @@ LocatePose uses `LocateAnything-3B` as the grounding backbone and trains one ide
 
 | Stage | Directory | Backbone state | Box source | Default datasets | Default epochs |
 |-------|-----------|----------------|------------|------------------|----------------|
-| stage 1 | `stage1_freeze_locate_person_queries` | frozen Locate backbone | `person_queries` | `coco,mpii,crowdpose,refhuman` | `50` |
-| stage 2 | `stage2_unfreeze_locate_person_queries` | selective vision/LLM LoRA | `person_queries` | `coco,mpii,crowdpose,refhuman` | `3` |
+| stage 1 | `stage1_freeze_locate_gt_box` | frozen Locate backbone | GT boxes | `coco,mpii,crowdpose,refhuman` | `30` |
+| stage 2 | `stage2_locate_box_closed_loop` | selective vision/LLM LoRA | LocateAnything boxes for RefHuman; GT boxes for regular pose data | `coco,mpii,crowdpose,refhuman` | `25` |
 
-Both stages use the same unified RGB pose pyramid and parameter shapes: an 800×800 input produces stride-4/8/16 features at 200×200, 100×100, and 50×50. The old 256 and 640 RGB branches and all SimCC heads are removed. Learned person queries pass through a two-layer human box decoder that predicts objectness and boxes; those same boxes condition the shared keypoint decoder. Box DN and keypoint DN remain enabled.
+Both stages use the same unified RGB pose pyramid and parameter shapes: an 800×800 input produces stride-4/8/16 features at 200×200, 100×100, and 50×50. The old 256 and 640 RGB branches and all SimCC heads are removed. LocateAnything/GT boxes condition the shared keypoint decoder. Box DN and keypoint DN remain enabled.
 
-Both stages load the multimodal Locate backbone and feed the same raw MoonViT feature type (`raw_visual`) to PoseHead. Stage 1 freezes Locate; Stage 2 selectively trains configured vision and LLM LoRA layers. Coordinate generation, `lm_head`, KV-cache generation, generated-box matching, and Locate teacher-forcing loss are not part of training. RefHuman trains an independent expression-to-person matching head against caption-independent person-query detections; the same shared pose decoder is used for every person and receives optional RefHuman text conditioning. Old checkpoints from the generated-box or dual-RGB/SimCC architectures are not compatible with this training path.
+Both stages load the complete multimodal Locate backbone and feed raw MoonViT features (`raw_visual`) to PoseHead. Stage 1 freezes Locate. Stage 2 retains `lm_head` and KV-cache generation, generates RefHuman boxes autoregressively, matches generated boxes to GT for pose supervision, and applies teacher-forcing loss to GT coordinate tokens while selectively training vision and LLM LoRA layers.
 
 Additional default knobs:
 
-- the LocatePose script forcibly uses physical GPUs `1,2,3` and launches three processes
-- Stage 1: `BATCH_SIZE=1`, `GRAD_ACCUM_STEPS=1`, `LR=2e-4`
+- the LocatePose script defaults to physical GPU `3`; override it with `LOCATEPOSE_CUDA_VISIBLE_DEVICES`
+- Stage 1: `BATCH_SIZE=1`, `GRAD_ACCUM_STEPS=4`, `LR=2e-4`
 - Stage 2: `BATCH_SIZE=1`, `GRAD_ACCUM_STEPS=4`, `LR=1e-4`
 - image size is fixed at `800`; the Locate feature map is fixed at 100×100 in the public recipe
 - `POSE_PYRAMID_CHANNELS=128`, `POSE_PYRAMID_BLOCKS=3`
@@ -414,12 +412,12 @@ Evaluate the latest LocatePose run:
 bash scripts/eval_locatepose.sh
 ```
 
-By default, `scripts/eval_locatepose.sh` evaluates the person-query outputs in one forward pass. Legacy generated-box checkpoints can still opt into `BOX_SOURCE=locate_generate`.
+By default, `scripts/eval_locatepose.sh` evaluates LocateAnything-generated boxes with `BOX_SOURCE=locate_generate`.
 
 Evaluate a specific checkpoint or stage directory:
 
 ```bash
-CHECKPOINT=outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
+CHECKPOINT=outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
 bash scripts/eval_locatepose.sh
 ```
 
@@ -429,13 +427,13 @@ Evaluate on multiple datasets:
 DATASETS=coco,mpii,crowdpose,refhuman bash scripts/eval_locatepose.sh
 ```
 
-Evaluate the GT-box upper bound instead of the person-query path:
+Evaluate the GT-box upper bound instead of the generated-box path:
 
 ```bash
 BOX_SOURCE=gt bash scripts/eval_locatepose.sh
 ```
 
-For a legacy generated-box checkpoint, select that path explicitly; `transformers` avoids the optional `vllm` dependency:
+Use the Transformers backend instead of the optional `vllm` backend:
 
 ```bash
 BOX_SOURCE=locate_generate LOCATE_GENERATION_BACKEND=transformers \
@@ -456,17 +454,17 @@ Run image or folder inference from a trained LocatePose checkpoint:
 
 ```bash
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
   --input demo/images \
   --format coco
 ```
 
-Legacy generated-box inference can still use the Transformers backend explicitly:
+Generated-box inference can use the Transformers backend explicitly:
 
 ```bash
 BOX_SOURCE=locate_generate LOCATE_GENERATION_BACKEND=transformers \
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
   --input demo/images \
   --format crowdpose
 ```
@@ -478,13 +476,13 @@ RefHuman caption-conditioned inference example:
 ```bash
 REF_POSE_QUALITY_ALPHA=0.25 \
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_unfreeze_locate_person_queries \
+  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
   --input datasets/refhuman \
   --format refhuman \
   --split val
 ```
 
-RefHuman inference detects all person-query candidates in the same forward pass, scores them with `ref_match_head`, and selects the referred person with `ref_score × pose_quality^0.25`. The selected candidate uses the same shared pose decoder as ordinary all-person inference.
+RefHuman inference asks LocateAnything to localize the described person, then passes the generated box to the shared pose decoder.
 
 The inference directory writes `summary.json`, `predictions.jsonl`, `predictions.json`, optional format-specific exports, `manifest.json`, and visualizations.
 
@@ -593,8 +591,8 @@ Typical LocatePose run:
 ```text
 outputs/locatepose/<run_name>/
 ├── logs/
-├── stage1_freeze_locate_person_queries/
-└── stage2_unfreeze_locate_person_queries/
+├── stage1_freeze_locate_gt_box/
+└── stage2_locate_box_closed_loop/
 ```
 
 Typical QwenPose run:

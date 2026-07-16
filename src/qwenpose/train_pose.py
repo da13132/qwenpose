@@ -45,6 +45,7 @@ from qwenpose.losses import (
     compute_pose_losses,
 )
 from qwenpose.model import QwenPoseConfig, QwenPoseModel, count_trainable_parameters
+from qwenpose.spatial_features import SpatialFeatureBatch
 from qwenpose.qwen_lora import (
     QwenFeatureExtractor,
     QwenLoRAConfig,
@@ -67,7 +68,9 @@ from qwenpose.eagle_lora import (
     EagleLoRAConfig,
     build_eagle_inputs,
     build_eagle_lm_inputs,
+    compute_eagle_pbd_grounding_losses,
     count_eagle_lora_parameters,
+    extract_eagle_pbd_blocks_from_lm_logits,
     get_eagle_base_model,
     load_eagle_vision_only_with_lora,
     load_eagle_with_lora,
@@ -108,12 +111,22 @@ def parse_args() -> argparse.Namespace:
         "--image_size",
         type=int,
         default=800,
-        help="Unified square RGB input size shared by all LocatePose stages.",
+        help="Reference pixel scale used by box/keypoint denoising.",
     )
     parser.add_argument(
-        "--disable_image_tensors",
-        action="store_true",
-        help="Disable loading fixed-size RGB tensors for the pose visual branch.",
+        "--letterbox_size",
+        type=int,
+        default=800,
+        help=(
+            "Resize the long image side to this value and center-pad the short side "
+            "to a fixed square canvas. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--letterbox_fill",
+        type=int,
+        default=127,
+        help="RGB gray value used for fixed-square letterbox padding.",
     )
     parser.add_argument("--max_samples_per_dataset", type=int, default=None)
     parser.add_argument(
@@ -156,6 +169,11 @@ def parse_args() -> argparse.Namespace:
         "--disable_vision_token_balancing",
         action="store_true",
         help="Disable cross-rank batching by estimated LocateAnything vision-token cost.",
+    )
+    parser.add_argument(
+        "--disable_spatial_shape_bucketing",
+        action="store_true",
+        help="Disable native-grid area/aspect bucketing inside homogeneous batches.",
     )
     parser.add_argument("--pose_augment", action="store_true", help="Enable synchronized image/box/keypoint augmentation.")
     parser.add_argument("--augment_flip_prob", type=float, default=0.5)
@@ -228,7 +246,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum raw MoonViT patch-token budget for one local micro batch.",
     )
-    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=100)
+    parser.add_argument(
+        "--locate_feature_size",
+        "--eagle_feature_size",
+        dest="eagle_feature_size",
+        type=int,
+        default=None,
+        help="Deprecated compatibility option; Locate uses native variable grids.",
+    )
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
     parser.add_argument("--locate_feature_refiner_bottleneck_dim", "--eagle_feature_refiner_bottleneck_dim", dest="eagle_feature_refiner_bottleneck_dim", type=int, default=256)
     parser.add_argument("--locate_feature_refiner_init_scale", "--eagle_feature_refiner_init_scale", dest="eagle_feature_refiner_init_scale", type=float, default=0.1)
@@ -259,9 +284,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--locate_train_scope",
-        choices=["frozen", "vision_lora", "all_lora", "selective_lora"],
+        choices=[
+            "frozen",
+            "vision_lora",
+            "llm_lora",
+            "all_lora",
+            "selective_vision_lora",
+            "selective_llm_lora",
+            "selective_lora",
+        ],
         default="all_lora",
-        help="Select which LocateAnything adapters receive gradients.",
+        help=(
+            "Select which LocateAnything adapters receive gradients. The selective_vision_lora "
+            "and selective_llm_lora modes are intended for the decoupled three-stage recipe."
+        ),
     )
     parser.add_argument(
         "--locate_llm_layers",
@@ -272,8 +308,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--locate_vision_layers",
         type=str,
-        default="15-26",
-        help="MoonViT block ranges enabled by selective_lora, e.g. 15-26.",
+        default="0-26",
+        help="MoonViT block ranges enabled by selective_lora; defaults to all 27 blocks.",
     )
     parser.add_argument(
         "--locate_llm_modules",
@@ -287,8 +323,29 @@ def parse_args() -> argparse.Namespace:
         default="wqkv,wo,fc0,fc1",
         help="Comma-separated MoonViT LoRA projections enabled by selective_lora.",
     )
-    parser.add_argument("--train_locate_projector", action="store_true")
+    parser.add_argument(
+        "--train_locate_projector",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Fully train LocateAnything's visual projector (mlp1) in every non-frozen "
+            "backbone scope. Use --no-train_locate_projector to keep it frozen."
+        ),
+    )
     parser.add_argument("--freeze_locate", "--freeze_eagle", dest="freeze_eagle", action="store_true")
+    parser.add_argument(
+        "--freeze_pose",
+        action="store_true",
+        help="Freeze every LocatePose/PoseHead parameter while keeping checkpoint weights intact.",
+    )
+    parser.add_argument(
+        "--locate_grounding_only",
+        action="store_true",
+        help=(
+            "Run only LocateAnything grounding LM/PBD supervision and skip PoseHead forward. "
+            "This is the low-memory Stage-2 path of the decoupled recipe."
+        ),
+    )
     parser.add_argument("--pose_decoder_layers", type=int, default=3)
     parser.add_argument("--refinement_steps", type=int, default=3)
     parser.add_argument("--human_decoder_layers", type=int, default=2)
@@ -297,23 +354,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box_condition_scale", type=float, default=1.25)
     parser.add_argument(
         "--pose_coordinate_init",
-        choices=("learned_spread", "box_center", "schema_prior"),
-        default="learned_spread",
-        help=(
-            "Main-pose coordinate reference. learned_spread uses trainable, "
-            "non-anatomical dispersed anchors; box_center is an ablation and "
-            "schema_prior is retained only for legacy checkpoint evaluation."
+        choices=(
+            "anatomical_dynamic",
+            "learned_spread",
+            "box_center",
+            "schema_prior",
         ),
+        default="anatomical_dynamic",
+        help=(
+            "Main-pose coordinate reference. anatomical_dynamic starts from a "
+            "schema prior and predicts an instance-conditioned residual; the "
+            "other modes are retained for ablation/legacy evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic_reference_offset_scale",
+        type=float,
+        default=1.5,
+        help="Maximum logit-space residual scale for anatomical dynamic references.",
     )
     parser.add_argument(
         "--schema_joint_priors_path",
         type=str,
         default="configs/schema_joint_priors.json",
-        help="Legacy schema-prior JSON; used only by --pose_coordinate_init=schema_prior.",
+        help="Schema prior JSON used by anatomical_dynamic and schema_prior modes.",
     )
     parser.add_argument("--pose_roi_size", type=int, default=16)
-    parser.add_argument("--pose_pyramid_channels", type=int, default=128)
-    parser.add_argument("--pose_pyramid_blocks", type=int, default=3)
+    parser.add_argument("--pose_feature_channels", type=int, default=256)
     parser.add_argument("--deformable_points", type=int, default=4)
     parser.add_argument("--deformable_min_radius_cells", type=float, default=2.0)
     parser.add_argument(
@@ -325,7 +392,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable_ref_visual_modulation",
         action="store_true",
-        help="Disable zero-initialized RefHuman text FiLM modulation on P2/P3/P4.",
+        help="Disable zero-initialized RefHuman text FiLM modulation on the Locate feature map.",
     )
     parser.add_argument(
         "--disable_box_denoising",
@@ -431,12 +498,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", -1)))
 
     # ---------------------------------------------------------------------
-    # Loss weights. Keep the training target clean: coord + OKS + vis are the
-    # main pose losses, Stage2 may add bbox LM supervision, and hard_joint is
-    # retained only as an off-by-default ablation knob.
+    # Loss weights. The final pose uses image-coordinate SmoothL1, evaluator-
+    # aligned OKS and keypoint quality confidence. Box-normalized coordinates
+    # are reserved for intermediate-stage auxiliary supervision.
     # ---------------------------------------------------------------------
     parser.add_argument("--w_oks", type=float, default=0.5)
-    parser.add_argument("--w_coord", type=float, default=3.0)
+    parser.add_argument(
+        "--w_coord",
+        type=float,
+        default=0.0,
+        help=(
+            "Deprecated compatibility option; final pose no longer uses a "
+            "box-normalized coordinate loss."
+        ),
+    )
     parser.add_argument("--w_image_coord", type=float, default=5.0)
     parser.add_argument(
         "--w_keypoint_confidence",
@@ -464,9 +539,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_lm", type=float, default=0.05)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--w_decoder_coords",
+        type=str,
+        default="0.25,0.5,0.75",
+        help="Comma-separated box-normalized auxiliary weights for grouped decoder layers.",
+    )
     parser.add_argument("--w_coarse_coord", type=float, default=0.5)
     parser.add_argument("--w_deform_coord", type=float, default=0.75)
-    parser.add_argument("--w_refine_coords", type=str, default="0.75,1.0,1.25")
+    parser.add_argument(
+        "--w_refine_coords",
+        type=str,
+        default="0.75,1.0",
+        help=(
+            "Comma-separated box-normalized coordinate weights for refinement "
+            "outputs before the final prediction."
+        ),
+    )
     parser.add_argument("--w_box_objectness", type=float, default=1.0)
     parser.add_argument("--w_box_l1", type=float, default=5.0)
     parser.add_argument("--w_box_giou", type=float, default=2.0)
@@ -520,11 +609,22 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "During training, use LocateAnything generated boxes for RefHuman and "
-            "GT boxes for regular pose datasets. This restores the last stable LLM-box recipe."
+            "Control only the legacy hard-generation fallback used when joint soft-box "
+            "training is disabled; the default joint path covers every pose dataset."
         ),
     )
     parser.add_argument("--w_locate_box_lm", type=float, default=0.0)
+    parser.add_argument("--w_locate_pbd", type=float, default=0.05)
+    parser.add_argument(
+        "--pose_box_grad_scale",
+        type=float,
+        default=0.05,
+        help=(
+            "Scale only the main PoseHead-loss gradient that flows through differentiable "
+            "Locate soft boxes; PoseHead still receives the full pose loss."
+        ),
+    )
+    parser.add_argument("--pbd_temperature", type=float, default=1.0)
     parser.add_argument("--locate_lm_loss_every", type=int, default=1)
     parser.add_argument("--locate_lm_max_instances", type=int, default=20)
     parser.add_argument("--disable_locate_grounding_aux", action="store_true")
@@ -802,6 +902,12 @@ def build_batch_trace_record(
                 "selected_target_count": selected_target_count,
                 "ref_target": int(target["ref_target"].detach().cpu().item()),
                 "selected_ref_target": int(selected_target["ref_target"].detach().cpu().item()),
+                "locate_direct_grounding_failed": bool(
+                    selected_target.get(
+                        "locate_direct_grounding_failed",
+                        torch.tensor(False),
+                    ).detach().cpu().item()
+                ),
                 "prompt_preview": _truncate_text(batch["prompts"][sample_idx], limit=200),
             }
         )
@@ -904,7 +1010,10 @@ def build_lm_responses(batch: dict, max_instances: int = 10) -> list[str]:
 
 def _locate_coord_token(value: float, upper: float) -> str:
     scaled = 0 if upper <= 0 else int(round(max(0.0, min(float(value), float(upper))) / float(upper) * 1000.0))
-    return "<" + f"{max(0, min(scaled, 1000)):03d}" + ">"
+    # LocateAnything registers coordinate tokens as <0> ... <1000>, without
+    # zero padding. Formatting <029> silently splits into ordinary text tokens
+    # and breaks both LM supervision and six-token PBD block extraction.
+    return "<" + str(max(0, min(scaled, 1000))) + ">"
 
 
 def build_locate_grounding_responses(
@@ -948,7 +1057,11 @@ def _select_target_instances(
     *,
     task_id: int,
 ) -> dict[str, torch.Tensor]:
-    index_tensor = torch.as_tensor(indices, dtype=torch.long)
+    index_tensor = torch.as_tensor(
+        indices,
+        dtype=torch.long,
+        device=target["boxes"].device,
+    )
     selected = dict(target)
     instance_fields = (
         "boxes",
@@ -999,9 +1112,82 @@ def _context_scale_for_indices(
         fallback = DATASET_BOX_CONTEXT_SCALE.get(dataset_name, 1.0)
         return torch.full((count,), float(fallback), dtype=torch.float32)
     if indices:
-        index_tensor = torch.as_tensor(indices, dtype=torch.long)
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=values.device)
         return values[index_tensor].clone().float()
     return torch.full((count,), float(values.flatten()[0].item()), dtype=torch.float32)
+
+
+def prepare_joint_pbd_conditioning(
+    batch: dict,
+    device: torch.device,
+    *,
+    max_instances: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """Align every pose dataset with batched differentiable Locate box blocks.
+
+    ALL_POSE keeps people in the exact spatial order used by the native LM
+    response; REF_POSE keeps only its referred person.  GT context boxes are
+    returned as a numerical fallback, then replaced inside the model by soft
+    boxes decoded from the same batched teacher-forcing LM forward.
+    """
+    selected_targets: list[dict[str, torch.Tensor]] = []
+    fallback_boxes: list[torch.Tensor] = []
+    flat_gt_boxes: list[torch.Tensor] = []
+    flat_context_scales: list[torch.Tensor] = []
+    box_counts: list[int] = []
+    limit = max(int(max_instances), 1)
+    for sample_idx, target in enumerate(batch["targets"]):
+        task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
+        boxes = target["boxes"]
+        if task_id == 1:
+            ref_target = int(target["ref_target"].detach().cpu().item())
+            indices = [ref_target] if 0 <= ref_target < int(boxes.shape[0]) else []
+        else:
+            indices = _spatially_sorted_instance_indices(
+                boxes,
+                list(range(int(boxes.shape[0]))),
+                limit,
+            )
+        selected = _select_target_instances(target, indices, task_id=task_id)
+        selected_targets.append(selected)
+        count = len(indices)
+        box_counts.append(count)
+        scales = _context_scale_for_indices(target, indices, count).to(
+            device=device,
+            dtype=torch.float32,
+        )
+        selected_gt = selected["boxes"].to(device=device, dtype=torch.float32)
+        fallback_boxes.append(expand_boxes_xyxy_per_box(selected_gt, scales))
+        if count > 0:
+            flat_gt_boxes.append(selected_gt)
+            flat_context_scales.append(scales)
+
+    max_boxes = max(box_counts + [1])
+    box_tensor = torch.zeros(
+        len(selected_targets), max_boxes, 4, device=device, dtype=torch.float32
+    )
+    box_mask = torch.zeros(
+        len(selected_targets), max_boxes, device=device, dtype=torch.bool
+    )
+    for sample_idx, boxes in enumerate(fallback_boxes):
+        count = int(boxes.shape[0])
+        if count > 0:
+            box_tensor[sample_idx, :count] = boxes
+            box_mask[sample_idx, :count] = True
+    metadata = {
+        "box_counts": torch.tensor(box_counts, device=device, dtype=torch.long),
+        "gt_boxes": (
+            torch.cat(flat_gt_boxes, dim=0)
+            if flat_gt_boxes
+            else box_tensor.new_zeros((0, 4))
+        ),
+        "context_scales": (
+            torch.cat(flat_context_scales, dim=0)
+            if flat_context_scales
+            else box_tensor.new_zeros((0,))
+        ),
+    }
+    return box_tensor, box_mask, selected_targets, metadata
 
 
 def prepare_box_conditioning(
@@ -2310,40 +2496,6 @@ def generate_locate_bbox_responses(
                     verbose=False,
                 )
                 response_text = _normalize_locate_generate_output(response)
-                if task_id == 1 and parse_locate_bbox_response(response_text, max_instances=1).numel() == 0:
-                    ref_texts = batch.get("ref_texts") or []
-                    ref_text = str(ref_texts[sample_idx]).strip() if sample_idx < len(ref_texts) else ""
-                    if not ref_text:
-                        ref_text = _extract_ref_description_from_prompt(str(batch["prompts"][sample_idx]))
-                    fallback_inputs = build_eagle_inputs(
-                        processor,
-                        [image_path],
-                        [build_refhuman_fallback_prompt(ref_text)],
-                        device,
-                        image_token_limit=image_token_limit,
-                        image_tensors=None if vision_images is None else [vision_images[sample_idx]],
-                    )
-                    fallback_response = locate_model.generate(
-                        pixel_values=fallback_inputs["pixel_values"],
-                        input_ids=fallback_inputs["input_ids"],
-                        attention_mask=fallback_inputs.get("attention_mask"),
-                        image_grid_hws=fallback_inputs.get("image_grid_hws"),
-                        tokenizer=tokenizer,
-                        max_new_tokens=locate_generation_token_budget(
-                            max_new_tokens,
-                            max_instances,
-                            task_id=0,
-                        ),
-                        use_cache=True,
-                        generation_mode=str(generation_mode),
-                        do_sample=False,
-                        verbose=False,
-                    )
-                    response_text = (
-                        REFHUMAN_FALLBACK_MARKER
-                        + "\n"
-                        + _normalize_locate_generate_output(fallback_response)
-                    )
                 responses.append(response_text)
     finally:
         if was_training:
@@ -2360,6 +2512,7 @@ def prepare_locate_generated_box_conditioning_from_responses(
     match_iou_thresh: float,
     nms_iou_thresh: float,
     disable_pre_pose_nms: bool = True,
+    gt_ref_fallback_on_failure: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
     selected_targets: list[dict[str, Any]] = []
     selected_condition_boxes: list[torch.Tensor] = []
@@ -2372,7 +2525,11 @@ def prepare_locate_generated_box_conditioning_from_responses(
             gt_indices = [ref_target] if 0 <= ref_target < num_gt else []
         else:
             gt_indices = list(range(min(num_gt, int(max_instances))))
-        gt_index_tensor = torch.as_tensor(gt_indices, dtype=torch.long)
+        gt_index_tensor = torch.as_tensor(
+            gt_indices,
+            dtype=torch.long,
+            device=gt_boxes_all.device,
+        )
         gt_boxes = gt_boxes_all[gt_index_tensor].clone() if gt_indices else gt_boxes_all[:0].clone()
 
         pred_boxes = parse_locate_boxes_for_task(
@@ -2383,13 +2540,23 @@ def prepare_locate_generated_box_conditioning_from_responses(
             disable_pre_pose_nms=disable_pre_pose_nms,
         )
 
-        matches = hungarian_match_boxes(pred_boxes, gt_boxes, iou_thresh=match_iou_thresh)
+        direct_grounding_failed = bool(task_id == 1 and pred_boxes.numel() == 0)
+        if gt_ref_fallback_on_failure and direct_grounding_failed and gt_boxes.numel() > 0:
+            pred_boxes = gt_boxes.clone()
+            matches = [(0, 0, 1.0)]
+        else:
+            matches = hungarian_match_boxes(pred_boxes, gt_boxes, iou_thresh=match_iou_thresh)
         selected = align_target_to_predictions(
             target,
             pred_boxes,
             gt_indices,
             matches,
             task_id=task_id,
+        )
+        selected["locate_direct_grounding_failed"] = torch.tensor(
+            direct_grounding_failed,
+            device=target["boxes"].device,
+            dtype=torch.bool,
         )
         context_scale = selected.get(
             "box_context_scale",
@@ -2422,7 +2589,7 @@ def generate_locate_bbox_responses_with_features(
     generation_mode: str,
     image_token_limit: int | None = None,
     single_pass_prompt: str = "locate",
-) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+) -> tuple[list[str], SpatialFeatureBatch, torch.Tensor]:
     module = unwrap_training_model(training_model)
     if module.backbone_name != "eagle" or module.backbone_model is None or module.backbone_extractor is None:
         raise ValueError("cached LocateAnything generation requires --backbone eagle/locatepose.")
@@ -2443,7 +2610,7 @@ def generate_locate_bbox_responses_with_features(
     was_training = bool(locate_model.training)
     locate_model.eval()
     responses: list[str] = []
-    feature_maps: list[torch.Tensor] = []
+    feature_maps: list[SpatialFeatureBatch] = []
     text_embeds: list[torch.Tensor] = []
     try:
         vision_images = batch.get("vision_images")
@@ -2468,33 +2635,6 @@ def generate_locate_bbox_responses_with_features(
                 do_sample=False,
                 temperature=0,
             )
-            task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
-            if task_id == 1 and parse_locate_bbox_response(response, max_instances=1).numel() == 0:
-                ref_texts = batch.get("ref_texts") or []
-                ref_text = str(ref_texts[sample_idx]).strip() if sample_idx < len(ref_texts) else ""
-                if not ref_text:
-                    ref_text = _extract_ref_description_from_prompt(str(batch["prompts"][sample_idx]))
-                fallback_inputs = build_eagle_inputs(
-                    processor,
-                    [image_path],
-                    [build_refhuman_fallback_prompt(ref_text)],
-                    device,
-                    image_token_limit=image_token_limit,
-                    image_tensors=None if vision_images is None else [vision_images[sample_idx]],
-                )
-                fallback_response, _, _ = module.backbone_extractor.generate_response_with_cached_features(
-                    fallback_inputs,
-                    tokenizer,
-                    max_new_tokens=locate_generation_token_budget(
-                        max_new_tokens,
-                        max_instances,
-                        task_id=0,
-                    ),
-                    generation_mode=generation_mode,
-                    do_sample=False,
-                    temperature=0,
-                )
-                response = REFHUMAN_FALLBACK_MARKER + "\n" + str(fallback_response)
             responses.append(response)
             feature_maps.append(feature_map)
             text_embeds.append(text_embed)
@@ -2502,7 +2642,7 @@ def generate_locate_bbox_responses_with_features(
         if was_training:
             locate_model.train()
 
-    return responses, torch.cat(feature_maps, dim=0), torch.cat(text_embeds, dim=0)
+    return responses, SpatialFeatureBatch.concatenate(feature_maps), torch.cat(text_embeds, dim=0)
 
 
 def parse_layer_selection(spec: str) -> set[int]:
@@ -2550,25 +2690,35 @@ def configure_backbone_train_scope(
     model: torch.nn.Module | None,
     scope: str,
     *,
-    train_projector: bool = False,
+    train_projector: bool = True,
     llm_layers: str = "32-35",
-    vision_layers: str = "15-26",
+    vision_layers: str = "0-26",
     llm_modules: str = "q_proj,v_proj",
     vision_modules: str = "wqkv,wo,fc0,fc1",
 ) -> dict[str, int]:
     """Enable exactly the requested pretrained-backbone adapter parameters."""
     scope = str(scope)
-    if scope not in {"frozen", "vision_lora", "all_lora", "selective_lora"}:
+    valid_scopes = {
+        "frozen",
+        "vision_lora",
+        "llm_lora",
+        "all_lora",
+        "selective_vision_lora",
+        "selective_llm_lora",
+        "selective_lora",
+    }
+    if scope not in valid_scopes:
         raise ValueError(f"Unsupported backbone train scope: {scope!r}")
     selected_llm_layers = parse_layer_selection(llm_layers)
     selected_vision_layers = parse_layer_selection(vision_layers)
     selected_llm_modules = parse_module_selection(llm_modules)
     selected_vision_modules = parse_module_selection(vision_modules)
-    if scope == "selective_lora":
-        if not selected_llm_layers or not selected_vision_layers:
-            raise ValueError("selective_lora requires non-empty LLM and vision layer selections.")
-        if not selected_llm_modules or not selected_vision_modules:
-            raise ValueError("selective_lora requires non-empty LLM and vision module selections.")
+    if scope in {"selective_lora", "selective_llm_lora"}:
+        if not selected_llm_layers or not selected_llm_modules:
+            raise ValueError(f"{scope} requires non-empty LLM layer/module selections.")
+    if scope in {"selective_lora", "selective_vision_lora"}:
+        if not selected_vision_layers or not selected_vision_modules:
+            raise ValueError(f"{scope} requires non-empty vision layer/module selections.")
 
     counts = {"vision_lora": 0, "language_lora": 0, "projector": 0}
     if model is None:
@@ -2577,20 +2727,26 @@ def configure_backbone_train_scope(
         is_lora = "lora_" in name
         is_vision = is_vision_parameter(name)
         is_projector = ".mlp1." in name or name.startswith("mlp1.")
-        enabled = False
-        if scope == "vision_lora":
+        enabled = bool(scope != "frozen" and train_projector and is_projector)
+        if not enabled and scope == "vision_lora":
             enabled = is_lora and is_vision
-        elif scope == "all_lora":
-            enabled = is_lora or (train_projector and is_projector)
-        elif scope == "selective_lora" and is_lora:
+        elif not enabled and scope == "llm_lora":
+            enabled = is_lora and not is_vision
+        elif not enabled and scope == "all_lora":
+            enabled = is_lora
+        elif not enabled and scope in {
+            "selective_vision_lora",
+            "selective_llm_lora",
+            "selective_lora",
+        } and is_lora:
             layer_index = _adapter_layer_index(name, vision=is_vision)
             projection_name = _adapter_projection_name(name)
-            if is_vision:
+            if is_vision and scope in {"selective_vision_lora", "selective_lora"}:
                 enabled = (
                     layer_index in selected_vision_layers
                     and projection_name in selected_vision_modules
                 )
-            else:
+            elif not is_vision and scope in {"selective_llm_lora", "selective_lora"}:
                 enabled = (
                     layer_index in selected_llm_layers
                     and projection_name in selected_llm_modules
@@ -2604,15 +2760,14 @@ def configure_backbone_train_scope(
             counts["vision_lora"] += param.numel()
         else:
             counts["language_lora"] += param.numel()
-    if scope == "selective_lora":
-        if counts["vision_lora"] == 0:
-            raise RuntimeError(
-                "selective_lora matched no vision LoRA parameters; check layer/module names."
-            )
-        if counts["language_lora"] == 0:
-            raise RuntimeError(
-                "selective_lora matched no language LoRA parameters; check layer/module names."
-            )
+    if scope in {"selective_lora", "selective_vision_lora"} and counts["vision_lora"] == 0:
+        raise RuntimeError(
+            f"{scope} matched no vision LoRA parameters; check layer/module names."
+        )
+    if scope in {"selective_lora", "selective_llm_lora"} and counts["language_lora"] == 0:
+        raise RuntimeError(
+            f"{scope} matched no language LoRA parameters; check layer/module names."
+        )
     return counts
 
 
@@ -2633,15 +2788,22 @@ class QwenPoseTrainingModel(torch.nn.Module):
         backbone_name: str = "qwen3vl",
         freeze_backbone: bool = False,
         backbone_train_scope: str = "all_lora",
-        train_backbone_projector: bool = False,
+        train_backbone_projector: bool = True,
         backbone_llm_layers: str = "32-35",
-        backbone_vision_layers: str = "15-26",
+        backbone_vision_layers: str = "0-26",
         backbone_llm_modules: str = "q_proj,v_proj",
         backbone_vision_modules: str = "wqkv,wo,fc0,fc1",
+        pose_condition_box_mode: str = "refined_detached",
     ) -> None:
         super().__init__()
         self.pose_model = pose_model
         self.backbone_name = backbone_name
+        if pose_condition_box_mode not in {"input", "refined_detached"}:
+            raise ValueError(
+                "pose_condition_box_mode must be input or refined_detached, "
+                f"got {pose_condition_box_mode!r}."
+            )
+        self.pose_condition_box_mode = pose_condition_box_mode
 
         # Support both old (qwen_model) and new (backbone_model) interface
         if backbone_model is not None:
@@ -2691,6 +2853,12 @@ class QwenPoseTrainingModel(torch.nn.Module):
         task_ids: torch.Tensor,
         qwen_inputs: dict[str, torch.Tensor] | None = None,
         qwen_lm_inputs: dict[str, torch.Tensor] | None = None,
+        pbd_box_counts: torch.Tensor | None = None,
+        pbd_gt_boxes: torch.Tensor | None = None,
+        pbd_context_scales: torch.Tensor | None = None,
+        pbd_temperature: float = 1.0,
+        pose_box_grad_scale: float = 0.05,
+        run_pose: bool = True,
         target_boxes: torch.Tensor | None = None,
         target_box_mask: torch.Tensor | None = None,
         images: torch.Tensor | None = None,
@@ -2713,6 +2881,76 @@ class QwenPoseTrainingModel(torch.nn.Module):
     ) -> dict[str, torch.Tensor]:
         extra = {}
         lm_loss = None
+        pbd_losses: dict[str, torch.Tensor] = {}
+        pbd_soft_boxes: torch.Tensor | None = None
+        projected_vit_cache: list[torch.Tensor] | None = None
+
+        # Stage 2 of the decoupled recipe trains only LocateAnything grounding.
+        # It intentionally avoids PoseHead and avoids a second multimodal pass:
+        # the teacher-forcing batch supplies both MoonViT tokens and LLM labels.
+        if not bool(run_pose):
+            if self.backbone_name != "eagle" or self.backbone_extractor is None:
+                raise ValueError("Grounding-only forward requires the LocateAnything backbone.")
+            if qwen_lm_inputs is None:
+                raise ValueError("Grounding-only forward requires qwen_lm_inputs.")
+            if self.freeze_backbone:
+                raise ValueError("Grounding-only forward requires trainable LLM adapters.")
+            (
+                locate_base_model,
+                lm_input_ids,
+                lm_attention_mask,
+                lm_pixel_values,
+                lm_image_grid_hws,
+            ) = self.backbone_extractor._prepare_locate_inputs(qwen_lm_inputs)
+            _, _, projected_visual_tokens = self.backbone_extractor.run_vision_tokens(
+                lm_pixel_values,
+                lm_image_grid_hws,
+            )
+            lm_hidden = self.backbone_extractor.run_language_hidden(
+                lm_input_ids,
+                lm_attention_mask,
+                projected_visual_tokens,
+            )
+            shift_labels = qwen_lm_inputs["labels"][:, 1:].contiguous()
+            valid_label_mask = shift_labels.ne(-100)
+            outputs: dict[str, torch.Tensor] = {}
+            if valid_label_mask.any():
+                target_hidden = lm_hidden[:, :-1, :][valid_label_mask]
+                target_labels = shift_labels[valid_label_mask]
+                target_logits = locate_base_model.language_model.lm_head(
+                    target_hidden
+                ).float()
+                outputs["lm_loss"] = F.cross_entropy(
+                    target_logits,
+                    target_labels,
+                    reduction="mean",
+                )
+                if pbd_box_counts is not None:
+                    if pbd_gt_boxes is None:
+                        raise ValueError("Grounding-only PBD requires GT boxes.")
+                    pbd_logits, pbd_target_ids = extract_eagle_pbd_blocks_from_lm_logits(
+                        self.backbone_extractor,
+                        target_logits,
+                        shift_labels,
+                        valid_label_mask,
+                        pbd_box_counts,
+                    )
+                    pbd_losses, pbd_soft_boxes = compute_eagle_pbd_grounding_losses(
+                        self.backbone_extractor,
+                        pbd_logits,
+                        pbd_target_ids,
+                        pbd_gt_boxes,
+                        temperature=float(pbd_temperature),
+                    )
+                    outputs.update(pbd_losses)
+                    outputs["pbd_soft_boxes"] = pbd_soft_boxes
+                    outputs["pbd_box_count"] = pbd_soft_boxes.new_tensor(
+                        float(pbd_soft_boxes.shape[0])
+                    )
+            else:
+                outputs["lm_loss"] = lm_hidden.sum() * 0.0
+            return outputs
+
         if self.backbone_extractor is not None:
             if self.backbone_name == "qwen3vl" and qwen_lm_inputs is not None and not self.freeze_backbone and qwen_inputs is None:
                 hidden = self.backbone_extractor.run_backbone_hidden(
@@ -2741,11 +2979,23 @@ class QwenPoseTrainingModel(torch.nn.Module):
                 # Both QwenFeatureExtractor and EagleFeatureExtractor share the same
                 # forward signature: (inputs, freeze_backbone=bool)
                 if self.backbone_name == "eagle":
-                    external_feature_map, external_text_embed = self.backbone_extractor(
-                        qwen_inputs,
-                        freeze_eagle=self.freeze_backbone,
-                        require_text=bool(task_ids.eq(1).any().item()),
-                    )
+                    require_text = bool(task_ids.eq(1).any().item())
+                    if qwen_lm_inputs is not None:
+                        (
+                            external_feature_map,
+                            external_text_embed,
+                            projected_vit_cache,
+                        ) = self.backbone_extractor.forward_with_vision_cache(
+                            qwen_inputs,
+                            freeze_eagle=self.freeze_backbone,
+                            require_text=require_text,
+                        )
+                    else:
+                        external_feature_map, external_text_embed = self.backbone_extractor(
+                            qwen_inputs,
+                            freeze_eagle=self.freeze_backbone,
+                            require_text=require_text,
+                        )
                     if qwen_lm_inputs is not None and not self.freeze_backbone:
                         # LocateAnything's custom top-level forward performs an
                         # in-place image-token write which is incompatible with
@@ -2760,10 +3010,19 @@ class QwenPoseTrainingModel(torch.nn.Module):
                             lm_pixel_values,
                             lm_image_grid_hws,
                         ) = self.backbone_extractor._prepare_locate_inputs(qwen_lm_inputs)
-                        _, _, projected_visual_tokens = self.backbone_extractor.run_vision_tokens(
-                            lm_pixel_values,
-                            lm_image_grid_hws,
-                        )
+                        projected_visual_tokens = None
+                        if projected_vit_cache is not None:
+                            cached_visual_tokens = torch.cat(projected_vit_cache, dim=0)
+                            expected_image_tokens = int(
+                                lm_input_ids.eq(int(locate_base_model.image_token_index)).sum().item()
+                            )
+                            if int(cached_visual_tokens.shape[0]) == expected_image_tokens:
+                                projected_visual_tokens = cached_visual_tokens
+                        if projected_visual_tokens is None:
+                            _, _, projected_visual_tokens = self.backbone_extractor.run_vision_tokens(
+                                lm_pixel_values,
+                                lm_image_grid_hws,
+                            )
                         lm_hidden = self.backbone_extractor.run_language_hidden(
                             lm_input_ids,
                             lm_attention_mask,
@@ -2782,6 +3041,27 @@ class QwenPoseTrainingModel(torch.nn.Module):
                                 target_labels,
                                 reduction="mean",
                             )
+                            if pbd_box_counts is not None:
+                                if pbd_gt_boxes is None or pbd_context_scales is None:
+                                    raise ValueError(
+                                        "Joint soft-box training requires PBD GT boxes and context scales."
+                                    )
+                                pbd_logits, pbd_target_ids = (
+                                    extract_eagle_pbd_blocks_from_lm_logits(
+                                        self.backbone_extractor,
+                                        target_logits,
+                                        shift_labels,
+                                        valid_label_mask,
+                                        pbd_box_counts,
+                                    )
+                                )
+                                pbd_losses, pbd_soft_boxes = compute_eagle_pbd_grounding_losses(
+                                    self.backbone_extractor,
+                                    pbd_logits,
+                                    pbd_target_ids,
+                                    pbd_gt_boxes,
+                                    temperature=float(pbd_temperature),
+                                )
                         else:
                             lm_loss = lm_hidden.new_zeros(())
                 else:
@@ -2793,6 +3073,48 @@ class QwenPoseTrainingModel(torch.nn.Module):
                 "external_feature_map": external_feature_map,
                 "external_text_embed": external_text_embed,
             }
+        pose_condition_box_mode = self.pose_condition_box_mode
+        if pbd_soft_boxes is not None:
+            if pbd_box_counts is None or pbd_context_scales is None:
+                raise RuntimeError("Decoded PBD soft boxes are missing batch packing metadata.")
+            counts = pbd_box_counts.to(device=pbd_soft_boxes.device, dtype=torch.long)
+            if int(counts.sum().item()) != int(pbd_soft_boxes.shape[0]):
+                raise RuntimeError(
+                    "PBD soft-box count does not match the per-sample box counts: "
+                    f"soft={int(pbd_soft_boxes.shape[0])}, counts={int(counts.sum().item())}."
+                )
+            scales = pbd_context_scales.to(
+                device=pbd_soft_boxes.device,
+                dtype=pbd_soft_boxes.dtype,
+            ).reshape(-1, 1)
+            center = (pbd_soft_boxes[:, :2] + pbd_soft_boxes[:, 2:]) * 0.5
+            wh = (pbd_soft_boxes[:, 2:] - pbd_soft_boxes[:, :2]).clamp(min=1e-4) * scales
+            expanded_boxes = torch.cat(
+                [center - 0.5 * wh, center + 0.5 * wh],
+                dim=-1,
+            ).clamp(0.0, 1.0)
+            grad_scale = float(pose_box_grad_scale)
+            expanded_boxes = expanded_boxes.detach() + grad_scale * (
+                expanded_boxes - expanded_boxes.detach()
+            )
+            max_boxes = max(int(counts.max().item()) if counts.numel() else 0, 1)
+            target_boxes = expanded_boxes.new_zeros(
+                (int(counts.numel()), max_boxes, 4)
+            )
+            target_box_mask = torch.zeros(
+                (int(counts.numel()), max_boxes),
+                device=expanded_boxes.device,
+                dtype=torch.bool,
+            )
+            offset = 0
+            for sample_idx, count_tensor in enumerate(counts):
+                count = int(count_tensor.item())
+                if count > 0:
+                    target_boxes[sample_idx, :count] = expanded_boxes[offset : offset + count]
+                    target_box_mask[sample_idx, :count] = True
+                    offset += count
+            pose_condition_box_mode = "input"
+
         outputs = self.pose_model(
             schema_ids=schema_ids,
             task_ids=task_ids,
@@ -2815,8 +3137,18 @@ class QwenPoseTrainingModel(torch.nn.Module):
             keypoint_dn_source_indices=keypoint_dn_source_indices,
             keypoint_dn_group_ids=keypoint_dn_group_ids,
             keypoint_dn_box_query_indices=keypoint_dn_box_query_indices,
+            pose_condition_box_mode=pose_condition_box_mode,
             **extra,
         )
+        if pbd_soft_boxes is not None:
+            outputs["pbd_soft_boxes"] = pbd_soft_boxes
+            outputs["pbd_box_count"] = pbd_soft_boxes.new_tensor(
+                float(pbd_soft_boxes.shape[0])
+            )
+            outputs["pose_box_grad_scale"] = pbd_soft_boxes.new_tensor(
+                float(pose_box_grad_scale)
+            )
+            outputs.update(pbd_losses)
         if lm_loss is not None:
             outputs["lm_loss"] = lm_loss
         return outputs
@@ -3191,6 +3523,7 @@ class LocatePoseUnifiedRuntime:
                 match_iou_thresh=config.box_match_iou_thresh,
                 nms_iou_thresh=config.box_nms_iou_thresh,
                 disable_pre_pose_nms=config.disable_pre_pose_nms,
+                gt_ref_fallback_on_failure=True,
             )
         return prepare_box_conditioning(
             batch["targets"],
@@ -3485,6 +3818,30 @@ def estimate_locate_vision_tokens(
     return max((target_w // patch_size) * (target_h // patch_size), 1)
 
 
+def estimate_locate_merged_grid(
+    width: int,
+    height: int,
+    image_token_limit: int | None,
+    *,
+    patch_size: int = 14,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+) -> tuple[int, int]:
+    """Return LocateAnything's native post-merge (height, width)."""
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    raw_tokens = max(width // patch_size, 1) * max(height // patch_size, 1)
+    if image_token_limit is not None and int(image_token_limit) > 0 and raw_tokens > int(image_token_limit):
+        scale = math.sqrt(float(image_token_limit) / float(raw_tokens))
+        width = max(int(width * scale), 1)
+        height = max(int(height * scale), 1)
+    merged_h_pixels = max(int(merge_kernel_size[0]), 1) * max(int(patch_size), 1)
+    merged_w_pixels = max(int(merge_kernel_size[1]), 1) * max(int(patch_size), 1)
+    return (
+        max(int(math.ceil(height / merged_h_pixels)), 1),
+        max(int(math.ceil(width / merged_w_pixels)), 1),
+    )
+
+
 class HomogeneousDatasetBatchSampler:
     """Yield one-dataset-only batches for InterleavedPoseDataset.
 
@@ -3506,6 +3863,7 @@ class HomogeneousDatasetBatchSampler:
         shuffle: bool = True,
         fill_last: bool = True,
         balance_vision_tokens: bool = False,
+        bucket_spatial_shapes: bool = False,
         vision_token_limit: int | None = None,
     ) -> None:
         required = ("datasets", "names", "global_index_for_dataset_linear")
@@ -3519,6 +3877,7 @@ class HomogeneousDatasetBatchSampler:
         self.shuffle = bool(shuffle)
         self.fill_last = bool(fill_last)
         self.balance_vision_tokens = bool(balance_vision_tokens)
+        self.bucket_spatial_shapes = bool(bucket_spatial_shapes)
         self.vision_token_limit = None if vision_token_limit is None else int(vision_token_limit)
         self.epoch = 0
         self.start_batch = 0
@@ -3581,6 +3940,32 @@ class HomogeneousDatasetBatchSampler:
         # Pose queries matter, but traces show vision tokens dominate peak memory.
         return int(token_cost + instance_count * 32)
 
+    def _sample_spatial_bucket(self, dataset_idx: int, local_linear: int) -> tuple[int, int]:
+        inner_dataset = list(getattr(self.dataset, "datasets"))[dataset_idx]
+        records = getattr(inner_dataset, "records", None)
+        offsets = getattr(self.dataset, "offsets", None)
+        strides = getattr(self.dataset, "strides", None)
+        if records is None or offsets is None or strides is None or not records:
+            return 0, 0
+        local_index = (
+            int(offsets[dataset_idx]) + int(local_linear) * int(strides[dataset_idx])
+        ) % len(records)
+        record = records[local_index]
+        grid_h, grid_w = estimate_locate_merged_grid(
+            int(getattr(record, "width", 1)),
+            int(getattr(record, "height", 1)),
+            self.vision_token_limit,
+        )
+        area = grid_h * grid_w
+        area_bucket = 0 if area <= 576 else (1 if area <= 800 else 2)
+        aspect = float(grid_w) / max(float(grid_h), 1.0)
+        aspect_bucket = (
+            0
+            if aspect < 0.8
+            else (1 if aspect <= 1.25 else (2 if aspect < 2.0 else 3))
+        )
+        return area_bucket, aspect_bucket
+
     def _build_batches(self) -> list[list[int]]:
         rng = random.Random(self.seed + self.epoch * 1009)
         per_dataset_batches: list[list[list[int]]] = []
@@ -3616,14 +4001,27 @@ class HomogeneousDatasetBatchSampler:
                     value: self._sample_cost(dataset_idx, value)
                     for value in local_linear
                 }
+                sample_buckets = (
+                    {
+                        value: self._sample_spatial_bucket(dataset_idx, value)
+                        for value in local_linear
+                    }
+                    if self.bucket_spatial_shapes
+                    else {}
+                )
                 # Random tie-breaking changes neighboring samples each epoch while
                 # retaining length bucketing by the dominant vision-token cost.
                 decorated = [
-                    (sample_costs[value], dataset_rng.random(), value)
+                    (
+                        sample_buckets.get(value, (0, 0)),
+                        sample_costs[value],
+                        dataset_rng.random(),
+                        value,
+                    )
                     for value in local_linear
                 ]
-                decorated.sort(key=lambda item: (item[0], item[1]))
-                local_linear = [item[2] for item in decorated]
+                decorated.sort(key=lambda item: (item[0], item[1], item[2]))
+                local_linear = [item[3] for item in decorated]
             elif self.shuffle:
                 dataset_rng.shuffle(local_linear)
 
@@ -3937,7 +4335,6 @@ def _weighted_loss_items(
         items.append((group, label, raw, weight, raw * weight))
 
     add("pose", "oks", "loss_oks", weights.oks)
-    add("pose", "coord", "loss_coord", weights.coord)
     add("pose", "img", "loss_image_coord", weights.image_coord)
     add("pose", "hard", "loss_hard_joint", weights.hard_joint)
     confidence_weight = (
@@ -3951,24 +4348,16 @@ def _weighted_loss_items(
     )
     add("pose", "pconf", "loss_person_confidence", weights.person_confidence)
     add("ref", "match", "loss_ref_match", weights.ref_match)
-    add(
-        "pose",
-        "coarse_oks",
-        "loss_oks_coarse",
-        weights.coarse_coord * weights.oks,
-    )
-    add(
-        "pose",
-        "coarse_coord",
-        "loss_coord_coarse",
-        weights.coarse_coord * weights.coord,
-    )
-    add(
-        "pose",
-        "coarse_img",
-        "loss_image_coord_coarse",
-        weights.coarse_coord * weights.image_coord,
-    )
+    for decoder_idx, decoder_weight in enumerate(
+        parse_float_list(weights.decoder_coords), start=1
+    ):
+        add(
+            "pose",
+            f"dec{decoder_idx}",
+            f"loss_coord_decoder_{decoder_idx}",
+            decoder_weight,
+        )
+    add("pose", "coarse", "loss_coord_coarse", weights.coarse_coord)
     add("pose", "deform", "loss_coord_deform", weights.deform_coord)
     for refine_idx, refine_weight in enumerate(parse_float_list(weights.refine_coords), start=1):
         add("pose", f"ref{refine_idx}", f"loss_coord_refine_{refine_idx}", refine_weight)
@@ -4042,17 +4431,19 @@ def build_detailed_loss_message(
 
 
 def format_loss_weights(weights: LossWeights) -> str:
+    coord_decoder = ",".join(
+        _format_loss_weight(value) for value in parse_float_list(weights.decoder_coords)
+    ) or "none"
     coord_refine = ",".join(_format_loss_weight(value) for value in parse_float_list(weights.refine_coords)) or "none"
     return (
         "Loss weights: "
         f"oks={_format_loss_weight(weights.oks)} "
-        f"coord={_format_loss_weight(weights.coord)} "
         f"image_coord={_format_loss_weight(weights.image_coord)} "
         f"keypoint_confidence={_format_loss_weight(weights.keypoint_confidence if weights.vis is None else weights.vis)} "
         f"person_confidence={_format_loss_weight(weights.person_confidence)} "
         f"ref_match={_format_loss_weight(weights.ref_match)} "
         f"hard={_format_loss_weight(weights.hard_joint)} "
-        f"coord_aux(coarse_full_objective_scale={_format_loss_weight(weights.coarse_coord)},"
+        f"coord_aux(decoder={coord_decoder},coarse={_format_loss_weight(weights.coarse_coord)},"
         f"deform={_format_loss_weight(weights.deform_coord)},refine={coord_refine}) "
         f"box(obj={_format_loss_weight(weights.box_objectness)},"
         f"l1={_format_loss_weight(weights.box_l1)},"
@@ -4435,6 +4826,26 @@ def trainable_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def backbone_adapter_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Save the complete cross-stage Locate adapter state, including frozen LoRA.
+
+    Stage 2 freezes the vision LoRA learned in Stage 1 while training only LLM
+    LoRA. Saving only ``requires_grad`` tensors would silently drop the vision
+    adapter before Stage 3, so keep every LoRA tensor plus the small mlp1
+    projector state used by both LocateAnything and LocatePose.
+    """
+    return {
+        name: param.detach().cpu()
+        for name, param in model.named_parameters()
+        if (
+            "lora_" in name
+            or ".mlp1." in name
+            or name.startswith("mlp1.")
+            or param.requires_grad
+        )
+    }
+
+
 def capture_rng_state() -> dict[str, object]:
     state: dict[str, object] = {
         "python": random.getstate(),
@@ -4672,7 +5083,9 @@ def save_checkpoint(
         payload["training_state"] = training_state
     if module.qwen_model is not None:
         backbone_state = trainable_state_dict(module.qwen_model)
+        adapter_state = backbone_adapter_state_dict(module.qwen_model)
         payload["backbone_trainable"] = backbone_state
+        payload["backbone_adapter"] = adapter_state
         payload["qwen_trainable"] = backbone_state
     if module.qwen_extractor is not None:
         backbone_base = (
@@ -4681,7 +5094,6 @@ def save_checkpoint(
             else None
         )
         feature_config = {
-            "output_size": int(module.qwen_extractor.output_size),
             "feature_source": str(getattr(module.qwen_extractor, "feature_source", "raw_visual")),
             "backbone_train_scope": str(getattr(module, "backbone_train_scope", "all_lora")),
             "backbone_llm_layers": str(getattr(module, "backbone_llm_layers", "")),
@@ -4697,6 +5109,10 @@ def save_checkpoint(
                 getattr(backbone_base, "generation_components_pruned", False)
             ),
         }
+        if str(getattr(module, "backbone_name", "")) == "eagle":
+            feature_config["native_spatial_features"] = True
+        else:
+            feature_config["output_size"] = int(module.qwen_extractor.output_size)
         payload["backbone_feature_config"] = feature_config
         payload["qwen_feature_config"] = feature_config
         extractor_state = {
@@ -4946,7 +5362,10 @@ def load_training_checkpoint(
     payload = torch.load(payload_path, map_location="cpu")
     module = unwrap_training_model(model)
     module.pose_model.load_state_dict(payload["model"])
-    backbone_state = payload.get("backbone_trainable", payload.get("qwen_trainable"))
+    backbone_state = payload.get(
+        "backbone_adapter",
+        payload.get("backbone_trainable", payload.get("qwen_trainable")),
+    )
     if module.qwen_model is not None and backbone_state is not None:
         module.qwen_model.load_state_dict(backbone_state, strict=False)
     if module.qwen_extractor is not None and "backbone_extractor" in payload:
@@ -4987,7 +5406,10 @@ def load_person_confidence_rescue_checkpoint(
             f"unexpected={sorted(unexpected)}"
         )
 
-    backbone_state = payload.get("backbone_trainable", payload.get("qwen_trainable"))
+    backbone_state = payload.get(
+        "backbone_adapter",
+        payload.get("backbone_trainable", payload.get("qwen_trainable")),
+    )
     if module.qwen_model is not None and backbone_state is not None:
         module.qwen_model.load_state_dict(backbone_state, strict=False)
     if module.qwen_extractor is not None and "backbone_extractor" in payload:
@@ -5049,6 +5471,16 @@ def is_vision_parameter(name: str) -> bool:
     )
 
 
+def is_visual_projector_parameter(name: str) -> bool:
+    """Check if a parameter belongs to LocateAnything's full visual projector."""
+    return (
+        name.startswith("mlp1.")
+        or ".mlp1." in name
+        or name.startswith("backbone_model.mlp1.")
+        or name.startswith("qwen_model.mlp1.")
+    )
+
+
 def build_optimizer_param_groups(
     model: torch.nn.Module,
     args: argparse.Namespace,
@@ -5057,18 +5489,25 @@ def build_optimizer_param_groups(
         "pose": [],
         "backbone_lora": [],
         "backbone_vision_lora": [],
+        "backbone_projector": [],
     }
     stats: dict[str, list[float]] = {
         "pose": [0, 0],
         "backbone_lora": [0, 0],
         "backbone_vision_lora": [0, 0],
+        "backbone_projector": [0, 0],
     }
     backbone_name = getattr(args, "backbone", "qwen3vl")
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if name.startswith("backbone_model.") or name.startswith("qwen_model."):
-            group_name = "backbone_vision_lora" if is_vision_parameter(name) else "backbone_lora"
+            if is_visual_projector_parameter(name):
+                group_name = "backbone_projector"
+            elif is_vision_parameter(name):
+                group_name = "backbone_vision_lora"
+            else:
+                group_name = "backbone_lora"
         else:
             group_name = "pose"
         grouped[group_name].append(param)
@@ -5086,12 +5525,15 @@ def build_optimizer_param_groups(
         "pose": args.lr,
         "backbone_lora": args.lr * lora_lr_scale,
         "backbone_vision_lora": args.lr * vision_lr_scale,
+        "backbone_projector": args.lr * vision_lr_scale,
     }
     param_groups = [
         {
             "params": params,
             "lr": lrs[name],
-            "weight_decay": args.weight_decay if name == "pose" else 0.0,
+            "weight_decay": (
+                args.weight_decay if name in {"pose", "backbone_projector"} else 0.0
+            ),
         }
         for name, params in grouped.items()
         if params
@@ -5175,10 +5617,12 @@ def main() -> None:
         raise ValueError("--refhuman_max_captions_per_instance must be >= 0.")
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
-    if args.image_size != 800:
-        raise ValueError("The unified LocatePose architecture requires --image_size 800.")
-    if args.pose_pyramid_channels <= 0 or args.pose_pyramid_blocks <= 0:
-        raise ValueError("Pose pyramid channels and block count must be positive.")
+    if args.dynamic_reference_offset_scale <= 0.0:
+        raise ValueError("--dynamic_reference_offset_scale must be positive.")
+    if args.pose_feature_channels <= 0:
+        raise ValueError("Pose feature channels must be positive.")
+    if args.decoder_heads <= 0 or args.hidden_dim % args.decoder_heads != 0:
+        raise ValueError("--hidden_dim must be divisible by positive --decoder_heads.")
     if args.human_decoder_layers <= 0 or args.pose_decoder_layers <= 0:
         raise ValueError("Human and pose decoder layer counts must be positive.")
     if args.deformable_points <= 0 or args.deformable_min_radius_cells <= 0.0:
@@ -5213,15 +5657,22 @@ def main() -> None:
     if not 0.0 <= args.pose_dropout < 1.0:
         raise ValueError("--pose_dropout must be in [0, 1).")
     if (
-        args.pose_coordinate_init == "schema_prior"
+        args.pose_coordinate_init in {"anatomical_dynamic", "schema_prior"}
         and args.schema_joint_priors_path
         and not Path(args.schema_joint_priors_path).is_file()
     ):
         raise FileNotFoundError(
             f"--schema_joint_priors_path does not exist: {args.schema_joint_priors_path}"
         )
+    decoder_coord_weights = parse_float_list(args.w_decoder_coords)
+    if any(weight < 0.0 for weight in decoder_coord_weights):
+        raise ValueError("--w_decoder_coords weights must be non-negative.")
     if args.pose_roi_size <= 1:
         raise ValueError("--pose_roi_size must be greater than 1.")
+    if args.letterbox_size < 0:
+        raise ValueError("--letterbox_size must be non-negative.")
+    if not 0 <= args.letterbox_fill <= 255:
+        raise ValueError("--letterbox_fill must be in [0, 255].")
     if not 0.0 <= args.visualize_min_gt_area_ratio <= 1.0:
         raise ValueError("--visualize_min_gt_area_ratio must be in [0, 1].")
     if min(
@@ -5242,6 +5693,10 @@ def main() -> None:
         raise ValueError("--w_ref_match must be non-negative.")
     if args.w_locate_box_lm < 0.0:
         raise ValueError("--w_locate_box_lm must be non-negative.")
+    if args.w_locate_pbd < 0.0 or args.pose_box_grad_scale < 0.0:
+        raise ValueError("--w_locate_pbd/--pose_box_grad_scale must be non-negative.")
+    if args.pbd_temperature <= 0.0:
+        raise ValueError("--pbd_temperature must be positive.")
     if args.locate_box_max_new_tokens <= 0:
         raise ValueError("--locate_box_max_new_tokens must be positive.")
     if args.locate_lm_loss_every <= 0:
@@ -5252,17 +5707,21 @@ def main() -> None:
         raise ValueError("--ref_text_scale must be non-negative.")
     if args.locate_vision_scale < 0.0 or args.locate_llm_scale < 0.0:
         raise ValueError("--locate_vision_scale/--locate_llm_scale must be non-negative.")
-    if args.locate_train_scope == "selective_lora":
+    selective_llm = args.locate_train_scope in {"selective_llm_lora", "selective_lora"}
+    selective_vision = args.locate_train_scope in {"selective_vision_lora", "selective_lora"}
+    if selective_llm or selective_vision:
         llm_layers = parse_layer_selection(args.locate_llm_layers)
         vision_layers = parse_layer_selection(args.locate_vision_layers)
         llm_modules = parse_module_selection(args.locate_llm_modules)
         vision_modules = parse_module_selection(args.locate_vision_modules)
-        if not llm_layers or max(llm_layers) >= 36:
+        if selective_llm and (not llm_layers or max(llm_layers) >= 36):
             raise ValueError("--locate_llm_layers must select Qwen2.5 layers in [0, 35].")
-        if not vision_layers or max(vision_layers) >= 27:
+        if selective_vision and (not vision_layers or max(vision_layers) >= 27):
             raise ValueError("--locate_vision_layers must select MoonViT blocks in [0, 26].")
-        if not llm_modules or not vision_modules:
-            raise ValueError("Selective LoRA module selections must be non-empty.")
+        if selective_llm and not llm_modules:
+            raise ValueError("Selective LLM LoRA module selection must be non-empty.")
+        if selective_vision and not vision_modules:
+            raise ValueError("Selective vision LoRA module selection must be non-empty.")
     if not 0.0 <= args.hard_joint_fraction <= 1.0:
         raise ValueError("--hard_joint_fraction must be in [0, 1].")
     if args.box_jitter_scale < 0.0 or args.box_jitter_shift < 0.0:
@@ -5273,6 +5732,17 @@ def main() -> None:
         raise ValueError("--box_match_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.box_nms_iou_thresh <= 1.0:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
+    if args.locate_grounding_only:
+        if args.backbone != "eagle":
+            raise ValueError("--locate_grounding_only is supported only by LocateAnything/eagle.")
+        if not args.freeze_pose:
+            raise ValueError("--locate_grounding_only requires --freeze_pose.")
+        if args.freeze_eagle or args.locate_train_scope == "frozen":
+            raise ValueError("Grounding-only training requires trainable LocateAnything LLM adapters.")
+        if args.locate_feature_source != "raw_visual":
+            raise ValueError("Grounding-only training requires --locate_feature_source=raw_visual.")
+        if args.w_locate_box_lm <= 0.0 and args.w_locate_pbd <= 0.0:
+            raise ValueError("Grounding-only training requires a positive LM or PBD loss weight.")
     if args.prune_locate_generation and args.backbone != "eagle":
         raise ValueError("--prune_locate_generation is only supported by LocateAnything/eagle.")
     if args.box_source == "locate_generate" and args.backbone != "eagle":
@@ -5393,13 +5863,21 @@ def main() -> None:
         names=dataset_names,
         max_instances=args.max_instances,
         image_size=args.image_size,
-        load_image_tensors=not args.disable_image_tensors,
-        # Only materialize and transfer a full-resolution image tensor when
-        # augmentation changes the pixels. Without augmentation, reopening the
-        # path in the main process is faster and avoids large worker IPC payloads.
-        load_vision_images=args.backbone == "eagle" and bool(args.pose_augment),
+        load_image_tensors=False,
+        # Fixed-size letterboxing changes both pixels and annotation geometry, so
+        # every LocateAnything stage consumes the materialized 800x800 tensor.
+        load_vision_images=(
+            args.backbone == "eagle"
+            and (bool(args.pose_augment) or int(args.letterbox_size) > 0)
+        ),
         augment_config=augment_config,
         use_prompts=args.locate_feature_source != "vision_only",
+        letterbox_size=(
+            int(args.letterbox_size)
+            if args.backbone == "eagle" and int(args.letterbox_size) > 0
+            else None
+        ),
+        letterbox_fill=int(args.letterbox_fill),
         split=args.split,
         max_samples_per_dataset=args.max_samples_per_dataset,
         refhuman_max_captions_per_instance=args.refhuman_max_captions_per_instance,
@@ -5443,6 +5921,9 @@ def main() -> None:
             shuffle=True,
             fill_last=True,
             balance_vision_tokens=balance_vision_tokens,
+            bucket_spatial_shapes=(
+                balance_vision_tokens and not args.disable_spatial_shape_bucketing
+            ),
             vision_token_limit=sampler_token_limit,
         )
     else:
@@ -5507,6 +5988,7 @@ def main() -> None:
                 "Homogeneous dataset batches enabled: "
                 f"one source per batch, batches_per_rank={len(batch_sampler)}, "
                 f"vision_token_balancing={batch_sampler.balance_vision_tokens}, "
+                f"spatial_shape_bucketing={batch_sampler.bucket_spatial_shapes}, "
                 f"sampler_token_limit={batch_sampler.vision_token_limit}, "
                 f"global_source_batches=[{source_batch_desc}]"
             )
@@ -5532,6 +6014,7 @@ def main() -> None:
     backbone_model = None
     backbone_processor = None
     external_dim = None
+    high_res_external_dim = 0
     backbone_name = args.backbone
     qwen_init_source: QwenInitializationSource | None = None
     qwenpose_init_payload: dict[str, object] | None = None
@@ -5560,9 +6043,13 @@ def main() -> None:
         backbone_model.to(device)
         backbone_model.train()
         external_dim = eagle_hidden_size(backbone_model)
+        eagle_base = get_eagle_base_model(backbone_model)
+        vision_config = getattr(getattr(eagle_base, "vision_model", None), "config", None)
+        high_res_external_dim = int(
+            getattr(vision_config, "hidden_size", 1152)
+        )
         bb_trainable, bb_total = count_eagle_lora_parameters(backbone_model)
         if is_main_process():
-            eagle_base = get_eagle_base_model(backbone_model)
             load_mode = (
                 "vision_tower_only"
                 if bool(getattr(eagle_base, "is_vision_only_backbone", False))
@@ -5630,10 +6117,10 @@ def main() -> None:
         qwenpose_init_payload = _load_local_torch_payload(init_payload_path)
     saved_pose_config = qwenpose_init_payload.get("pose_config") if qwenpose_init_payload is not None else None
     if saved_pose_config is not None:
-        if "pose_pyramid_channels" not in saved_pose_config or int(saved_pose_config.get("rgb_input_size", 0)) != 800:
+        if saved_pose_config.get("use_native_spatial_features") is not True:
             raise ValueError(
-                "The initialization checkpoint predates the unified 800x800 pose pyramid and cannot be loaded. "
-                "Train a new Stage1 checkpoint, then use it for Stage2/Stage3."
+                "The initialization checkpoint predates native-grid Locate pose features. "
+                "Train a new Stage1 checkpoint, then use it for Stage2."
             )
         if (
             "enable_keypoint_denoising" not in saved_pose_config
@@ -5652,12 +6139,14 @@ def main() -> None:
             raise ValueError(
                 "Pose coordinate initialization must match between stages/checkpoints: "
                 f"checkpoint={saved_coordinate_init}, requested={args.pose_coordinate_init}. "
-                "Retrain Stage1 with learned_spread for the new image-conditioned path; "
-                "schema_prior is legacy-only."
+                "Architecture-changing coordinate modes require a new matching Stage1 run."
             )
         model_config = QwenPoseConfig(
             hidden_dim=int(saved_pose_config.get("hidden_dim", args.hidden_dim)),
             external_dim=external_dim,
+            high_res_external_dim=int(
+                saved_pose_config.get("high_res_external_dim", high_res_external_dim)
+            ),
             pose_decoder_layers=int(saved_pose_config.get("pose_decoder_layers", args.pose_decoder_layers)),
             refinement_steps=int(saved_pose_config.get("refinement_steps", args.refinement_steps)),
             decoder_heads=int(saved_pose_config.get("decoder_heads", args.decoder_heads)),
@@ -5665,13 +6154,20 @@ def main() -> None:
             box_condition_scale=float(saved_pose_config.get("box_condition_scale", args.box_condition_scale)),
             pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
-            rgb_input_size=int(saved_pose_config.get("rgb_input_size", 800)),
-            pose_pyramid_channels=int(saved_pose_config.get("pose_pyramid_channels", args.pose_pyramid_channels)),
-            pose_pyramid_blocks=int(saved_pose_config.get("pose_pyramid_blocks", args.pose_pyramid_blocks)),
+            pose_feature_channels=int(saved_pose_config["pose_feature_channels"]),
             human_decoder_layers=int(saved_pose_config.get("human_decoder_layers", args.human_decoder_layers)),
             deformable_points=int(saved_pose_config.get("deformable_points", args.deformable_points)),
             deformable_min_radius_cells=float(
                 saved_pose_config.get("deformable_min_radius_cells", args.deformable_min_radius_cells)
+            ),
+            deformable_scale_prior_strength=float(
+                saved_pose_config.get("deformable_scale_prior_strength", 0.5)
+            ),
+            deformable_scale_prior_center_cells=float(
+                saved_pose_config.get("deformable_scale_prior_center_cells", 6.0)
+            ),
+            deformable_scale_prior_temperature=float(
+                saved_pose_config.get("deformable_scale_prior_temperature", 1.5)
             ),
             enable_box_denoising=bool(
                 saved_pose_config.get("enable_box_denoising", not args.disable_box_denoising)
@@ -5707,11 +6203,18 @@ def main() -> None:
                     "schema_joint_priors_path", args.schema_joint_priors_path
                 )
             ),
+            dynamic_reference_offset_scale=float(
+                saved_pose_config.get(
+                    "dynamic_reference_offset_scale",
+                    args.dynamic_reference_offset_scale,
+                )
+            ),
         )
     else:
         model_config = QwenPoseConfig(
             hidden_dim=args.hidden_dim,
             external_dim=external_dim,
+            high_res_external_dim=high_res_external_dim,
             pose_decoder_layers=args.pose_decoder_layers,
             refinement_steps=args.refinement_steps,
             decoder_heads=args.decoder_heads,
@@ -5719,12 +6222,13 @@ def main() -> None:
             box_condition_scale=args.box_condition_scale,
             pose_roi_size=args.pose_roi_size,
             use_refinement=not args.disable_refinement,
-            rgb_input_size=args.image_size,
-            pose_pyramid_channels=args.pose_pyramid_channels,
-            pose_pyramid_blocks=args.pose_pyramid_blocks,
+            pose_feature_channels=args.pose_feature_channels,
             human_decoder_layers=args.human_decoder_layers,
             deformable_points=args.deformable_points,
             deformable_min_radius_cells=args.deformable_min_radius_cells,
+            deformable_scale_prior_strength=0.5,
+            deformable_scale_prior_center_cells=6.0,
+            deformable_scale_prior_temperature=1.5,
             enable_box_denoising=not args.disable_box_denoising,
             enable_keypoint_denoising=not args.disable_keypoint_denoising,
             ref_text_scale=args.ref_text_scale,
@@ -5736,6 +6240,13 @@ def main() -> None:
             num_person_queries=args.num_person_queries,
             pose_coordinate_init=args.pose_coordinate_init,
             schema_joint_priors_path=args.schema_joint_priors_path,
+            dynamic_reference_offset_scale=args.dynamic_reference_offset_scale,
+        )
+    if len(decoder_coord_weights) != int(model_config.pose_decoder_layers):
+        raise ValueError(
+            "--w_decoder_coords must provide exactly one weight per actual pose "
+            "decoder layer: "
+            f"layers={model_config.pose_decoder_layers}, weights={decoder_coord_weights}."
         )
     requested_person_queries = args.box_source == "person_queries"
     if bool(model_config.use_global_person_queries) != requested_person_queries:
@@ -5762,12 +6273,14 @@ def main() -> None:
             "--w_person_confidence > 0 requires an enabled person confidence head."
         )
     model = QwenPoseModel(model_config).to(device)
+    if args.freeze_pose:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
     trainable, total = count_trainable_parameters(model)
     if is_main_process():
         print(f"Pose module trainable parameters: {trainable:,} / {total:,}")
     # Select feature extractor params based on backbone
     if backbone_name == "eagle":
-        feature_size = args.eagle_feature_size
         refiner_layers = args.eagle_feature_refiner_layers
         refiner_bottleneck_dim = args.eagle_feature_refiner_bottleneck_dim
         refiner_init_scale = args.eagle_feature_refiner_init_scale
@@ -5793,7 +6306,6 @@ def main() -> None:
     if backbone_name == "eagle":
         backbone_extractor = EagleFeatureExtractor(
             backbone_model,
-            output_size=feature_size,
             refiner_layers=refiner_layers,
             refiner_bottleneck_dim=refiner_bottleneck_dim,
             refiner_init_scale=refiner_init_scale,
@@ -5820,6 +6332,9 @@ def main() -> None:
         backbone_vision_layers=args.locate_vision_layers,
         backbone_llm_modules=args.locate_llm_modules,
         backbone_vision_modules=args.locate_vision_modules,
+        pose_condition_box_mode=(
+            "input" if args.box_source == "gt" else "refined_detached"
+        ),
     ).to(device)
     if args.person_confidence_rescue:
         if args.init_from_checkpoint is None:
@@ -5864,7 +6379,21 @@ def main() -> None:
             print(f"Initialized QwenPose extra modules from {init_checkpoint}")
     if is_main_process():
         print(f"Backbone: {backbone_name}")
-        print(f"Feature grid size: {feature_size}x{feature_size}")
+        print(
+            "Feature grid size: native_dynamic"
+            if backbone_name == "eagle"
+            else f"Feature grid size: {feature_size}x{feature_size}"
+        )
+        print(
+            "Model dimensions: "
+            f"hidden_dim={model_config.hidden_dim}, "
+            f"external_dim={model_config.external_dim}, "
+            f"decoder_heads={model_config.decoder_heads}, "
+            f"human_decoder_layers={model_config.human_decoder_layers}, "
+            f"pose_decoder_layers={model_config.pose_decoder_layers}, "
+            f"refinement_steps={model_config.refinement_steps}, "
+            f"dropout={model_config.dropout}"
+        )
         if backbone_name == "eagle":
             print(
                 "Locate image budget: "
@@ -5885,17 +6414,21 @@ def main() -> None:
         )
         print(f"Box condition scale: {model_config.box_condition_scale}")
         print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
-        print(
-            "Unified pose pyramid: "
-            f"input={model_config.rgb_input_size}x{model_config.rgb_input_size}, "
-            f"channels={model_config.pose_pyramid_channels}, "
-            f"grids={model_config.rgb_input_size // 4}x{model_config.rgb_input_size // 4}/"
-            f"{model_config.rgb_input_size // 8}x{model_config.rgb_input_size // 8}/"
-            f"{model_config.rgb_input_size // 16}x{model_config.rgb_input_size // 16}, "
-            f"blocks={model_config.pose_pyramid_blocks}, "
-            f"human_decoder_layers={model_config.human_decoder_layers}, "
-            f"pose_decoder_layers={model_config.pose_decoder_layers}"
-        )
+        if backbone_name == "eagle":
+            print(
+                "Locate pose feature: "
+                f"channels={model_config.pose_feature_channels}, grid=native_dynamic, "
+                f"human_decoder_layers={model_config.human_decoder_layers}, "
+                f"pose_decoder_layers={model_config.pose_decoder_layers}"
+            )
+        else:
+            print(
+                "Qwen pose feature: "
+                f"channels={model_config.pose_feature_channels}, "
+                f"grid={int(args.qwen_feature_size)}x{int(args.qwen_feature_size)}, "
+                f"human_decoder_layers={model_config.human_decoder_layers}, "
+                f"pose_decoder_layers={model_config.pose_decoder_layers}"
+            )
         print(
             "Box denoising: "
             f"enabled={model_config.enable_box_denoising}, "
@@ -5911,7 +6444,12 @@ def main() -> None:
             f"negative_ks=[{args.keypoint_dn_negative_ks_min},{args.keypoint_dn_negative_ks_max}], "
             f"weight={args.w_keypoint_dn}"
         )
-        if model_config.pose_coordinate_init == "learned_spread":
+        if model_config.pose_coordinate_init == "anatomical_dynamic":
+            coordinate_message = (
+                "mode=anatomical_dynamic, main_reference=schema_prior+instance_offset, "
+                "decoder=grouped_iterative"
+            )
+        elif model_config.pose_coordinate_init == "learned_spread":
             coordinate_message = (
                 "mode=learned_spread, main_reference=trainable_nonsemantic_halton, "
                 "deform_reference=detached_coarse"
@@ -6025,6 +6563,7 @@ def main() -> None:
         box_relative=args.w_box_relative,
         box_dn=args.w_box_dn,
         keypoint_dn=args.w_keypoint_dn,
+        decoder_coords=parse_float_list(args.w_decoder_coords),
         coarse_coord=args.w_coarse_coord,
         deform_coord=args.w_deform_coord,
         refine_coords=parse_float_list(args.w_refine_coords),
@@ -6037,6 +6576,28 @@ def main() -> None:
         )
         print(f"Training duration: {duration}")
         print(format_loss_weights(weights))
+        print(
+            "Locate auxiliary loss weights: "
+            f"box_lm={args.w_locate_box_lm}, "
+            f"pbd_outer={args.w_locate_pbd}, "
+            "pbd_inner(frame=0.5,coord=1,l1=5,giou=2,order=1), "
+            f"joint_pose_box_grad_scale={args.pose_box_grad_scale}, "
+            "joint_soft_box_scope=all_pose_datasets, "
+            f"pbd_temperature={args.pbd_temperature}, "
+            f"lm_every_micro_steps={args.locate_lm_loss_every}"
+        )
+        print(
+            "Training/logging intervals: "
+            f"world_size={world_size}, batch_per_gpu={args.batch_size}, "
+            f"grad_accum={args.grad_accum_steps}, "
+            f"effective_global_batch={world_size * args.batch_size * args.grad_accum_steps}, "
+            f"warmup_steps={args.warmup_steps}, log_every={args.log_every}, "
+            f"save_every={args.save_every}, save_total_limit={args.save_total_limit}, "
+            f"visualize_every={args.visualize_every}, "
+            f"visualize_max_instances={args.visualize_max_instances}, "
+            f"visualize_min_gt_area_ratio={args.visualize_min_gt_area_ratio}, "
+            f"batch_trace={not args.disable_batch_trace}"
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     global_step = 0
     micro_step = 0
@@ -6229,8 +6790,10 @@ def main() -> None:
                 torch.cuda.reset_peak_memory_stats(device)
             qwen_inputs = None
             qwen_lm_inputs = None
+            pbd_supervision: dict[str, object] | None = None
             trace_qwen_inputs = None
             use_lm_loss = False
+            joint_soft_box_enabled = False
             pose_targets = batch.get("targets", [])
             prep_time = None
             forward_time = None
@@ -6243,14 +6806,47 @@ def main() -> None:
                 sync_cuda_for_timing(args.sync_timing, device)
                 prep_started = time.perf_counter()
                 batch = move_batch_to_device(batch, device)
-                target_boxes, target_box_mask, pose_targets = unified_runtime.prepare_training_conditioning(
-                    batch,
-                    unified_config,
-                    box_source=args.box_source,
+                joint_soft_box_enabled = bool(
+                    backbone_name == "eagle"
+                    and args.box_source == "locate_generate"
+                    and not args.freeze_eagle
+                    and not args.disable_locate_grounding_aux
+                    and (
+                        args.w_locate_pbd > 0.0
+                        or args.pose_box_grad_scale > 0.0
+                    )
                 )
+                if args.locate_grounding_only:
+                    (
+                        target_boxes,
+                        target_box_mask,
+                        pose_targets,
+                        pbd_supervision,
+                    ) = prepare_joint_pbd_conditioning(
+                        batch,
+                        device,
+                        max_instances=args.locate_lm_max_instances,
+                    )
+                elif joint_soft_box_enabled:
+                    (
+                        target_boxes,
+                        target_box_mask,
+                        pose_targets,
+                        pbd_supervision,
+                    ) = prepare_joint_pbd_conditioning(
+                        batch,
+                        device,
+                        max_instances=args.locate_lm_max_instances,
+                    )
+                else:
+                    target_boxes, target_box_mask, pose_targets = unified_runtime.prepare_training_conditioning(
+                        batch,
+                        unified_config,
+                        box_source=args.box_source,
+                    )
                 dn_batch: dict[str, torch.Tensor] = {}
                 box_dn_batch: dict[str, torch.Tensor] | None = None
-                if not args.disable_box_denoising:
+                if not args.locate_grounding_only and not args.disable_box_denoising:
                     box_dn_batch = prepare_box_denoising(
                         pose_targets,
                         device,
@@ -6262,7 +6858,11 @@ def main() -> None:
                     )
                     if box_dn_batch is not None:
                         dn_batch.update(box_dn_batch)
-                if not args.disable_keypoint_denoising and box_dn_batch is not None:
+                if (
+                    not args.locate_grounding_only
+                    and not args.disable_keypoint_denoising
+                    and box_dn_batch is not None
+                ):
                     keypoint_dn_batch = prepare_keypoint_denoising(
                         pose_targets,
                         device,
@@ -6283,15 +6883,16 @@ def main() -> None:
                 if backbone_processor is None:
                     qwen_inputs = None
                 elif backbone_name == "eagle":
-                    qwen_inputs = build_eagle_inputs(
-                        backbone_processor,
-                        batch["image_paths"],
-                        None if args.locate_feature_source == "vision_only" else batch["prompts"],
-                        device,
-                        image_token_limit=args.eagle_image_token_limit,
-                        batch_token_limit=args.eagle_batch_token_limit,
-                        image_tensors=batch.get("vision_images"),
-                    )
+                    if not args.locate_grounding_only:
+                        qwen_inputs = build_eagle_inputs(
+                            backbone_processor,
+                            batch["image_paths"],
+                            None if args.locate_feature_source == "vision_only" else batch["prompts"],
+                            device,
+                            image_token_limit=args.eagle_image_token_limit,
+                            batch_token_limit=args.eagle_batch_token_limit,
+                            image_tensors=batch.get("vision_images"),
+                        )
                     use_lm_loss = (
                         args.w_locate_box_lm > 0.0
                         and not args.disable_locate_grounding_aux
@@ -6299,7 +6900,11 @@ def main() -> None:
                         and args.locate_lm_loss_every > 0
                         and micro_step % args.locate_lm_loss_every == 0
                     )
-                    if use_lm_loss:
+                    if (
+                        args.locate_grounding_only
+                        or use_lm_loss
+                        or joint_soft_box_enabled
+                    ):
                         locate_responses = build_locate_grounding_responses(
                             batch,
                             max_instances=args.locate_lm_max_instances,
@@ -6311,6 +6916,7 @@ def main() -> None:
                             locate_responses,
                             device,
                             image_token_limit=args.eagle_image_token_limit,
+                            batch_token_limit=args.eagle_batch_token_limit,
                             image_tensors=batch.get("vision_images"),
                         )
                     trace_qwen_inputs = qwen_lm_inputs if qwen_lm_inputs is not None else qwen_inputs
@@ -6358,6 +6964,24 @@ def main() -> None:
                         task_ids=batch["task_ids"],
                         qwen_inputs=qwen_inputs,
                         qwen_lm_inputs=qwen_lm_inputs,
+                        pbd_box_counts=(
+                            None
+                            if pbd_supervision is None
+                            else pbd_supervision["box_counts"]
+                        ),
+                        pbd_gt_boxes=(
+                            None
+                            if pbd_supervision is None
+                            else pbd_supervision["gt_boxes"]
+                        ),
+                        pbd_context_scales=(
+                            None
+                            if pbd_supervision is None
+                            else pbd_supervision["context_scales"]
+                        ),
+                        pbd_temperature=float(args.pbd_temperature),
+                        pose_box_grad_scale=float(args.pose_box_grad_scale),
+                        run_pose=not args.locate_grounding_only,
                         target_boxes=target_boxes,
                         target_box_mask=target_box_mask,
                         images=batch.get("images"),
@@ -6372,7 +6996,7 @@ def main() -> None:
                         raise FloatingPointError(
                             f"Non-finite model output before loss at step={global_step} micro={micro_step}: {local_detail}"
                         )
-                    if args.box_source == "person_queries":
+                    if not args.locate_grounding_only and args.box_source == "person_queries":
                         pose_targets = align_targets_to_person_queries(
                             outputs,
                             pose_targets,
@@ -6387,7 +7011,15 @@ def main() -> None:
                         ]
                         for _, tensor in diagnostic_output_tensors:
                             tensor.retain_grad()
-                    if args.person_confidence_rescue:
+                    if args.locate_grounding_only:
+                        floating_outputs = [
+                            tensor for _, tensor in iter_named_floating_tensors(outputs)
+                        ]
+                        if not floating_outputs:
+                            raise RuntimeError("Grounding-only forward returned no floating tensors.")
+                        loss = sum(tensor.sum() * 0.0 for tensor in floating_outputs)
+                        loss_dict = {"loss_total": loss}
+                    elif args.person_confidence_rescue:
                         loss, loss_dict = compute_person_confidence_quality_loss(
                             outputs,
                             pose_targets,
@@ -6399,13 +7031,23 @@ def main() -> None:
                             batch["task_ids"],
                             weights,
                         )
-                    loss_dict.update(
-                        compute_pose_diagnostics(outputs, pose_targets, batch["task_ids"])
-                    )
+                    if not args.locate_grounding_only:
+                        loss_dict.update(
+                            compute_pose_diagnostics(outputs, pose_targets, batch["task_ids"])
+                        )
+                        direct_failure_flags = [
+                            target["locate_direct_grounding_failed"].float()
+                            for target in pose_targets
+                            if torch.is_tensor(target.get("locate_direct_grounding_failed"))
+                        ]
+                        if direct_failure_flags:
+                            loss_dict["locate_direct_grounding_failure_rate"] = torch.stack(
+                                direct_failure_flags
+                            ).mean().to(device=loss.device)
                     if "lm_loss" in outputs:
                         lm_loss = outputs["lm_loss"].float()
                         lm_weight = (
-                            float(args.w_locate_box_lm)
+                            (float(args.w_locate_box_lm) if use_lm_loss else 0.0)
                             if backbone_name == "eagle"
                             else weights.lm
                         )
@@ -6421,6 +7063,40 @@ def main() -> None:
                                 f"weight={lm_weight:g} "
                                 f"contribution={float((lm_weight * lm_loss).detach()):.6f}",
                             )
+                    if "pbd_frame_loss" in outputs:
+                        pbd_ground_loss = (
+                            0.5 * outputs["pbd_frame_loss"].float()
+                            + outputs["pbd_coord_loss"].float()
+                            + 5.0 * outputs["pbd_l1_loss"].float()
+                            + 2.0 * outputs["pbd_giou_loss"].float()
+                            + outputs["pbd_order_loss"].float()
+                        )
+                        pbd_weight = float(args.w_locate_pbd)
+                        loss = loss + pbd_weight * pbd_ground_loss
+                        loss_dict.update(
+                            {
+                                "loss_pbd_ground": pbd_ground_loss,
+                                "loss_pbd_frame": outputs["pbd_frame_loss"].float(),
+                                "loss_pbd_coord": outputs["pbd_coord_loss"].float(),
+                                "loss_pbd_l1": outputs["pbd_l1_loss"].float(),
+                                "loss_pbd_giou": outputs["pbd_giou_loss"].float(),
+                                "loss_pbd_order": outputs["pbd_order_loss"].float(),
+                                "loss_pbd_weight": torch.as_tensor(pbd_weight, device=loss.device),
+                                "pbd_temperature": torch.as_tensor(
+                                    float(args.pbd_temperature),
+                                    device=loss.device,
+                                ),
+                                "pbd_box_count": outputs.get(
+                                    "pbd_box_count",
+                                    torch.zeros((), device=loss.device),
+                                ).float(),
+                                "pose_box_grad_scale": torch.as_tensor(
+                                    float(args.pose_box_grad_scale),
+                                    device=loss.device,
+                                ),
+                            }
+                        )
+                    loss_dict["loss_total"] = loss
 
                 # --- Synchronized loss spike detection ---
                 loss_val = float(loss.detach())

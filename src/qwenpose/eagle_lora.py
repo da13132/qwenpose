@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .qwen_lora import QwenFeatureRefiner, _dtype_from_name
+from .spatial_features import MultiScaleSpatialFeatureBatch, SpatialFeatureBatch
 
 
 @dataclass
@@ -528,31 +529,11 @@ def _locate_image_token_limit(
     return None
 
 
-def build_eagle_inputs(
-    processor,
+def _load_eagle_images(
     image_paths: list[str],
-    prompts: list[str] | None,
-    device: torch.device,
-    image_token_limit: int | None = None,
-    batch_token_limit: int | None = None,
-    image_tensors: list[torch.Tensor] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Build LocateAnything processor inputs from image paths and task prompts.
-
-    Vision-only processors return ``pixel_values`` and ``image_grid_hws`` only.
-    Multimodal processors additionally return ``input_ids`` and ``attention_mask``.
-    The Eagle image processor handles dynamic resolution internally.
-
-    Args:
-        image_token_limit: LocateAnything native raw MoonViT patch-token budget
-            per image. This controls processor.image_processor.in_token_limit.
-        batch_token_limit: Optional raw patch-token budget for the complete local
-            micro batch. It is converted to a conservative per-image limit so a
-            rank cannot receive several maximum-resolution images simultaneously.
-        image_tensors: Optional original-resolution CHW uint8 tensors loaded by
-            the Dataset. When provided, no image file is opened here.
-    """
-    images = []
+    image_tensors: list[torch.Tensor] | None,
+) -> list[Image.Image]:
+    images: list[Image.Image] = []
     if image_tensors is not None:
         if len(image_tensors) != len(image_paths):
             raise ValueError(
@@ -565,70 +546,107 @@ def build_eagle_inputs(
             if array.dtype != torch.uint8:
                 array = array.clamp(0, 255).to(torch.uint8)
             images.append(Image.fromarray(array.permute(1, 2, 0).contiguous().numpy(), mode="RGB"))
-    else:
-        for image_path in image_paths:
-            with Image.open(image_path) as image:
-                images.append(image.convert("RGB").copy())
+        return images
+    for image_path in image_paths:
+        with Image.open(image_path) as image:
+            images.append(image.convert("RGB").copy())
+    return images
 
+
+def _process_eagle_texts(
+    processor,
+    images: list[Image.Image],
+    texts: list[str] | None,
+    device: torch.device,
+    *,
+    image_token_limit: int | None,
+    batch_token_limit: int | None = None,
+) -> dict[str, torch.Tensor]:
     is_vision_only = bool(getattr(processor, "_qwenpose_vision_only", False))
     image_processor = getattr(processor, "image_processor", processor)
     token_limit = _locate_image_token_limit(image_token_limit=image_token_limit)
     if batch_token_limit is not None and int(batch_token_limit) > 0 and images:
-        # LocateAnything pads both dimensions to 2x2 patch multiples after the
-        # area cap. Keep 12.5% headroom for that rounding so the final packed
-        # token count remains close to the requested local-batch budget.
         per_image_batch_limit = max(int(int(batch_token_limit) / len(images) * 0.875), 64)
-        token_limit = (
-            per_image_batch_limit
-            if token_limit is None
-            else min(int(token_limit), per_image_batch_limit)
-        )
+        token_limit = per_image_batch_limit if token_limit is None else min(int(token_limit), per_image_batch_limit)
     old_token_limit = getattr(image_processor, "in_token_limit", None) if image_processor is not None else None
     if image_processor is not None and token_limit is not None:
         image_processor.in_token_limit = int(token_limit)
     try:
-        # Stage 1 uses AutoImageProcessor directly, so it never loads or invokes
-        # the tokenizer. Multimodal Stage 2 keeps the original chat processor.
         if is_vision_only:
             inputs = image_processor(images=images, return_tensors="pt")
         else:
-            if prompts is None:
-                raise ValueError("Multimodal Locate input construction requires prompts.")
-            texts = []
-            for prompt in prompts:
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": prompt},
-                        ],
-                    }
-                ]
-                texts.append(
-                    processor.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                )
-            # LocateAnythingProcessor does not accept Qwen-style
-            # min_pixels/max_pixels kwargs. Its real control knob is
-            # image_processor.in_token_limit.
+            if texts is None:
+                raise ValueError("Multimodal Locate input construction requires text templates.")
             inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
     finally:
         if image_processor is not None and old_token_limit is not None:
             image_processor.in_token_limit = old_token_limit
     result = {}
-    for k, v in inputs.items():
-        if isinstance(v, torch.Tensor):
-            result[k] = v.to(device)
-        elif isinstance(v, np.ndarray):
-            # image_grid_hws: convert to tensor for vision model compatibility
-            result[k] = torch.from_numpy(v).to(device)
+    for key, value in inputs.items():
+        if isinstance(value, torch.Tensor):
+            result[key] = value.to(device)
+        elif isinstance(value, np.ndarray):
+            result[key] = torch.from_numpy(value).to(device)
         else:
-            result[k] = v
+            result[key] = value
     return result
+
+
+def _eagle_user_messages(prompt: str) -> list[dict[str, object]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": str(prompt)},
+            ],
+        }
+    ]
+
+
+def _prefix_mask_from_attention(
+    attention_mask: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+) -> torch.Tensor:
+    active = attention_mask.bool()
+    if active.numel() == 0:
+        return torch.zeros_like(active)
+    ranks = torch.cumsum(active.to(dtype=torch.long), dim=1)
+    lengths = prefix_lengths.to(device=attention_mask.device, dtype=torch.long).clamp(min=0)[:, None]
+    return active & ranks.le(lengths)
+
+
+def build_eagle_inputs(
+    processor,
+    image_paths: list[str],
+    prompts: list[str] | None,
+    device: torch.device,
+    image_token_limit: int | None = None,
+    batch_token_limit: int | None = None,
+    image_tensors: list[torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Build LocateAnything processor inputs from image paths and task prompts."""
+    images = _load_eagle_images(image_paths, image_tensors)
+    texts = None
+    if not bool(getattr(processor, "_qwenpose_vision_only", False)):
+        if prompts is None:
+            raise ValueError("Multimodal Locate input construction requires prompts.")
+        texts = [
+            processor.apply_chat_template(
+                _eagle_user_messages(prompt),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for prompt in prompts
+        ]
+    return _process_eagle_texts(
+        processor,
+        images,
+        texts,
+        device,
+        image_token_limit=image_token_limit,
+        batch_token_limit=batch_token_limit,
+    )
 
 
 def build_eagle_lm_inputs(
@@ -638,49 +656,273 @@ def build_eagle_lm_inputs(
     responses,
     device,
     image_token_limit=None,
+    batch_token_limit=None,
     image_tensors=None,
 ):
-    """Build teacher-forcing inputs for LocateAnything coordinate tokens.
-
-    Only response tokens contribute to the causal-LM loss; image and prompt
-    tokens are masked with ``-100``.  This path intentionally requires the
-    complete LocateAnything model, including its tokenizer and ``lm_head``.
-    """
+    """Build Locate teacher-forcing inputs with only assistant answer tokens supervised."""
     if bool(getattr(processor, "_qwenpose_vision_only", False)):
         raise RuntimeError(
             "Locate grounding LM supervision requires the full LocateAnything "
             "model; vision-only loading is not supported."
         )
-    mixed_prompts = [str(prompt) + " " + str(response) for prompt, response in zip(prompts, responses)]
-    inputs = build_eagle_inputs(
-        processor,
-        image_paths,
-        mixed_prompts,
-        device,
-        image_token_limit=image_token_limit,
-        image_tensors=image_tensors,
-    )
-    prompt_inputs = build_eagle_inputs(
-        processor,
-        image_paths,
-        prompts,
-        device,
-        image_token_limit=image_token_limit,
-        image_tensors=image_tensors,
-    )
-    labels = inputs["input_ids"].clone()
-    prompt_mask = prompt_inputs.get("attention_mask")
-    for row in range(labels.shape[0]):
-        prompt_len = (
-            int(prompt_mask[row].sum().item())
-            if prompt_mask is not None
-            else int(prompt_inputs["input_ids"].shape[1])
+    if not (len(image_paths) == len(prompts) == len(responses)):
+        raise ValueError("image_paths, prompts, and responses must have identical lengths.")
+    images = _load_eagle_images(list(image_paths), image_tensors)
+    prompt_messages = [_eagle_user_messages(str(prompt)) for prompt in prompts]
+    full_messages = [
+        [
+            user_messages[0],
+            {"role": "assistant", "content": str(response)},
+        ]
+        for user_messages, response in zip(prompt_messages, responses)
+    ]
+    prompt_texts = [
+        processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        labels[row, : min(prompt_len, labels.shape[1])] = -100
-    if "attention_mask" in inputs:
-        labels = labels.masked_fill(inputs["attention_mask"].eq(0), -100)
-    inputs["labels"] = labels
-    return inputs
+        for messages in prompt_messages
+    ]
+    full_texts = [
+        processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        for messages in full_messages
+    ]
+    prompt_inputs = _process_eagle_texts(
+        processor,
+        images,
+        prompt_texts,
+        device,
+        image_token_limit=image_token_limit,
+        batch_token_limit=batch_token_limit,
+    )
+    full_inputs = _process_eagle_texts(
+        processor,
+        images,
+        full_texts,
+        device,
+        image_token_limit=image_token_limit,
+        batch_token_limit=batch_token_limit,
+    )
+    prompt_attention = prompt_inputs.get("attention_mask")
+    if prompt_attention is None:
+        prompt_attention = torch.ones_like(prompt_inputs["input_ids"], dtype=torch.long)
+    full_attention = full_inputs.get("attention_mask")
+    if full_attention is None:
+        full_attention = torch.ones_like(full_inputs["input_ids"], dtype=torch.long)
+        full_inputs["attention_mask"] = full_attention
+    prompt_lengths = prompt_attention.sum(dim=1).to(dtype=torch.long)
+    prefix_mask = _prefix_mask_from_attention(full_attention, prompt_lengths)
+    labels = full_inputs["input_ids"].clone()
+    labels = labels.masked_fill(~full_attention.bool(), -100)
+    labels = labels.masked_fill(prefix_mask, -100)
+
+    for row in range(labels.shape[0]):
+        prompt_ids = prompt_inputs["input_ids"][row][prompt_attention[row].bool()]
+        full_ids = full_inputs["input_ids"][row][full_attention[row].bool()]
+        if int(full_ids.numel()) < int(prompt_ids.numel()) or not torch.equal(
+            full_ids[: int(prompt_ids.numel())], prompt_ids
+        ):
+            raise RuntimeError(
+                "Locate chat-template prefix mismatch: assistant response cannot be masked safely."
+            )
+        if not labels[row].ne(-100).any():
+            raise RuntimeError("Locate grounding response produced no supervised assistant tokens.")
+    full_inputs["labels"] = labels
+    return full_inputs
+
+
+def tokenize_eagle_pbd_targets(
+    processor,
+    responses: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Tokenize native Locate box blocks and require one six-token PBD unit."""
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("LocateAnything tokenizer is required for PBD supervision.")
+    rows: list[list[int]] = []
+    for response in responses:
+        encoded = tokenizer(
+            str(response),
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )
+        ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        token_ids = [int(token_id) for token_id in ids]
+        if len(token_ids) != 6:
+            decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
+            raise RuntimeError(
+                "Locate PBD target must tokenize to exactly six tokens; "
+                f"got {len(token_ids)} for {decoded!r}."
+            )
+        rows.append(token_ids)
+    if not rows:
+        return torch.zeros((0, 6), device=device, dtype=torch.long)
+    return torch.tensor(rows, device=device, dtype=torch.long)
+
+
+def extract_eagle_pbd_blocks_from_lm_logits(
+    extractor: "EagleFeatureExtractor",
+    target_logits: torch.Tensor,
+    shift_labels: torch.Tensor,
+    valid_label_mask: torch.Tensor,
+    expected_box_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract every native six-token box block from batched LM supervision.
+
+    ``target_logits`` follows the row-major boolean indexing order of
+    ``shift_labels[valid_label_mask]``.  Keeping the blocks in response order
+    lets ALL_POSE supervise every spatially sorted person while REF_POSE keeps
+    its single referred person.  The returned logits stay attached to the LM
+    graph, so a downstream differentiable box/pose loss can update Locate LoRA.
+    """
+    if target_logits.ndim != 2:
+        raise ValueError(f"Expected flattened LM logits [N,V], got {tuple(target_logits.shape)}")
+    if shift_labels.shape != valid_label_mask.shape:
+        raise ValueError("Shifted LM labels and valid-label mask must have identical shapes.")
+    if int(expected_box_counts.numel()) != int(shift_labels.shape[0]):
+        raise ValueError("PBD box counts must contain one value per LM batch row.")
+
+    base = get_eagle_base_model(extractor.eagle_model)
+    box_start = int(base.token_ids["box_start_token_id"])
+    box_end = int(base.token_ids["box_end_token_id"])
+    coord_start = int(base.token_ids["coord_start_token_id"])
+    coord_end = int(base.token_ids["coord_end_token_id"])
+    flat_ranks = (
+        valid_label_mask.to(dtype=torch.long).reshape(-1).cumsum(dim=0) - 1
+    ).view_as(valid_label_mask)
+    logit_blocks: list[torch.Tensor] = []
+    target_blocks: list[torch.Tensor] = []
+
+    for row in range(int(shift_labels.shape[0])):
+        active_positions = torch.nonzero(valid_label_mask[row], as_tuple=False).flatten()
+        active_ids = shift_labels[row, active_positions]
+        row_blocks = 0
+        cursor = 0
+        while cursor + 5 < int(active_ids.numel()):
+            candidate = active_ids[cursor : cursor + 6]
+            is_box = bool(
+                candidate[0].eq(box_start).item()
+                and candidate[5].eq(box_end).item()
+                and candidate[1:5].ge(coord_start).all().item()
+                and candidate[1:5].le(coord_end).all().item()
+            )
+            if not is_box:
+                cursor += 1
+                continue
+            positions = active_positions[cursor : cursor + 6]
+            ranks = flat_ranks[row, positions]
+            logit_blocks.append(target_logits.index_select(0, ranks))
+            target_blocks.append(candidate)
+            row_blocks += 1
+            cursor += 6
+        expected = int(expected_box_counts[row].detach().cpu().item())
+        if row_blocks != expected:
+            raise RuntimeError(
+                "Locate LM/PBD box-block mismatch: "
+                f"row={row}, expected={expected}, extracted={row_blocks}."
+            )
+
+    total_expected = int(expected_box_counts.sum().detach().cpu().item())
+    if len(logit_blocks) != total_expected:
+        raise RuntimeError(
+            f"Expected {total_expected} batched PBD boxes, extracted {len(logit_blocks)}."
+        )
+    if not logit_blocks:
+        return (
+            target_logits.new_zeros((0, 6, int(target_logits.shape[-1]))),
+            shift_labels.new_zeros((0, 6)),
+        )
+    return torch.stack(logit_blocks, dim=0), torch.stack(target_blocks, dim=0)
+
+
+def _aligned_generalized_box_iou_loss(
+    boxes1: torch.Tensor,
+    boxes2: torch.Tensor,
+) -> torch.Tensor:
+    """Mean aligned GIoU loss for normalized xyxy boxes."""
+    left_top = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+    right_bottom = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+    intersection_wh = (right_bottom - left_top).clamp(min=0.0)
+    intersection = intersection_wh[:, 0] * intersection_wh[:, 1]
+    area1_wh = (boxes1[:, 2:] - boxes1[:, :2]).clamp(min=0.0)
+    area2_wh = (boxes2[:, 2:] - boxes2[:, :2]).clamp(min=0.0)
+    area1 = area1_wh[:, 0] * area1_wh[:, 1]
+    area2 = area2_wh[:, 0] * area2_wh[:, 1]
+    union = (area1 + area2 - intersection).clamp(min=1e-8)
+    iou = intersection / union
+    enclosing_left_top = torch.minimum(boxes1[:, :2], boxes2[:, :2])
+    enclosing_right_bottom = torch.maximum(boxes1[:, 2:], boxes2[:, 2:])
+    enclosing_wh = (enclosing_right_bottom - enclosing_left_top).clamp(min=0.0)
+    enclosing = (enclosing_wh[:, 0] * enclosing_wh[:, 1]).clamp(min=1e-8)
+    giou = iou - (enclosing - union) / enclosing
+    return (1.0 - giou).mean()
+
+
+def compute_eagle_pbd_grounding_losses(
+    extractor: "EagleFeatureExtractor",
+    pbd_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    temperature: float = 1.0,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Supervise the exact six-position PBD path and return its soft legal boxes."""
+    if target_ids.shape != pbd_logits.shape[:2]:
+        raise ValueError(
+            f"PBD target shape {tuple(target_ids.shape)} does not match logits {tuple(pbd_logits.shape)}"
+        )
+    if gt_boxes.shape != (int(pbd_logits.shape[0]), 4):
+        raise ValueError(f"Expected PBD GT boxes [B,4], got {tuple(gt_boxes.shape)}")
+    if int(pbd_logits.shape[0]) == 0:
+        anchor = pbd_logits.sum() * 0.0
+        return {
+            "pbd_frame_loss": anchor,
+            "pbd_coord_loss": anchor,
+            "pbd_l1_loss": anchor,
+            "pbd_giou_loss": anchor,
+            "pbd_order_loss": anchor,
+        }, gt_boxes.to(device=pbd_logits.device, dtype=pbd_logits.dtype).reshape(0, 4)
+    base = get_eagle_base_model(extractor.eagle_model)
+    box_start = int(base.token_ids["box_start_token_id"])
+    box_end = int(base.token_ids["box_end_token_id"])
+    if not bool(target_ids[:, 0].eq(box_start).all().item()):
+        raise RuntimeError("PBD target position 0 is not LocateAnything's box-start token.")
+    if not bool(target_ids[:, 5].eq(box_end).all().item()):
+        raise RuntimeError("PBD target position 5 is not LocateAnything's box-end token.")
+    frame_loss = 0.5 * (
+        F.cross_entropy(pbd_logits[:, 0, :], target_ids[:, 0])
+        + F.cross_entropy(pbd_logits[:, 5, :], target_ids[:, 5])
+    )
+    coord_loss = F.cross_entropy(
+        pbd_logits[:, 1:5, :].reshape(-1, pbd_logits.shape[-1]),
+        target_ids[:, 1:5].reshape(-1),
+    )
+    raw_boxes, legal_boxes = extractor.decode_pbd_soft_boxes(
+        pbd_logits,
+        temperature=temperature,
+    )
+    gt_boxes = gt_boxes.to(device=legal_boxes.device, dtype=legal_boxes.dtype).clamp(0.0, 1.0)
+    l1_loss = F.smooth_l1_loss(raw_boxes, gt_boxes)
+    giou_loss = _aligned_generalized_box_iou_loss(legal_boxes, gt_boxes)
+    x1, y1, x2, y2 = raw_boxes.unbind(dim=-1)
+    order_loss = (
+        F.relu(x1 - x2 + 0.01)
+        + F.relu(y1 - y2 + 0.01)
+    ).mean()
+    return {
+        "pbd_frame_loss": frame_loss,
+        "pbd_coord_loss": coord_loss,
+        "pbd_l1_loss": l1_loss,
+        "pbd_giou_loss": giou_loss,
+        "pbd_order_loss": order_loss,
+    }, legal_boxes
 
 
 class EagleFeatureExtractor(nn.Module):
@@ -698,7 +940,6 @@ class EagleFeatureExtractor(nn.Module):
     def __init__(
         self,
         eagle_model: nn.Module,
-        output_size: int = 32,
         refiner_layers: int = 0,
         refiner_bottleneck_dim: int = 256,
         refiner_init_scale: float = 0.1,
@@ -706,7 +947,6 @@ class EagleFeatureExtractor(nn.Module):
     ) -> None:
         super().__init__()
         self.eagle_model = eagle_model
-        self.output_size = output_size
         self.feature_source = str(feature_source)
         if self.feature_source not in {"vision_only", "raw_visual"}:
             raise ValueError(
@@ -714,7 +954,6 @@ class EagleFeatureExtractor(nn.Module):
                 "expected 'vision_only' or 'raw_visual'."
             )
         hidden_size = eagle_hidden_size(eagle_model)
-        self.raw_feature_norm = nn.LayerNorm(hidden_size)
         self.feature_refiner = QwenFeatureRefiner(
             hidden_size,
             num_layers=refiner_layers,
@@ -727,23 +966,72 @@ class EagleFeatureExtractor(nn.Module):
         eagle_inputs: dict[str, torch.Tensor],
         freeze_eagle: bool = False,
         require_text: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Stage 1 skips the 3B language model entirely. Stage 2/3 use
-        # ``raw_visual`` so the full model and language LoRA are available while
-        # the PoseHead still receives exactly the same MoonViT feature type.
+    ) -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor]:
+        # P2 is the true MoonViT pre-merger grid. P3 is the existing projected
+        # post-merger Locate grid. Only P3 keeps the legacy feature refiner;
+        # PoseHead owns the independent P2/P3 channel projections.
         if self.feature_source == "vision_only" or not bool(require_text):
-            raw_maps, text_embed = self._extract_eagle_vision_features(
+            raw_levels, text_embed = self._extract_eagle_vision_features(
                 eagle_inputs,
                 freeze_backbone=bool(freeze_eagle),
             )
         else:
-            raw_maps, _, text_embed = self._extract_eagle_feature_maps(
+            raw_levels, text_embed = self._extract_eagle_feature_maps(
                 eagle_inputs,
                 freeze_backbone=bool(freeze_eagle),
             )
-        visual_map = self.normalize_raw_feature_maps(raw_maps)
-        visual_map = self.feature_refiner(visual_map)
-        return visual_map, text_embed
+        p2, p3 = raw_levels.levels
+        p3 = p3.map_samples(self.feature_refiner)
+        return MultiScaleSpatialFeatureBatch((p2, p3)), text_embed
+
+    def forward_with_vision_cache(
+        self,
+        eagle_inputs: dict[str, torch.Tensor],
+        freeze_eagle: bool = False,
+        require_text: bool = True,
+    ) -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor, list[torch.Tensor]]:
+        """Extract P2/P3 pose features and retain projected P3 tokens for the LM."""
+        _, input_ids, attention_mask, pixel_values, image_grid_hws = self._prepare_locate_inputs(
+            eagle_inputs
+        )
+
+        def extract() -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor, list[torch.Tensor]]:
+            premerge_list, _, projected_vit_list, projected_vit = (
+                self.run_multiscale_vision_tokens(pixel_values, image_grid_hws)
+            )
+            p2_maps = self.build_premerge_feature_maps(image_grid_hws, premerge_list)
+            if self.feature_source == "vision_only" or not bool(require_text):
+                p3_maps = self.build_raw_feature_maps(image_grid_hws, projected_vit_list)
+                hidden_size = int(p3_maps.shape[1])
+                text_embed = p3_maps.new_zeros((len(projected_vit_list), hidden_size))
+            else:
+                if input_ids is None:
+                    raise ValueError("Multimodal Locate feature extraction requires input_ids.")
+                hidden = self.run_language_hidden(
+                    input_ids,
+                    attention_mask,
+                    projected_vit,
+                )
+                p3_maps, text_embed = self.build_feature_maps(
+                    input_ids,
+                    attention_mask,
+                    image_grid_hws,
+                    projected_vit_list,
+                    hidden,
+                )
+            return MultiScaleSpatialFeatureBatch((p2_maps, p3_maps)), text_embed, projected_vit_list
+
+        if freeze_eagle:
+            with torch.no_grad():
+                raw_levels, text_embed, projected_vit_list = extract()
+            raw_levels = raw_levels.detach()
+            text_embed = text_embed.detach()
+            projected_vit_list = [tokens.detach() for tokens in projected_vit_list]
+        else:
+            raw_levels, text_embed, projected_vit_list = extract()
+        p2, p3 = raw_levels.levels
+        p3 = p3.map_samples(self.feature_refiner)
+        return MultiScaleSpatialFeatureBatch((p2, p3)), text_embed, projected_vit_list
 
     def _prepare_locate_inputs(
         self,
@@ -762,17 +1050,101 @@ class EagleFeatureExtractor(nn.Module):
             image_grid_hws = image_grid_hws.to(device=pixel_values.device, dtype=torch.long)
         return base, input_ids, attention_mask, pixel_values, image_grid_hws
 
+    def run_multiscale_vision_tokens(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_hws: torch.Tensor | None,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+        """Run MoonViT once and expose true pre-merger P2 plus legacy merged P3."""
+        if image_grid_hws is None:
+            raise ValueError("MoonViT multi-scale extraction requires image_grid_hws.")
+        base = get_eagle_base_model(self.eagle_model)
+        vision_model = base.vision_model
+        grid_rows = image_grid_hws.detach().cpu().tolist()
+        merge_kernel = getattr(vision_model, "merge_kernel_size", (2, 2))
+        merge_h = max(int(merge_kernel[0]), 1)
+        merge_w = max(int(merge_kernel[1]), 1)
+        premerge_list: list[torch.Tensor] = []
+        merged_list: list[torch.Tensor] = []
+
+        if hasattr(vision_model, "patch_embed") and hasattr(vision_model, "encoder"):
+            hidden_states = vision_model.patch_embed(pixel_values, image_grid_hws)
+            hidden_states = vision_model.encoder(hidden_states, image_grid_hws)
+            offset = 0
+            for raw_h, raw_w in grid_rows:
+                raw_h = int(raw_h)
+                raw_w = int(raw_w)
+                count = raw_h * raw_w
+                tokens = hidden_states[offset : offset + count]
+                if int(tokens.shape[0]) != count:
+                    raise ValueError(
+                        "MoonViT pre-merger token/grid mismatch: "
+                        f"tokens={int(tokens.shape[0])}, grid={raw_h}x{raw_w}."
+                    )
+                if raw_h % merge_h != 0 or raw_w % merge_w != 0:
+                    raise ValueError(
+                        "MoonViT grid must be divisible by its spatial merger: "
+                        f"grid={raw_h}x{raw_w}, merger={merge_h}x{merge_w}."
+                    )
+                premerge_list.append(tokens)
+                merged = tokens.view(
+                    raw_h // merge_h,
+                    merge_h,
+                    raw_w // merge_w,
+                    merge_w,
+                    int(tokens.shape[-1]),
+                )
+                merged = merged.permute(0, 2, 1, 3, 4).contiguous().view(
+                    (raw_h // merge_h) * (raw_w // merge_w), -1
+                )
+                merged_list.append(merged)
+                offset += count
+            if offset != int(hidden_states.shape[0]):
+                raise ValueError(
+                    "MoonViT batch token/grid mismatch after splitting: "
+                    f"consumed={offset}, total={int(hidden_states.shape[0])}."
+                )
+        else:
+            # Some lightweight wrappers expose only extract_feature(). The
+            # Locate merger is a lossless 2x2 channel concatenation, so invert
+            # it exactly to recover the pre-merger grid instead of upsampling.
+            merged_output = base.extract_feature(pixel_values, image_grid_hws)
+            merged_list = (
+                list(merged_output)
+                if isinstance(merged_output, (list, tuple))
+                else [merged_output]
+            )
+            if len(merged_list) != len(grid_rows):
+                raise ValueError("MoonViT merged feature batch/grid count mismatch.")
+            for merged, (raw_h, raw_w) in zip(merged_list, grid_rows):
+                raw_h = int(raw_h)
+                raw_w = int(raw_w)
+                merged_h = raw_h // merge_h
+                merged_w = raw_w // merge_w
+                channels = int(merged.shape[-1])
+                kernel_area = merge_h * merge_w
+                if channels % kernel_area != 0:
+                    raise ValueError("Cannot invert MoonViT spatial merger channel layout.")
+                hidden_dim = channels // kernel_area
+                premerge = merged.view(
+                    merged_h, merged_w, merge_h, merge_w, hidden_dim
+                ).permute(0, 2, 1, 3, 4).contiguous().view(
+                    raw_h * raw_w, hidden_dim
+                )
+                premerge_list.append(premerge)
+        projected_vit_list = [base.mlp1(tokens) for tokens in merged_list]
+        projected_vit = torch.cat(projected_vit_list, dim=0)
+        return premerge_list, merged_list, projected_vit_list, projected_vit
+
     def run_vision_tokens(
         self,
         pixel_values: torch.Tensor,
         image_grid_hws: torch.Tensor | None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
-        base = get_eagle_base_model(self.eagle_model)
-        vit_embeds = base.extract_feature(pixel_values, image_grid_hws)
-        vit_embeds_list = vit_embeds if isinstance(vit_embeds, list) else [vit_embeds]
-        projected_vit_list = [base.mlp1(vit_embeds) for vit_embeds in vit_embeds_list]
-        projected_vit = torch.cat(projected_vit_list, dim=0)
-        return vit_embeds_list, projected_vit_list, projected_vit
+        _, merged_list, projected_vit_list, projected_vit = (
+            self.run_multiscale_vision_tokens(pixel_values, image_grid_hws)
+        )
+        return merged_list, projected_vit_list, projected_vit
 
     def _ensure_safe_image_processing(self, lm: nn.Module) -> None:
         qwen_model = getattr(lm, "model", None)
@@ -810,6 +1182,7 @@ class EagleFeatureExtractor(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         projected_visual_tokens: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         base = get_eagle_base_model(self.eagle_model)
         image_token_id = int(base.image_token_index)
@@ -825,6 +1198,7 @@ class EagleFeatureExtractor(nn.Module):
             visual_features=projected_visual_tokens,
             image_token_index=image_token_id,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             use_cache=False,
             output_hidden_states=False,
             return_dict=True,
@@ -832,6 +1206,104 @@ class EagleFeatureExtractor(nn.Module):
         if was_training:
             lm.train()
         return lm_outputs.last_hidden_state
+
+    def forward_pbd_logits(
+        self,
+        eagle_inputs: dict[str, torch.Tensor],
+        n_future_tokens: int = 6,
+        projected_visual_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run LocateAnything's first differentiable MTP/PBD decoding step."""
+        if int(n_future_tokens) != 6:
+            raise ValueError("LocateAnything box PBD requires exactly six future tokens.")
+        base, input_ids, attention_mask, pixel_values, image_grid_hws = self._prepare_locate_inputs(
+            eagle_inputs
+        )
+        if input_ids is None:
+            raise ValueError("Differentiable Locate PBD requires multimodal input_ids.")
+        if int(input_ids.shape[0]) != 1:
+            raise ValueError("Differentiable Locate PBD currently requires one sample per input dict.")
+        if eagle_generation_is_pruned(self.eagle_model):
+            raise RuntimeError("Differentiable Locate PBD requires the unpruned lm_head.")
+        expected_image_tokens = int(input_ids.eq(int(base.image_token_index)).sum().item())
+        if (
+            projected_visual_tokens is None
+            or int(projected_visual_tokens.reshape(-1, projected_visual_tokens.shape[-1]).shape[0])
+            != expected_image_tokens
+        ):
+            _, _, projected_visual_tokens = self.run_vision_tokens(pixel_values, image_grid_hws)
+        mask_token_id = int(base.token_ids["default_mask_token_id"])
+        mask_tokens = torch.full(
+            (1, n_future_tokens - 1),
+            mask_token_id,
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+        mtp_input_ids = torch.cat(
+            [input_ids, input_ids[:, -1:], mask_tokens],
+            dim=1,
+        )
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        mtp_attention_mask = torch.cat(
+            [
+                attention_mask,
+                torch.ones(
+                    (1, n_future_tokens),
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                ),
+            ],
+            dim=1,
+        )
+        position_ids = torch.arange(
+            mtp_input_ids.shape[1],
+            device=mtp_input_ids.device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+        position_ids[:, -n_future_tokens:] -= 1
+        hidden = self.run_language_hidden(
+            mtp_input_ids,
+            mtp_attention_mask,
+            projected_visual_tokens,
+            position_ids=position_ids,
+        )
+        return base.language_model.lm_head(hidden[:, -n_future_tokens:, :]).float()
+
+    def decode_pbd_soft_boxes(
+        self,
+        pbd_logits: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode PBD coordinate logits into raw and legal differentiable xyxy boxes."""
+        if pbd_logits.ndim != 3 or int(pbd_logits.shape[1]) != 6:
+            raise ValueError(f"Expected [B,6,V] PBD logits, got {tuple(pbd_logits.shape)}")
+        if float(temperature) <= 0.0:
+            raise ValueError("PBD temperature must be positive.")
+        base = get_eagle_base_model(self.eagle_model)
+        coord_start = int(base.token_ids["coord_start_token_id"])
+        coord_end = int(base.token_ids["coord_end_token_id"])
+        coord_logits = pbd_logits[:, 1:5, coord_start : coord_end + 1]
+        coord_probs = torch.softmax(coord_logits / float(temperature), dim=-1)
+        coord_values = torch.linspace(
+            0.0,
+            1.0,
+            coord_end - coord_start + 1,
+            device=coord_probs.device,
+            dtype=coord_probs.dtype,
+        )
+        raw_boxes = (coord_probs * coord_values.view(1, 1, -1)).sum(dim=-1)
+        x1, y1, x2, y2 = raw_boxes.unbind(dim=-1)
+        legal_boxes = torch.stack(
+            [
+                torch.minimum(x1, x2),
+                torch.minimum(y1, y2),
+                torch.maximum(x1, x2),
+                torch.maximum(y1, y2),
+            ],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+        return raw_boxes, legal_boxes
 
     def run_language_prefill(
         self,
@@ -864,11 +1336,41 @@ class EagleFeatureExtractor(nn.Module):
             past_key_values = past_key_values.to_legacy_cache()
         return lm_outputs.hidden_states[-1], past_key_values
 
+    def build_premerge_feature_maps(
+        self,
+        image_grid_hws: torch.Tensor | np.ndarray | None,
+        premerge_vit_list: list[torch.Tensor],
+    ) -> SpatialFeatureBatch:
+        """Restore the true MoonViT encoder grid before the 2x2 spatial merger."""
+        if isinstance(image_grid_hws, torch.Tensor):
+            grid_hws_np = image_grid_hws.detach().cpu().numpy()
+        elif isinstance(image_grid_hws, np.ndarray):
+            grid_hws_np = image_grid_hws
+        else:
+            grid_hws_np = None
+        if grid_hws_np is None:
+            raise ValueError("Pre-merger feature maps require image_grid_hws.")
+        maps: list[torch.Tensor] = []
+        for batch_idx, tokens in enumerate(premerge_vit_list):
+            if batch_idx >= len(grid_hws_np):
+                raise ValueError("Missing MoonViT grid shape for a pre-merger feature sample.")
+            raw_h = max(int(grid_hws_np[batch_idx][0]), 1)
+            raw_w = max(int(grid_hws_np[batch_idx][1]), 1)
+            expected = raw_h * raw_w
+            if int(tokens.shape[0]) != expected:
+                raise ValueError(
+                    "MoonViT pre-merger token/grid mismatch: "
+                    f"sample={batch_idx}, tokens={int(tokens.shape[0])}, "
+                    f"grid={raw_h}x{raw_w}."
+                )
+            maps.append(tokens.float().view(raw_h, raw_w, -1).permute(2, 0, 1))
+        return SpatialFeatureBatch.from_maps(maps)
+
     def build_raw_feature_maps(
         self,
         image_grid_hws: torch.Tensor | np.ndarray | None,
         projected_vit_list: list[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> SpatialFeatureBatch:
         base = get_eagle_base_model(self.eagle_model)
         if isinstance(image_grid_hws, torch.Tensor):
             grid_hws_np = image_grid_hws.detach().cpu().numpy()
@@ -899,22 +1401,8 @@ class EagleFeatureExtractor(nn.Module):
                     f"raw_grid={None if grid_hws_np is None else grid_hws_np[batch_idx].tolist()}, "
                     f"merge_kernel={merge_h}x{merge_w}."
                 )
-            raw_map = raw_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
-            raw_map = F.interpolate(
-                raw_map,
-                size=(self.output_size, self.output_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-            raw_maps.append(raw_map.squeeze(0))
-        return torch.stack(raw_maps, dim=0)
-
-    def normalize_raw_feature_maps(self, raw_maps: torch.Tensor) -> torch.Tensor:
-        adapter_param = self.raw_feature_norm.weight
-        raw_maps = raw_maps.to(device=adapter_param.device, dtype=adapter_param.dtype)
-        b, c, h, w = raw_maps.shape
-        raw_tokens = raw_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        return self.raw_feature_norm(raw_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
+            raw_maps.append(raw_tokens.float().view(h, w, -1).permute(2, 0, 1))
+        return SpatialFeatureBatch.from_maps(raw_maps)
 
     def build_feature_maps(
         self,
@@ -923,7 +1411,7 @@ class EagleFeatureExtractor(nn.Module):
         image_grid_hws: torch.Tensor | np.ndarray | None,
         projected_vit_list: list[torch.Tensor],
         hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[SpatialFeatureBatch, torch.Tensor]:
         base = get_eagle_base_model(self.eagle_model)
         image_token_id = int(base.image_token_index)
         image_mask = input_ids == image_token_id
@@ -966,20 +1454,16 @@ class EagleFeatureExtractor(nn.Module):
                     f"merge_kernel={merge_h}x{merge_w}."
                 )
 
-            raw_map = raw_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
-            lm_map = lm_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
-            raw_map = F.interpolate(raw_map, size=(self.output_size, self.output_size), mode="bilinear", align_corners=False)
-            lm_map = F.interpolate(lm_map, size=(self.output_size, self.output_size), mode="bilinear", align_corners=False)
-            visual_maps.append((raw_map.squeeze(0), lm_map.squeeze(0)))
-        raw_maps = torch.stack([item[0] for item in visual_maps], dim=0)
-        lm_maps = torch.stack([item[1] for item in visual_maps], dim=0)
+            raw_map = raw_tokens.float().view(h, w, -1).permute(2, 0, 1)
+            visual_maps.append(raw_map)
+        raw_maps = SpatialFeatureBatch.from_maps(visual_maps)
 
         non_image = ~image_mask
         if attention_mask is not None:
             non_image = non_image & attention_mask.bool()
         text_mask = non_image.float().unsqueeze(-1)
         text_embed = (hidden * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp(min=1.0)
-        return raw_maps, lm_maps, text_embed
+        return raw_maps, text_embed
 
     @staticmethod
     def _cache_seq_len(past_key_values: object) -> int:
@@ -1005,7 +1489,7 @@ class EagleFeatureExtractor(nn.Module):
         generation_mode: str = "hybrid",
         n_future_tokens: int = 6,
         **generate_kwargs,
-    ) -> tuple[str, torch.Tensor, torch.Tensor]:
+    ) -> tuple[str, SpatialFeatureBatch, torch.Tensor]:
         """Generate LocateAnything text while reusing the prompt prefill features.
 
         This mirrors LocateAnythingForConditionalGeneration.generate(), but the
@@ -1061,14 +1545,14 @@ class EagleFeatureExtractor(nn.Module):
         with torch.inference_mode():
             _, projected_vit_list, projected_vit = self.run_vision_tokens(pixel_values, image_grid_hws)
             hidden, past_key_values = self.run_language_prefill(input_ids, attention_mask, projected_vit)
-            raw_maps, lm_maps, text_embed = self.build_feature_maps(
+            raw_maps, text_embed = self.build_feature_maps(
                 input_ids,
                 attention_mask,
                 image_grid_hws,
                 projected_vit_list,
                 hidden,
             )
-            feature_map = self.feature_refiner(self.normalize_raw_feature_maps(raw_maps))
+            feature_map = raw_maps.map_samples(self.feature_refiner)
 
             generated = input_ids.clone()
             tokenizer_max_length = int(getattr(tokenizer, "model_max_length", seq_len + int(max_new_tokens)))
@@ -1180,47 +1664,57 @@ class EagleFeatureExtractor(nn.Module):
         self,
         eagle_inputs: dict[str, torch.Tensor],
         freeze_backbone: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        _, input_ids, _, pixel_values, image_grid_hws = self._prepare_locate_inputs(eagle_inputs)
+    ) -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor]:
+        _, _, _, pixel_values, image_grid_hws = self._prepare_locate_inputs(eagle_inputs)
 
-        def extract() -> tuple[torch.Tensor, torch.Tensor]:
-            _, projected_vit_list, _ = self.run_vision_tokens(pixel_values, image_grid_hws)
-            raw_maps = self.build_raw_feature_maps(image_grid_hws, projected_vit_list)
-            hidden_size = int(raw_maps.shape[1])
+        def extract() -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor]:
+            premerge_list, _, projected_vit_list, _ = self.run_multiscale_vision_tokens(
+                pixel_values, image_grid_hws
+            )
+            p2_maps = self.build_premerge_feature_maps(image_grid_hws, premerge_list)
+            p3_maps = self.build_raw_feature_maps(image_grid_hws, projected_vit_list)
+            hidden_size = int(p3_maps.shape[1])
             batch_size = len(projected_vit_list)
-            text_embed = raw_maps.new_zeros((batch_size, hidden_size))
-            return raw_maps, text_embed
+            text_embed = p3_maps.new_zeros((batch_size, hidden_size))
+            return MultiScaleSpatialFeatureBatch((p2_maps, p3_maps)), text_embed
 
         if freeze_backbone:
             with torch.no_grad():
-                raw_maps, text_embed = extract()
-            return raw_maps.detach(), text_embed.detach()
+                raw_levels, text_embed = extract()
+            return raw_levels.detach(), text_embed.detach()
         return extract()
 
     def _extract_eagle_feature_maps(
         self,
         eagle_inputs: dict[str, torch.Tensor],
         freeze_backbone: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor]:
         _, input_ids, attention_mask, pixel_values, image_grid_hws = self._prepare_locate_inputs(eagle_inputs)
         if input_ids is None:
             raise ValueError("Multimodal Locate feature extraction requires input_ids.")
+
+        def extract() -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor]:
+            premerge_list, _, projected_vit_list, projected_vit = (
+                self.run_multiscale_vision_tokens(pixel_values, image_grid_hws)
+            )
+            hidden = self.run_language_hidden(input_ids, attention_mask, projected_vit)
+            p2_maps = self.build_premerge_feature_maps(image_grid_hws, premerge_list)
+            p3_maps, text_embed = self.build_feature_maps(
+                input_ids,
+                attention_mask,
+                image_grid_hws,
+                projected_vit_list,
+                hidden,
+            )
+            return MultiScaleSpatialFeatureBatch((p2_maps, p3_maps)), text_embed
+
         if freeze_backbone:
             with torch.no_grad():
-                _, projected_vit_list, projected_vit = self.run_vision_tokens(pixel_values, image_grid_hws)
-                hidden = self.run_language_hidden(input_ids, attention_mask, projected_vit)
-                raw_maps, lm_maps, text_embed = self.build_feature_maps(
-                    input_ids,
-                    attention_mask,
-                    image_grid_hws,
-                    projected_vit_list,
-                    hidden,
-                )
-            return raw_maps.detach(), lm_maps.detach(), text_embed.detach()
-        _, projected_vit_list, projected_vit = self.run_vision_tokens(pixel_values, image_grid_hws)
-        hidden = self.run_language_hidden(input_ids, attention_mask, projected_vit)
-        return self.build_feature_maps(input_ids, attention_mask, image_grid_hws, projected_vit_list, hidden)
+                raw_levels, text_embed = extract()
+            return raw_levels.detach(), text_embed.detach()
+        return extract()
 
-    def _extract_eagle_features(self, eagle_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        raw_maps, _, text_embed = self._extract_eagle_feature_maps(eagle_inputs, freeze_backbone=False)
-        return self.normalize_raw_feature_maps(raw_maps), text_embed
+    def _extract_eagle_features(
+        self, eagle_inputs: dict[str, torch.Tensor]
+    ) -> tuple[MultiScaleSpatialFeatureBatch, torch.Tensor]:
+        return self._extract_eagle_feature_maps(eagle_inputs, freeze_backbone=False)

@@ -11,8 +11,9 @@ from typing import Optional
 import numpy as np
 import torch
 from torch import nn
-import torch.nn.functional as F
 from transformers import BatchFeature
+
+from qwenpose.spatial_features import SpatialFeatureBatch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
@@ -387,12 +388,9 @@ class LocateAnythingVLLMForConditionalGeneration(
 
         from qwenpose.qwen_lora import QwenFeatureRefiner
 
-        feature_size = int(os.environ.get("QWENPOSE_VLLM_FEATURE_SIZE", "100"))
         refiner_layers = int(os.environ.get("QWENPOSE_VLLM_FEATURE_REFINER_LAYERS", "2"))
         refiner_bottleneck_dim = int(os.environ.get("QWENPOSE_VLLM_FEATURE_REFINER_BOTTLENECK_DIM", "256"))
         refiner_init_scale = float(os.environ.get("QWENPOSE_VLLM_FEATURE_REFINER_INIT_SCALE", "0.1"))
-        self.qwenpose_feature_size = feature_size
-        self.raw_feature_norm = nn.LayerNorm(llm_hidden_size)
         self.feature_refiner = QwenFeatureRefiner(
             llm_hidden_size,
             num_layers=refiner_layers,
@@ -412,10 +410,12 @@ class LocateAnythingVLLMForConditionalGeneration(
         self._qwenpose_feature_cache.clear()
         self._qwenpose_last_input_ids = None
 
-    def pop_qwenpose_feature_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def pop_qwenpose_feature_cache(self) -> tuple[SpatialFeatureBatch, torch.Tensor]:
         if not self._qwenpose_feature_cache:
             raise RuntimeError("vLLM LocateAnything produced no cached qwenpose features.")
-        feature_map = torch.cat([item["feature_map"] for item in self._qwenpose_feature_cache], dim=0)
+        feature_map = SpatialFeatureBatch.from_maps(
+            [item["feature_map"].squeeze(0) for item in self._qwenpose_feature_cache]
+        )
         text_embed = torch.cat([item["text_embed"] for item in self._qwenpose_feature_cache], dim=0)
         self._qwenpose_feature_cache.clear()
         return feature_map, text_embed
@@ -425,7 +425,6 @@ class LocateAnythingVLLMForConditionalGeneration(
         extractor_state = checkpoint.get("backbone_extractor", checkpoint.get("qwen_extractor"))
         if isinstance(extractor_state, Mapping):
             adapter_prefixes = (
-                "raw_feature_norm.",
                 "feature_refiner.",
             )
             adapter_state = {
@@ -446,12 +445,9 @@ class LocateAnythingVLLMForConditionalGeneration(
 
         hidden_size = int(self.config.text_config.hidden_size)
         saved_pose_config = checkpoint.get("pose_config") or {}
-        if (
-            "pose_pyramid_channels" not in saved_pose_config
-            or int(saved_pose_config.get("rgb_input_size", 0)) != 800
-        ):
+        if saved_pose_config.get("use_native_spatial_features") is not True:
             raise ValueError(
-                "The vLLM checkpoint predates the unified 800x800 pose pyramid. "
+                "The vLLM checkpoint predates native-grid Locate pose features. "
                 "Train a new Stage1 checkpoint before vLLM export."
             )
         pose_config_kwargs = {
@@ -473,13 +469,6 @@ class LocateAnythingVLLMForConditionalGeneration(
         self.qwenpose_pose_model = pose_model
         self._qwenpose_pose_loaded = True
         print(f"[qwenpose vLLM] loaded PoseHead from {checkpoint_path}", flush=True)
-
-    def _normalize_qwenpose_raw_feature_maps(self, raw_maps: torch.Tensor) -> torch.Tensor:
-        adapter_param = self.raw_feature_norm.weight
-        raw_maps = raw_maps.to(device=adapter_param.device, dtype=adapter_param.dtype)
-        b, c, h, w = raw_maps.shape
-        raw_tokens = raw_maps.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        return self.raw_feature_norm(raw_tokens).view(b, h, w, c).permute(0, 3, 1, 2)
 
     def _cache_qwenpose_prefill_features(
         self,
@@ -539,10 +528,7 @@ class LocateAnythingVLLMForConditionalGeneration(
                     f"merged_grid={h}x{w}, raw_grid={grid_hw}, merge_kernel={merge_h}x{merge_w}."
                 )
             raw_map = raw_tokens.float().view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
-            raw_map = F.interpolate(raw_map, size=(self.qwenpose_feature_size, self.qwenpose_feature_size), mode="bilinear", align_corners=False)
-            feature_map = self.feature_refiner(
-                self._normalize_qwenpose_raw_feature_maps(raw_map)
-            )
+            feature_map = self.feature_refiner(raw_map)
             non_image = ~image_mask
             text_mask = non_image.float().to(device=hidden_states.device).unsqueeze(-1)
             seq_hidden = hidden[left:right]
@@ -563,7 +549,7 @@ class LocateAnythingVLLMForConditionalGeneration(
         target_boxes: torch.Tensor,
         target_box_mask: torch.Tensor,
         images: torch.Tensor | None,
-        external_feature_map: torch.Tensor,
+        external_feature_map: torch.Tensor | SpatialFeatureBatch,
         external_text_embed: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         if self.qwenpose_pose_model is None:
@@ -752,7 +738,6 @@ class LocateAnythingVLLMForConditionalGeneration(
         loaded = loader.load_weights(weights)
         self._merge_qwenpose_vision_lora()
         qwenpose_prefixes = (
-            "raw_feature_norm.",
             "feature_refiner.",
         )
         for name, _ in self.named_parameters():

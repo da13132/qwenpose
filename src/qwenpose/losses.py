@@ -25,8 +25,10 @@ def oks_loss(
         return pred_keypoints.sum() * 0.0
     d2 = ((pred_keypoints[..., :2] - gt_keypoints[..., :2]) ** 2).sum(dim=-1)
     areas = box_area(gt_boxes).clamp(min=1e-6)[:, None]
-    sigma2 = (sigmas.to(pred_keypoints.device)[None, :] ** 2).clamp(min=1e-6)
-    oks = torch.exp(-d2 / (2.0 * areas * sigma2))
+    variances = (
+        2.0 * sigmas.to(device=pred_keypoints.device, dtype=pred_keypoints.dtype)
+    ).square()[None, :].clamp(min=1e-8)
+    oks = torch.exp(-d2 / (2.0 * areas * variances))
     valid_f = valid.float()
     oks_mean = (oks * valid_f).sum(dim=-1) / valid_f.sum(dim=-1).clamp(min=1.0)
     per_instance = -torch.log(oks_mean.clamp(min=1e-4)).clamp(max=10.0)
@@ -54,7 +56,10 @@ def normalized_coord_loss(
 class LossWeights:
     # Main pose supervision.
     oks: float = 0.5
-    coord: float = 3.0
+    # Deprecated compatibility field. Final pose no longer uses a second,
+    # box-normalized coordinate objective; intermediate stages have dedicated
+    # coarse/deform/refine weights below.
+    coord: float = 0.0
     image_coord: float = 5.0
     keypoint_confidence: float = 0.1
     # YOLO-style instance ranking score trained against detached evaluator OKS.
@@ -77,6 +82,7 @@ class LossWeights:
     # Training-only box-conditioned OKS keypoint denoising.
     keypoint_dn: float = 1.0
     # Pose coordinate deep supervision.
+    decoder_coords: tuple[float, ...] = ()
     coarse_coord: float = 0.0
     deform_coord: float = 0.0
     refine_coords: tuple[float, ...] = ()
@@ -211,10 +217,17 @@ def compute_keypoint_denoising_loss(
     loss_image_coord = graph_anchor
     loss_coarse = graph_anchor
     loss_deform = graph_anchor
+    decoder_predictions = outputs.get("keypoint_dn_decoder_keypoints", [])
+    if not isinstance(decoder_predictions, list):
+        decoder_predictions = []
+    loss_decoder = [graph_anchor for _ in decoder_predictions]
     refine_predictions = outputs.get("keypoint_dn_refine_keypoints", [])
     if not isinstance(refine_predictions, list):
         refine_predictions = []
-    loss_refine = [graph_anchor for _ in refine_predictions]
+    # The final refinement is exactly ``pred`` and must not be supervised a
+    # second time. Only genuine intermediate predictions receive auxiliaries.
+    auxiliary_refine_predictions = refine_predictions[:-1]
+    loss_refine = [graph_anchor for _ in auxiliary_refine_predictions]
 
     if positive.any():
         pred_pos = pred[positive]
@@ -233,6 +246,14 @@ def compute_keypoint_denoising_loss(
             per_joint_oks_loss(pred_pos, target_pos, valid_pos, areas_pos, sigmas),
             valid_pos,
         ).mean()
+        for decoder_idx, decoder_pred in enumerate(decoder_predictions):
+            if torch.is_tensor(decoder_pred):
+                loss_decoder[decoder_idx] = _mean_valid_joints(
+                    per_joint_normalized_coord_loss(
+                        decoder_pred[positive], target_pos, valid_pos, boxes_pos
+                    ),
+                    valid_pos,
+                ).mean()
         coarse_pred = outputs.get("keypoint_dn_coarse_keypoints")
         if torch.is_tensor(coarse_pred):
             loss_coarse = _mean_valid_joints(
@@ -249,7 +270,7 @@ def compute_keypoint_denoising_loss(
                 ),
                 valid_pos,
             ).mean()
-        for refine_idx, refine_pred in enumerate(refine_predictions):
+        for refine_idx, refine_pred in enumerate(auxiliary_refine_predictions):
             if torch.is_tensor(refine_pred):
                 loss_refine[refine_idx] = _mean_valid_joints(
                     per_joint_normalized_coord_loss(
@@ -301,17 +322,21 @@ def compute_keypoint_denoising_loss(
 
     total = (
         float(weights.oks) * loss_oks
-        + float(weights.coord) * loss_coord
         + float(weights.image_coord) * loss_image_coord
         + _confidence_weight(weights) * confidence_loss
         + float(weights.person_confidence) * pose_quality_loss
         + float(weights.coarse_coord) * loss_coarse
         + float(weights.deform_coord) * loss_deform
     )
+    for decoder_idx, decoder_weight in enumerate(
+        _weight_sequence(weights.decoder_coords)
+    ):
+        if decoder_idx < len(loss_decoder):
+            total = total + float(decoder_weight) * loss_decoder[decoder_idx]
     for refine_idx, refine_weight in enumerate(_weight_sequence(weights.refine_coords)):
         if refine_idx < len(loss_refine):
             total = total + float(refine_weight) * loss_refine[refine_idx]
-    return total, {
+    parts = {
         "loss_keypoint_dn": total,
         "loss_keypoint_dn_oks": loss_oks,
         "loss_keypoint_dn_coord": loss_coord,
@@ -321,6 +346,9 @@ def compute_keypoint_denoising_loss(
         "keypoint_dn_positive_count": positive.sum().detach().float(),
         "keypoint_dn_negative_count": negative.sum().detach().float(),
     }
+    for decoder_idx, decoder_loss in enumerate(loss_decoder, start=1):
+        parts[f"loss_keypoint_dn_decoder_{decoder_idx}"] = decoder_loss
+    return total, parts
 
 
 def _sigmoid_focal_loss(
@@ -719,16 +747,27 @@ def compute_box_conditioned_pose_losses(
     total_hard_joint = torch.tensor(0.0, device=device)
     total_confidence = torch.tensor(0.0, device=device)
     total_coarse_coord = torch.tensor(0.0, device=device)
-    total_coarse_image_coord = torch.tensor(0.0, device=device)
-    total_coarse_oks = torch.tensor(0.0, device=device)
     total_deform_coord = torch.tensor(0.0, device=device)
     total_joint_loss = torch.zeros(len(UNION_KEYPOINTS), device=device)
     total_joint_count = torch.zeros(len(UNION_KEYPOINTS), device=device)
 
+    decoder_keypoints = outputs.get("decoder_keypoints", [])
+    if not isinstance(decoder_keypoints, list):
+        decoder_keypoints = []
+    total_decoder_coord = [
+        torch.tensor(0.0, device=device) for _ in decoder_keypoints
+    ]
+
     refine_keypoints = outputs.get("refine_keypoints", [])
     if not isinstance(refine_keypoints, list):
         refine_keypoints = []
-    total_refine_coord = [torch.tensor(0.0, device=device) for _ in refine_keypoints]
+    # ``refine_keypoints[-1]`` is identical to the final ``keypoints`` output.
+    # Excluding it here prevents duplicate final-stage coordinate supervision,
+    # including when an older config still supplies one extra refine weight.
+    auxiliary_refine_keypoints = refine_keypoints[:-1]
+    total_refine_coord = [
+        torch.tensor(0.0, device=device) for _ in auxiliary_refine_keypoints
+    ]
 
     num_pos = 0
     num_confidence_instances = 0
@@ -833,30 +872,26 @@ def compute_box_conditioned_pose_losses(
         total_image_coord = total_image_coord + _mean_valid_joints(image_coord_joint, gt_valid).sum()
         total_oks = total_oks + _mean_valid_joints(oks_joint, gt_valid).sum()
 
+        for decoder_idx, decoder_pred in enumerate(decoder_keypoints):
+            decoder_joint = per_joint_normalized_coord_loss(
+                decoder_pred[b, q], gt_keypoints, gt_valid, loss_boxes
+            )
+            total_decoder_coord[decoder_idx] = (
+                total_decoder_coord[decoder_idx]
+                + _mean_valid_joints(decoder_joint, gt_valid).sum()
+            )
         if "coarse_keypoints" in outputs:
             coarse_pred = outputs["coarse_keypoints"][b, q]
             coarse_joint = per_joint_normalized_coord_loss(
                 coarse_pred, gt_keypoints, gt_valid, loss_boxes
             )
             total_coarse_coord = total_coarse_coord + _mean_valid_joints(coarse_joint, gt_valid).sum()
-            coarse_image_joint = per_joint_image_coord_loss(
-                coarse_pred, gt_keypoints, gt_valid
-            )
-            total_coarse_image_coord = total_coarse_image_coord + _mean_valid_joints(
-                coarse_image_joint, gt_valid
-            ).sum()
-            coarse_oks_joint = per_joint_oks_loss(
-                coarse_pred, gt_keypoints, gt_valid, loss_areas, sigmas
-            )
-            total_coarse_oks = total_coarse_oks + _mean_valid_joints(
-                coarse_oks_joint, gt_valid
-            ).sum()
         if "deform_keypoints" in outputs:
             deform_joint = per_joint_normalized_coord_loss(
                 outputs["deform_keypoints"][b, q], gt_keypoints, gt_valid, loss_boxes
             )
             total_deform_coord = total_deform_coord + _mean_valid_joints(deform_joint, gt_valid).sum()
-        for refine_idx, refine_pred in enumerate(refine_keypoints):
+        for refine_idx, refine_pred in enumerate(auxiliary_refine_keypoints):
             refine_joint = per_joint_normalized_coord_loss(
                 refine_pred[b, q], gt_keypoints, gt_valid, loss_boxes
             )
@@ -888,10 +923,10 @@ def compute_box_conditioned_pose_losses(
         "loss_hard_joint": total_hard_joint / max(num_hard_groups, 1),
         "loss_keypoint_confidence": total_confidence / max(num_confidence_instances, 1),
     }
+    for decoder_idx, total_decoder in enumerate(total_decoder_coord, start=1):
+        loss_parts[f"loss_coord_decoder_{decoder_idx}"] = total_decoder / denom
     if "coarse_keypoints" in outputs:
         loss_parts["loss_coord_coarse"] = total_coarse_coord / denom
-        loss_parts["loss_image_coord_coarse"] = total_coarse_image_coord / denom
-        loss_parts["loss_oks_coarse"] = total_coarse_oks / denom
     if "deform_keypoints" in outputs:
         loss_parts["loss_coord_deform"] = total_deform_coord / denom
     for refine_idx, total_refine in enumerate(total_refine_coord, start=1):
@@ -907,19 +942,19 @@ def compute_box_conditioned_pose_losses(
 
     total = (
         weights.oks * loss_parts["loss_oks"]
-        + weights.coord * loss_parts["loss_coord"]
         + weights.image_coord * loss_parts["loss_image_coord"]
         + weights.hard_joint * loss_parts["loss_hard_joint"]
         + _confidence_weight(weights) * loss_parts["loss_keypoint_confidence"]
         + graph_anchor
     )
-    if "coarse_keypoints" in outputs:
-        coarse_objective = (
-            weights.oks * loss_parts["loss_oks_coarse"]
-            + weights.coord * loss_parts["loss_coord_coarse"]
-            + weights.image_coord * loss_parts["loss_image_coord_coarse"]
+    for decoder_idx, decoder_weight in enumerate(
+        _weight_sequence(weights.decoder_coords), start=1
+    ):
+        total = total + decoder_weight * loss_parts.get(
+            f"loss_coord_decoder_{decoder_idx}", graph_anchor
         )
-        total = total + weights.coarse_coord * coarse_objective
+    if "coarse_keypoints" in outputs:
+        total = total + weights.coarse_coord * loss_parts["loss_coord_coarse"]
     total = total + weights.deform_coord * loss_parts.get("loss_coord_deform", graph_anchor)
     for refine_idx, refine_weight in enumerate(_weight_sequence(weights.refine_coords), start=1):
         total = total + refine_weight * loss_parts.get(f"loss_coord_refine_{refine_idx}", graph_anchor)
@@ -967,11 +1002,12 @@ def per_joint_oks_loss(
 ) -> torch.Tensor:
     if pred_keypoints.numel() == 0:
         return pred_keypoints.new_zeros(pred_keypoints.shape[:-1])
-    d2 = ((pred_keypoints[..., :2] - gt_keypoints[..., :2]) ** 2).sum(dim=-1)
-    d2 = d2.clamp(max=1.0)
-    areas = gt_areas.to(pred_keypoints.device).clamp(min=1e-8)[:, None]
-    sigma2 = (sigmas.to(pred_keypoints.device)[None, :] ** 2).clamp(min=1e-6)
-    oks = torch.exp(-d2 / (2.0 * areas * sigma2))
+    oks = per_joint_oks_score(
+        pred_keypoints[..., :2],
+        gt_keypoints[..., :2],
+        gt_areas,
+        sigmas,
+    )
     return (1.0 - oks).masked_fill(~valid, 0.0)
 
 
@@ -981,16 +1017,16 @@ def per_joint_oks_score(
     gt_areas: torch.Tensor,
     sigmas: torch.Tensor,
 ) -> torch.Tensor:
-    """Evaluator-aligned detached OKS target for localization confidence.
+    """Evaluator-aligned OKS shared by pose loss and confidence quality.
 
     COCO evaluation uses ``variances=(2*sigma)^2`` and divides the normalized
     squared distance by another factor of two. Keeping this exact expression in
-    one function prevents the confidence target from drifting away from the AP
-    metric even though the historical training OKS loss uses a sharper kernel.
+    one function prevents the training loss and quality target from drifting
+    away from the AP metric.
     """
     if pred_xy.numel() == 0:
         return pred_xy.new_zeros(pred_xy.shape[:-1])
-    d2 = ((pred_xy - gt_xy) ** 2).sum(dim=-1).clamp(max=1.0)
+    d2 = ((pred_xy - gt_xy) ** 2).sum(dim=-1)
     areas = gt_areas.to(device=pred_xy.device, dtype=pred_xy.dtype).clamp(min=1e-8)[:, None]
     variances = (2.0 * sigmas.to(device=pred_xy.device, dtype=pred_xy.dtype)) ** 2
     return torch.exp(-d2 / (2.0 * areas * variances[None, :].clamp(min=1e-8)))

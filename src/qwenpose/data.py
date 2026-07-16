@@ -342,6 +342,8 @@ def transform_pose_boxes(
     height: int,
     *,
     clamp: bool,
+    output_width: int | None = None,
+    output_height: int | None = None,
 ) -> torch.Tensor:
     if boxes.numel() == 0:
         return boxes.clone()
@@ -360,7 +362,15 @@ def transform_pose_boxes(
     transformed = _transform_xy(corners, matrix)
     mins = transformed.min(dim=-2).values
     maxs = transformed.max(dim=-2).values
-    out = torch.cat([mins, maxs], dim=-1) / scale
+    output_scale = boxes.new_tensor(
+        [
+            output_width if output_width is not None else width,
+            output_height if output_height is not None else height,
+            output_width if output_width is not None else width,
+            output_height if output_height is not None else height,
+        ]
+    )
+    out = torch.cat([mins, maxs], dim=-1) / output_scale
     return out.clamp_(0.0, 1.0) if clamp else out
 
 
@@ -373,12 +383,20 @@ def transform_pose_keypoints(
     height: int,
     *,
     horizontal_flip: bool,
+    output_width: int | None = None,
+    output_height: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if keypoints.numel() == 0:
         return keypoints.clone(), valid.clone(), visibility_valid.clone()
     out = keypoints.clone()
     pixel = out[..., :2] * out.new_tensor([width, height])
-    out[..., :2] = _transform_xy(pixel, matrix) / out.new_tensor([width, height])
+    output_size = out.new_tensor(
+        [
+            output_width if output_width is not None else width,
+            output_height if output_height is not None else height,
+        ]
+    )
+    out[..., :2] = _transform_xy(pixel, matrix) / output_size
     if horizontal_flip:
         permutation = UNION_FLIP_PERMUTATION.to(device=out.device)
         out = out.index_select(1, permutation)
@@ -430,6 +448,42 @@ def apply_pose_image_augmentation(image: Image.Image, spec: PoseAugmentSpec) -> 
             array[y1:y2, x1:x2] = 127
         image = Image.fromarray(array, mode="RGB")
     return image
+
+
+def letterbox_pose_image(
+    image: Image.Image,
+    size: int,
+    *,
+    fill: int = 127,
+) -> tuple[Image.Image, torch.Tensor, tuple[int, int, int, int]]:
+    """Scale the long side to ``size`` and center-pad the short side.
+
+    Returns the 800x800-style canvas, the pixel-space affine matrix mapping the
+    original image into that canvas, and ``(left, top, resized_width,
+    resized_height)`` for logging/debugging.
+    """
+    target = max(int(size), 1)
+    width, height = image.size
+    scale = float(target) / float(max(width, height, 1))
+    resized_width = max(min(int(round(width * scale)), target), 1)
+    resized_height = max(min(int(round(height * scale)), target), 1)
+    left = (target - resized_width) // 2
+    top = (target - resized_height) // 2
+    resized = image.resize(
+        (resized_width, resized_height),
+        Image.Resampling.BILINEAR,
+    )
+    canvas = Image.new("RGB", (target, target), (int(fill), int(fill), int(fill)))
+    canvas.paste(resized, (left, top))
+    matrix = torch.tensor(
+        [
+            [float(resized_width) / max(float(width), 1.0), 0.0, float(left)],
+            [0.0, float(resized_height) / max(float(height), 1.0), float(top)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+    return canvas, matrix, (left, top, resized_width, resized_height)
 
 
 def pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:
@@ -517,6 +571,8 @@ class PoseRecordDataset(Dataset):
         load_vision_images: bool = False,
         augment_config: PoseAugmentConfig | None = None,
         use_prompts: bool = True,
+        letterbox_size: int | None = None,
+        letterbox_fill: int = 127,
     ) -> None:
         self.records = records
         self.max_instances = max_instances
@@ -525,6 +581,12 @@ class PoseRecordDataset(Dataset):
         self.load_vision_images = load_vision_images
         self.augment_config = augment_config or PoseAugmentConfig(enabled=False)
         self.use_prompts = bool(use_prompts)
+        self.letterbox_size = (
+            max(int(letterbox_size), 1)
+            if letterbox_size is not None and int(letterbox_size) > 0
+            else None
+        )
+        self.letterbox_fill = max(0, min(int(letterbox_fill), 255))
 
     def __len__(self) -> int:
         return len(self.records)
@@ -546,7 +608,11 @@ class PoseRecordDataset(Dataset):
         box_jitter_shift = record.box_jitter_shift[:n].clone()
         ref_target = record.ref_target if record.ref_target < n else -1
 
-        needs_image = self.load_image_tensors or self.load_vision_images
+        needs_image = (
+            self.load_image_tensors
+            or self.load_vision_images
+            or self.letterbox_size is not None
+        )
         if needs_image:
             with Image.open(record.image_path) as handle:
                 source_image = handle.convert("RGB").copy()
@@ -613,6 +679,54 @@ class PoseRecordDataset(Dataset):
                         erase_rects=spec.erase_rects,
                     )
             augmented_image = apply_pose_image_augmentation(source_image, spec)
+            output_width, output_height = width, height
+            letterbox_metadata = (0, 0, width, height)
+            combined_matrix = spec.matrix
+            if self.letterbox_size is not None:
+                target_size = int(self.letterbox_size)
+                augmented_image, letterbox_matrix, letterbox_metadata = letterbox_pose_image(
+                    augmented_image,
+                    target_size,
+                    fill=self.letterbox_fill,
+                )
+                boxes = transform_pose_boxes(
+                    boxes,
+                    letterbox_matrix,
+                    width,
+                    height,
+                    clamp=True,
+                    output_width=target_size,
+                    output_height=target_size,
+                )
+                loss_boxes = transform_pose_boxes(
+                    loss_boxes,
+                    letterbox_matrix,
+                    width,
+                    height,
+                    clamp=False,
+                    output_width=target_size,
+                    output_height=target_size,
+                )
+                keypoints, valid, visibility_valid = transform_pose_keypoints(
+                    keypoints,
+                    valid,
+                    visibility_valid,
+                    letterbox_matrix,
+                    width,
+                    height,
+                    horizontal_flip=False,
+                    output_width=target_size,
+                    output_height=target_size,
+                )
+                letterbox_area_scale = (
+                    abs(float(torch.det(letterbox_matrix[:2, :2])))
+                    * float(width)
+                    * float(height)
+                    / float(target_size * target_size)
+                )
+                loss_areas = loss_areas * max(letterbox_area_scale, 1e-8)
+                combined_matrix = letterbox_matrix @ spec.matrix
+                output_width = output_height = target_size
             image = (
                 pil_to_local_rgb_tensor(augmented_image, self.image_size)
                 if self.load_image_tensors
@@ -623,13 +737,17 @@ class PoseRecordDataset(Dataset):
                 if self.load_vision_images
                 else None
             )
-            augmentation_matrix = spec.matrix.to(dtype=torch.float32)
+            augmentation_matrix = combined_matrix.to(dtype=torch.float32)
             augmented = bool(self.augment_config.enabled)
+            letterboxed = self.letterbox_size is not None
         else:
             image = torch.zeros(3, 1, 1, dtype=torch.float32)
             vision_image = None
             augmentation_matrix = torch.eye(3, dtype=torch.float32)
             augmented = False
+            letterboxed = False
+            output_width, output_height = record.width, record.height
+            letterbox_metadata = (0, 0, record.width, record.height)
 
         return {
             "image": image,
@@ -651,10 +769,17 @@ class PoseRecordDataset(Dataset):
                 "dataset": record.dataset_name,
                 "image_id": record.image_id,
                 "schema": record.schema,
-                "width": record.width,
-                "height": record.height,
+                "width": output_width,
+                "height": output_height,
+                "original_width": record.width,
+                "original_height": record.height,
                 "augmentation_matrix": augmentation_matrix,
                 "augmented": augmented,
+                "letterboxed": letterboxed,
+                "letterbox_left": int(letterbox_metadata[0]),
+                "letterbox_top": int(letterbox_metadata[1]),
+                "letterbox_resized_width": int(letterbox_metadata[2]),
+                "letterbox_resized_height": int(letterbox_metadata[3]),
             },
             "prompt": record.prompt if self.use_prompts else "",
             "ref_text": record.ref_text if self.use_prompts else "",
@@ -1685,6 +1810,8 @@ def build_datasets(
     load_vision_images: bool = False,
     augment_config: PoseAugmentConfig | None = None,
     use_prompts: bool = True,
+    letterbox_size: int | None = None,
+    letterbox_fill: int = 127,
     split: str = "train",
     max_samples_per_dataset: int | None = None,
     refhuman_max_captions_per_instance: int = 1,
@@ -1817,6 +1944,8 @@ def build_datasets(
             "load_vision_images": load_vision_images,
             "augment_config": augment_config,
             "use_prompts": use_prompts,
+            "letterbox_size": letterbox_size,
+            "letterbox_fill": letterbox_fill,
         }
         if name == "refhuman" and refhuman_max_captions_per_instance > 0:
             pose_dataset: Dataset = EpochRandomRefHumanDataset(

@@ -6,10 +6,15 @@ from types import SimpleNamespace
 
 import torch
 
+from qwenpose.spatial_features import MultiScaleSpatialFeatureBatch, SpatialFeatureBatch
+
 from qwenpose.eagle_lora import (
     EagleFeatureExtractor,
     PrunedEagleLMHead,
+    build_eagle_lm_inputs,
+    compute_eagle_pbd_grounding_losses,
     eagle_generation_is_pruned,
+    extract_eagle_pbd_blocks_from_lm_logits,
     prune_eagle_generation_components,
 )
 from qwenpose.train_pose import (
@@ -17,6 +22,73 @@ from qwenpose.train_pose import (
     load_deepspeed_config,
     synchronized_finite_check,
 )
+
+
+class _DummyTokenizer:
+    def __init__(self) -> None:
+        self.vocab: dict[str, int] = {"<pad>": 0}
+        self.inverse: dict[int, str] = {0: "<pad>"}
+
+    def _encode(self, text: str) -> list[int]:
+        ids: list[int] = []
+        for token in str(text).split():
+            if token not in self.vocab:
+                index = len(self.vocab)
+                self.vocab[token] = index
+                self.inverse[index] = token
+            ids.append(self.vocab[token])
+        return ids
+
+    def __call__(self, texts, **_: object) -> dict[str, object]:
+        if isinstance(texts, str):
+            return {"input_ids": self._encode(texts)}
+        rows = [self._encode(text) for text in texts]
+        return {
+            "input_ids": rows,
+            "attention_mask": [[1] * len(row) for row in rows],
+        }
+
+    def decode(self, ids, **_: object) -> str:
+        return " ".join(self.inverse[int(index)] for index in ids)
+
+
+class _DummyProcessor:
+    def __init__(self) -> None:
+        self.tokenizer = _DummyTokenizer()
+        self.image_processor = SimpleNamespace(in_token_limit=None)
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> str:
+        del tokenize
+        user_text = messages[0]["content"][1]["text"]
+        text = f"USER IMAGE {user_text} ASSISTANT"
+        if len(messages) > 1:
+            text += f" {messages[1]['content']} END"
+        elif not add_generation_prompt:
+            text += " END"
+        return text
+
+    def __call__(self, *, text, images, padding: bool, return_tensors: str):
+        del images, padding, return_tensors
+        rows = [self.tokenizer._encode(item) for item in text]
+        width = max(len(row) for row in rows)
+        input_ids = torch.zeros(len(rows), width, dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids)
+        for row_idx, row in enumerate(rows):
+            start = width - len(row)
+            input_ids[row_idx, start:] = torch.tensor(row, dtype=torch.long)
+            attention_mask[row_idx, start:] = 1
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": torch.zeros(len(rows), 3, 2, 2),
+            "image_grid_hws": torch.ones(len(rows), 2, dtype=torch.long),
+        }
 
 
 class _DummyEagle(torch.nn.Module):
@@ -72,17 +144,113 @@ class _DummyMultimodalEagle(torch.nn.Module):
         self.image_token_index = 6
 
 
+def test_eagle_lm_inputs_supervise_only_complete_assistant_response() -> None:
+    processor = _DummyProcessor()
+    inputs = build_eagle_lm_inputs(
+        processor,
+        ["a.jpg", "b.jpg"],
+        ["short prompt", "a much longer prompt"],
+        ["<box><100><200><300><400></box>", "None"],
+        torch.device("cpu"),
+        image_tensors=[
+            torch.zeros(3, 4, 4, dtype=torch.uint8),
+            torch.zeros(3, 4, 4, dtype=torch.uint8),
+        ],
+    )
+
+    supervised = []
+    for row in range(2):
+        ids = inputs["input_ids"][row][inputs["labels"][row].ne(-100)]
+        supervised.append(processor.tokenizer.decode(ids))
+
+    assert supervised == [
+        "<box><100><200><300><400></box> END",
+        "None END",
+    ]
+
+
+def test_pbd_grounding_loss_backpropagates_to_coordinate_logits() -> None:
+    model = _DummyEagle(hidden_size=4)
+    model.token_ids = {
+        "box_start_token_id": 8,
+        "box_end_token_id": 9,
+        "coord_start_token_id": 10,
+        "coord_end_token_id": 14,
+    }
+    extractor = EagleFeatureExtractor(
+        model,
+        refiner_layers=0,
+        feature_source="raw_visual",
+    )
+    logits = torch.randn(1, 6, 20, requires_grad=True)
+    target_ids = torch.tensor([[8, 10, 11, 12, 13, 9]])
+    gt_boxes = torch.tensor([[0.0, 0.25, 0.5, 0.75]])
+
+    losses, soft_boxes = compute_eagle_pbd_grounding_losses(
+        extractor,
+        logits,
+        target_ids,
+        gt_boxes,
+        temperature=1.0,
+    )
+    total = sum(losses.values()) + soft_boxes.sum() * 0.0
+    total.backward()
+
+    assert soft_boxes.shape == (1, 4)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert float(logits.grad[:, 1:5].abs().sum()) > 0.0
+
+
+def test_extracts_all_batched_teacher_forced_pbd_blocks_in_response_order() -> None:
+    model = _DummyEagle(hidden_size=4)
+    model.token_ids = {
+        "box_start_token_id": 8,
+        "box_end_token_id": 9,
+        "coord_start_token_id": 10,
+        "coord_end_token_id": 14,
+    }
+    extractor = EagleFeatureExtractor(model, refiner_layers=0, feature_source="raw_visual")
+    shift_labels = torch.tensor(
+        [
+            [8, 10, 11, 12, 13, 9, 3, -100, -100, -100, -100, -100, -100],
+            [8, 14, 13, 12, 11, 9, 8, 10, 10, 14, 14, 9, 3],
+        ]
+    )
+    valid = shift_labels.ne(-100)
+    logits = torch.randn(int(valid.sum()), 20, requires_grad=True)
+
+    blocks, targets = extract_eagle_pbd_blocks_from_lm_logits(
+        extractor,
+        logits,
+        shift_labels,
+        valid,
+        torch.tensor([1, 2]),
+    )
+
+    assert blocks.shape == (3, 6, 20)
+    assert targets.tolist() == [
+        [8, 10, 11, 12, 13, 9],
+        [8, 14, 13, 12, 11, 9],
+        [8, 10, 10, 14, 14, 9],
+    ]
+    blocks.sum().backward()
+    assert logits.grad is not None
+    assert int(torch.count_nonzero(logits.grad)) == 3 * 6 * 20
+
+
 def test_raw_visual_extractor_has_no_lm_image_fusion_parameters() -> None:
     extractor = EagleFeatureExtractor(
         _DummyEagle(),
-        output_size=2,
         refiner_layers=0,
         feature_source="raw_visual",
     )
     raw_maps = torch.randn(2, 4, 2, 2)
-    normalized = extractor.normalize_raw_feature_maps(raw_maps)
+    refined = extractor.feature_refiner(raw_maps)
 
-    assert normalized.shape == raw_maps.shape
+    assert refined.shape == raw_maps.shape
+    assert torch.equal(refined, raw_maps)
+    assert not hasattr(extractor, "raw_feature_norm")
     assert not hasattr(extractor, "dual_feature_fuse")
     assert not hasattr(extractor, "lm_feature_norm")
 
@@ -90,23 +258,23 @@ def test_raw_visual_extractor_has_no_lm_image_fusion_parameters() -> None:
 def test_raw_visual_only_runs_language_path_when_text_is_required() -> None:
     extractor = EagleFeatureExtractor(
         _DummyEagle(),
-        output_size=2,
         refiner_layers=0,
         feature_source="raw_visual",
     )
-    raw_maps = torch.randn(1, 4, 2, 2)
+    raw_maps = SpatialFeatureBatch.from_maps([torch.randn(4, 2, 2)])
+    raw_levels = MultiScaleSpatialFeatureBatch((raw_maps, raw_maps))
     expected_text = torch.randn(1, 4)
     calls = {"vision": 0, "language": 0}
 
     def vision_only(*args, **kwargs):
         del args, kwargs
         calls["vision"] += 1
-        return raw_maps, torch.zeros_like(expected_text)
+        return raw_levels, torch.zeros_like(expected_text)
 
     def with_language(*args, **kwargs):
         del args, kwargs
         calls["language"] += 1
-        return raw_maps, torch.randn_like(raw_maps), expected_text
+        return raw_levels, expected_text
 
     extractor._extract_eagle_vision_features = vision_only  # type: ignore[method-assign]
     extractor._extract_eagle_feature_maps = with_language  # type: ignore[method-assign]
@@ -140,7 +308,6 @@ def test_pruned_locate_text_features_bypass_lm_head_and_do_not_build_cache() -> 
     prune_eagle_generation_components(model)
     extractor = EagleFeatureExtractor(
         model,
-        output_size=2,
         refiner_layers=0,
         feature_source="raw_visual",
     )

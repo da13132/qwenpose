@@ -328,7 +328,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locate_attn_implementation", "--eagle_attn_implementation", dest="eagle_attn_implementation", type=str, default="sdpa")
     parser.add_argument("--locate_image_token_limit", "--eagle_image_token_limit", dest="eagle_image_token_limit", type=int, default=None)
     parser.add_argument("--locate_batch_token_limit", "--eagle_batch_token_limit", dest="eagle_batch_token_limit", type=int, default=None)
-    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=100)
+    parser.add_argument(
+        "--locate_feature_size",
+        "--eagle_feature_size",
+        dest="eagle_feature_size",
+        type=int,
+        default=None,
+        help="Deprecated compatibility option; Locate uses native variable grids.",
+    )
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=0)
     parser.add_argument(
         "--locate_feature_refiner_bottleneck_dim",
@@ -495,12 +502,15 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
                 prune_generation=prune_locate_generation,
             )
         )
-        if "backbone_trainable" in checkpoint or "qwen_trainable" in checkpoint:
-            backbone_model.load_state_dict(checkpoint["backbone_trainable"] if "backbone_trainable" in checkpoint else checkpoint["qwen_trainable"], strict=False)
+        backbone_state = checkpoint.get(
+            "backbone_adapter",
+            checkpoint.get("backbone_trainable", checkpoint.get("qwen_trainable")),
+        )
+        if backbone_state is not None:
+            backbone_model.load_state_dict(backbone_state, strict=False)
         backbone_model.to(device)
         backbone_model.eval()
         external_dim = eagle_hidden_size(backbone_model)
-        default_feature_size = args.eagle_feature_size
         default_refiner_layers = args.eagle_feature_refiner_layers
         default_refiner_bottleneck_dim = args.eagle_feature_refiner_bottleneck_dim
         default_refiner_init_scale = args.eagle_feature_refiner_init_scale
@@ -525,7 +535,10 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
                     attn_implementation=args.qwen_attn_implementation,
                 )
             )
-        qwen_state = checkpoint.get("backbone_trainable", checkpoint.get("qwen_trainable"))
+        qwen_state = checkpoint.get(
+            "backbone_adapter",
+            checkpoint.get("backbone_trainable", checkpoint.get("qwen_trainable")),
+        )
         if not backbone_merged and qwen_state is not None:
             backbone_model.load_state_dict(qwen_state, strict=False)
         backbone_model.to(device)
@@ -537,13 +550,10 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
         default_refiner_init_scale = args.qwen_feature_refiner_init_scale
 
     saved_pose_config = checkpoint.get("pose_config")
-    if saved_pose_config is not None and (
-        "pose_pyramid_channels" not in saved_pose_config
-        or int(saved_pose_config.get("rgb_input_size", 0)) != 800
-    ):
+    if saved_pose_config is not None and saved_pose_config.get("use_native_spatial_features") is not True:
         raise ValueError(
-            "This checkpoint predates the unified 800x800 pose pyramid and cannot be evaluated "
-            "with the new architecture. Train a new Stage1 checkpoint first."
+            "This checkpoint predates native-grid Locate pose features. "
+            "Train a new Stage1 checkpoint first."
         )
     pose_config_kwargs = (
         {
@@ -563,7 +573,7 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
             if key in saved_pose_config
         }
     )
-    # Keypoint DN is training-only. Old unified-pyramid checkpoints do not own
+    # Keypoint DN is training-only. Older checkpoints do not own
     # its tiny type embedding, so keep their inference graph parameter-exact.
     if saved_pose_config is not None and "enable_keypoint_denoising" not in saved_pose_config:
         pose_config_kwargs["enable_keypoint_denoising"] = False
@@ -582,7 +592,11 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
         )
     refiner_config = checkpoint.get("backbone_feature_refiner_config", checkpoint.get("qwen_feature_refiner_config", {}))
     has_refiner_checkpoint = "backbone_feature_refiner" in checkpoint or "qwen_feature_refiner" in checkpoint
-    feature_size = int(feature_config.get("output_size", default_feature_size))
+    feature_size = (
+        None
+        if backbone_name == "eagle"
+        else int(feature_config.get("output_size", default_feature_size))
+    )
     refiner_layers = int(refiner_config.get("layers", default_refiner_layers)) if has_refiner_checkpoint else 0
     refiner_bottleneck_dim = int(refiner_config.get("bottleneck_dim", default_refiner_bottleneck_dim))
     refiner_init_scale = float(refiner_config.get("init_scale", default_refiner_init_scale))
@@ -592,7 +606,6 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
         from qwenpose.eagle_lora import EagleFeatureExtractor
         backbone_extractor = EagleFeatureExtractor(
             backbone_model,
-            output_size=feature_size,
             refiner_layers=refiner_layers,
             refiner_bottleneck_dim=refiner_bottleneck_dim,
             refiner_init_scale=refiner_init_scale,
@@ -600,6 +613,7 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
         )
     else:
         from qwenpose.qwen_lora import QwenFeatureExtractor
+        assert feature_size is not None
         backbone_extractor = QwenFeatureExtractor(
             backbone_model,
             output_size=feature_size,
@@ -881,14 +895,13 @@ def main() -> None:
             else ("locate_generate" if args.backbone == "eagle" else "qwen_generate")
         )
     device = torch.device(args.device)
-    pose_image_size = int((checkpoint.get("pose_config") or {}).get("rgb_input_size", 640))
-
     dataset_names = [name.strip() for name in args.datasets.split(",") if name.strip()]
     dataset = build_datasets(
         dataset_root=args.dataset_root,
         names=dataset_names,
         max_instances=args.max_instances,
-        image_size=pose_image_size,
+        image_size=1,
+        load_image_tensors=False,
         split=args.split,
         max_samples_per_dataset=args.max_samples_per_dataset,
         mixing_strategy="concat_shuffle",

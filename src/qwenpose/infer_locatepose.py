@@ -114,8 +114,14 @@ def parse_args() -> argparse.Namespace:
     # --locate_image_token_limit：Locate 原生图像 token 上限；和训练/eval 入口保持同名同义。
     parser.add_argument("--locate_image_token_limit", "--eagle_image_token_limit", dest="eagle_image_token_limit", type=int, default=None, help="Locate 原生图像 token 上限；空表示不覆盖 processor 默认。")
     parser.add_argument("--locate_batch_token_limit", "--eagle_batch_token_limit", dest="eagle_batch_token_limit", type=int, default=None, help="完整 micro batch 的 Locate raw patch token 预算。")
-    # --locate_feature_size：Locate token 特征投影后的空间特征图边长；需与 checkpoint 配置一致。
-    parser.add_argument("--locate_feature_size", "--eagle_feature_size", dest="eagle_feature_size", type=int, default=100, help="统一 800 架构的 raw MoonViT 特征图边长。")
+    parser.add_argument(
+        "--locate_feature_size",
+        "--eagle_feature_size",
+        dest="eagle_feature_size",
+        type=int,
+        default=None,
+        help="已弃用；Locate 推理保持 MoonViT 原生可变网格。",
+    )
     # --locate_feature_refiner_layers：Locate feature refiner 层数；加载 checkpoint 时会优先使用保存配置。
     parser.add_argument("--locate_feature_refiner_layers", "--eagle_feature_refiner_layers", dest="eagle_feature_refiner_layers", type=int, default=2, help="Locate feature refiner 层数。")
     # --locate_feature_refiner_bottleneck_dim：feature refiner bottleneck 维度；需与训练配置匹配。
@@ -729,7 +735,6 @@ class VLLMLocateBBoxGenerator:
     def __init__(self, args: argparse.Namespace, checkpoint_path: Path) -> None:
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        os.environ["QWENPOSE_VLLM_FEATURE_SIZE"] = str(int(getattr(args, "eagle_feature_size", 100)))
         os.environ["QWENPOSE_VLLM_FEATURE_REFINER_LAYERS"] = str(int(getattr(args, "eagle_feature_refiner_layers", 2)))
         os.environ["QWENPOSE_VLLM_FEATURE_REFINER_BOTTLENECK_DIM"] = str(int(getattr(args, "eagle_feature_refiner_bottleneck_dim", 256)))
         os.environ["QWENPOSE_VLLM_FEATURE_REFINER_INIT_SCALE"] = str(float(getattr(args, "eagle_feature_refiner_init_scale", 0.1)))
@@ -1198,17 +1203,14 @@ def main() -> None:
             if bool(pose_config.get("use_global_person_queries", False))
             else "locate_generate"
         )
-    pose_image_size = int(
-        (checkpoint_metadata.get("pose_config") or {}).get("rgb_input_size", 640)
-    )
     backend = str(args.locate_generation_backend or "transformers").lower()
     use_vllm_integrated = args.box_source == "locate_generate" and backend == "vllm"
     precomputed_locate_responses = None if use_vllm_integrated else maybe_precompute_locate_responses(records, args, checkpoint_path)
     dataset = PoseRecordDataset(
         records,
         max_instances=args.max_instances,
-        image_size=pose_image_size,
-        load_image_tensors=True,
+        image_size=1,
+        load_image_tensors=False,
     )
     loader_kwargs: dict[str, Any] = {
         "batch_size": args.batch_size,

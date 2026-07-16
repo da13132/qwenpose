@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover - torchvision may be unavailable in minima
     torchvision_roi_align = None
 
 from .schemas import SCHEMA_INDICES, SCHEMA_NAMES, UNION_KEYPOINTS, UNION_TO_ID
+from .spatial_features import MultiScaleSpatialFeatureBatch, SpatialFeatureBatch
 
 
 def _box_iou_diagonal_xyxy(
@@ -72,30 +73,38 @@ class MLP(nn.Module):
 
 
 class SinePositionEncoding(nn.Module):
-    def __init__(self, hidden_dim: int) -> None:
+    """Standard DETR-style normalized 2D sine/cosine position encoding."""
+
+    def __init__(self, hidden_dim: int, temperature: float = 10000.0) -> None:
         super().__init__()
         if hidden_dim % 4 != 0:
             raise ValueError("hidden_dim must be divisible by 4 for 2D sine PE.")
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = int(hidden_dim)
+        self.temperature = float(temperature)
 
     def forward(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Position-encoding shape must be positive, got {(height, width)}.")
         y, x = torch.meshgrid(
-            torch.linspace(0, 1, height, device=device),
-            torch.linspace(0, 1, width, device=device),
+            (torch.arange(height, device=device, dtype=torch.float32) + 0.5) / float(height),
+            (torch.arange(width, device=device, dtype=torch.float32) + 0.5) / float(width),
             indexing="ij",
         )
-        omega = torch.arange(self.hidden_dim // 4, device=device, dtype=torch.float32)
-        omega = 1.0 / (10000 ** (omega / max(len(omega), 1)))
-        pe = torch.cat(
-            [
-                torch.sin(x[..., None] * omega),
-                torch.cos(x[..., None] * omega),
-                torch.sin(y[..., None] * omega),
-                torch.cos(y[..., None] * omega),
-            ],
-            dim=-1,
+        num_pos_feats = self.hidden_dim // 2
+        dim_t = torch.arange(num_pos_feats, device=device, dtype=torch.float32)
+        dim_t = self.temperature ** (
+            2.0 * torch.div(dim_t, 2, rounding_mode="floor") / float(num_pos_feats)
         )
-        return pe.view(height * width, self.hidden_dim)
+        scale = 2.0 * math.pi
+        pos_x = x[..., None] * scale / dim_t
+        pos_y = y[..., None] * scale / dim_t
+        pos_x = torch.stack(
+            [pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()], dim=-1
+        ).flatten(-2)
+        pos_y = torch.stack(
+            [pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()], dim=-1
+        ).flatten(-2)
+        return torch.cat([pos_y, pos_x], dim=-1).view(height * width, self.hidden_dim)
 
 
 def _group_count(hidden_dim: int, max_groups: int = 32) -> int:
@@ -105,21 +114,103 @@ def _group_count(hidden_dim: int, max_groups: int = 32) -> int:
     return 1
 
 
-class SpatialFeatureInjector(nn.Module):
-    """Near-identity spatial adapter, following Qwen3-VL-Seg's stable injection idea."""
+def _padded_grid_from_normalized_points(
+    points: torch.Tensor,
+    spatial_shapes: torch.Tensor,
+    padded_height: int,
+    padded_width: int,
+) -> torch.Tensor:
+    """Map per-image [0,1] coordinates into a top-left padded feature tensor."""
+    scales = torch.stack(
+        [
+            spatial_shapes[:, 1].to(dtype=points.dtype) / max(float(padded_width), 1.0),
+            spatial_shapes[:, 0].to(dtype=points.dtype) / max(float(padded_height), 1.0),
+        ],
+        dim=-1,
+    ).to(device=points.device)
+    view_shape = [int(points.shape[0])] + [1] * (points.ndim - 2) + [2]
+    return points * scales.view(*view_shape) * 2.0 - 1.0
 
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.norm = nn.GroupNorm(_group_count(hidden_dim), hidden_dim)
-        self.depthwise = nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim)
-        self.scale = nn.Parameter(torch.tensor(1e-3))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.scale.to(dtype=x.dtype) * F.gelu(self.depthwise(self.norm(x)))
+def _masked_spatial_mean(
+    feature_map: torch.Tensor,
+    spatial_shapes: torch.Tensor,
+) -> torch.Tensor:
+    height, width = feature_map.shape[-2:]
+    rows = torch.arange(height, device=feature_map.device)[None, :, None]
+    cols = torch.arange(width, device=feature_map.device)[None, None, :]
+    mask = (rows < spatial_shapes[:, 0, None, None]) & (
+        cols < spatial_shapes[:, 1, None, None]
+    )
+    weights = mask[:, None].to(dtype=feature_map.dtype)
+    return (feature_map * weights).sum(dim=(-2, -1)) / weights.sum(
+        dim=(-2, -1)
+    ).clamp(min=1.0)
+
+
+def _repeat_feature_levels(
+    feature_maps: list[torch.Tensor],
+    spatial_shapes: list[torch.Tensor] | torch.Tensor,
+    num_scales: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    maps = list(feature_maps[:num_scales])
+    if isinstance(spatial_shapes, torch.Tensor):
+        shapes = [spatial_shapes for _ in maps]
+    else:
+        shapes = list(spatial_shapes[:num_scales])
+    while len(maps) < num_scales:
+        maps.append(maps[-1])
+        shapes.append(shapes[-1])
+    if len(shapes) != len(maps):
+        raise ValueError("Every deformable feature level requires its own spatial shape tensor.")
+    return maps, shapes
+
+
+def _radial_offset_bias(num_scales: int, num_points: int) -> torch.Tensor:
+    """Non-collapsed Deformable-DETR offset initialization around each reference."""
+    if num_points <= 0:
+        return torch.zeros(num_scales, 0, 2)
+    biases = []
+    for level_idx in range(num_scales):
+        phase = 0.0 if level_idx % 2 == 0 else math.pi / max(float(num_points), 1.0)
+        angles = torch.arange(num_points, dtype=torch.float32) * (
+            2.0 * math.pi / float(num_points)
+        ) + phase
+        radius = 0.5
+        biases.append(torch.stack([angles.cos(), angles.sin()], dim=-1) * radius)
+    pattern = torch.stack(biases, dim=0).clamp(-0.95, 0.95)
+    return torch.atanh(pattern).reshape(-1)
+
+
+def _apply_two_level_scale_prior(
+    logits: torch.Tensor,
+    boxes_wh: torch.Tensor,
+    p3_shapes: torch.Tensor,
+    *,
+    num_points: int,
+    strength: float,
+    center_cells: float,
+    temperature: float,
+) -> torch.Tensor:
+    """Bias tiny people toward P2 while preserving fully learned soft routing."""
+    if logits.shape[-2] != 2 or strength <= 0:
+        return logits
+    p3_wh = torch.stack([p3_shapes[:, 1], p3_shapes[:, 0]], dim=-1).to(
+        device=boxes_wh.device, dtype=boxes_wh.dtype
+    )
+    size_cells = (boxes_wh * p3_wh[:, None]).amin(dim=-1)
+    p2_gate = torch.sigmoid(
+        (float(center_cells) - size_cells) / max(float(temperature), 1e-4)
+    ).clamp(1e-4, 1.0 - 1e-4)
+    prior = torch.stack([p2_gate.log(), (1.0 - p2_gate).log()], dim=-1)
+    while prior.ndim < logits.ndim - 1:
+        prior = prior.unsqueeze(-2)
+    prior = prior.unsqueeze(-1).expand(*logits.shape[:-1], num_points)
+    return logits + float(strength) * prior
 
 
 class HumanBoxDeformableAttention(nn.Module):
-    """Box-relative sparse cross-attention over the unified pose pyramid."""
+    """Box-relative sparse cross-attention over the Locate spatial feature."""
 
     def __init__(
         self,
@@ -129,6 +220,9 @@ class HumanBoxDeformableAttention(nn.Module):
         num_points: int = 4,
         offset_scale: float = 0.5,
         min_radius_cells: float = 2.0,
+        scale_prior_strength: float = 0.5,
+        scale_prior_center_cells: float = 6.0,
+        scale_prior_temperature: float = 1.5,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -137,6 +231,9 @@ class HumanBoxDeformableAttention(nn.Module):
         self.num_points = max(int(num_points), 1)
         self.offset_scale = float(offset_scale)
         self.min_radius_cells = max(float(min_radius_cells), 0.0)
+        self.scale_prior_strength = max(float(scale_prior_strength), 0.0)
+        self.scale_prior_center_cells = float(scale_prior_center_cells)
+        self.scale_prior_temperature = max(float(scale_prior_temperature), 1e-4)
         sample_count = self.num_scales * self.num_points
         self.offset_head = nn.Linear(hidden_dim, sample_count * 2)
         self.weight_head = nn.Linear(hidden_dim, sample_count)
@@ -146,7 +243,12 @@ class HumanBoxDeformableAttention(nn.Module):
         self.context_proj = MLP(hidden_dim * 2, hidden_dim, hidden_dim, depth=2)
         self.scale = nn.Parameter(torch.tensor(-1.0))
         nn.init.zeros_(self.offset_head.weight)
-        nn.init.zeros_(self.offset_head.bias)
+        with torch.no_grad():
+            self.offset_head.bias.copy_(
+                _radial_offset_bias(self.num_scales, self.num_points).to(
+                    dtype=self.offset_head.bias.dtype
+                )
+            )
         nn.init.zeros_(self.weight_head.weight)
         nn.init.zeros_(self.weight_head.bias)
         self._zero_init_last_linear(self.context_proj)
@@ -156,31 +258,46 @@ class HumanBoxDeformableAttention(nn.Module):
         tokens: torch.Tensor,
         boxes: torch.Tensor,
         feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor] | torch.Tensor,
     ) -> torch.Tensor:
         if tokens.numel() == 0 or not feature_maps:
             return tokens
-        maps = list(feature_maps[: self.num_scales])
-        while len(maps) < self.num_scales:
-            maps.append(maps[-1])
+        maps, level_shapes = _repeat_feature_levels(
+            feature_maps, spatial_shapes, self.num_scales
+        )
         b, q, c = tokens.shape
         sample_count = self.num_scales * self.num_points
         token_input = tokens.to(dtype=self.offset_head.weight.dtype)
         offsets = torch.tanh(self.offset_head(token_input).float()).to(dtype=tokens.dtype)
         offsets = offsets.view(b, q, self.num_scales, self.num_points, 2)
-        weights = self.weight_head(token_input).float().softmax(dim=-1).to(dtype=tokens.dtype)
-        weights = weights.view(b, q, self.num_scales, self.num_points)
         center = (boxes[..., :2] + boxes[..., 2:]) * 0.5
         box_wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
+        weight_logits = self.weight_head(token_input).float().view(
+            b, q, self.num_scales, self.num_points
+        )
+        if self.num_scales == 2:
+            weight_logits = _apply_two_level_scale_prior(
+                weight_logits,
+                box_wh.float(),
+                level_shapes[1],
+                num_points=self.num_points,
+                strength=self.scale_prior_strength,
+                center_cells=self.scale_prior_center_cells,
+                temperature=self.scale_prior_temperature,
+            )
+        weights = weight_logits.flatten(-2).softmax(dim=-1).view_as(weight_logits)
+        weights = weights.to(dtype=tokens.dtype)
 
         sampled_scales = []
         for scale_idx, feature_map in enumerate(maps):
-            feature_h, feature_w = feature_map.shape[-2:]
-            minimum = box_wh.new_tensor(
+            shape = level_shapes[scale_idx]
+            minimum = torch.stack(
                 [
-                    self.min_radius_cells / max(float(feature_w), 1.0),
-                    self.min_radius_cells / max(float(feature_h), 1.0),
-                ]
-            )
+                    self.min_radius_cells / shape[:, 1].clamp(min=1).to(dtype=box_wh.dtype),
+                    self.min_radius_cells / shape[:, 0].clamp(min=1).to(dtype=box_wh.dtype),
+                ],
+                dim=-1,
+            ).to(device=box_wh.device)[:, None, :]
             radius = torch.maximum(
                 box_wh.to(dtype=tokens.dtype) * self.offset_scale,
                 minimum.to(dtype=tokens.dtype),
@@ -189,7 +306,7 @@ class HumanBoxDeformableAttention(nn.Module):
                 center.to(dtype=tokens.dtype).unsqueeze(2)
                 + offsets[:, :, scale_idx] * radius
             ).clamp(0.0, 1.0)
-            sampled = self._sample_points(feature_map, points)
+            sampled = self._sample_points(feature_map, points, shape)
             projection = self.level_projections[scale_idx]
             sampled = projection(sampled.to(dtype=projection.weight.dtype)).to(dtype=tokens.dtype)
             sampled_scales.append(sampled)
@@ -203,10 +320,19 @@ class HumanBoxDeformableAttention(nn.Module):
         return tokens + self.scale.sigmoid().to(dtype=update.dtype) * update
 
     @staticmethod
-    def _sample_points(feature_map: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-        b, channels, _, _ = feature_map.shape
+    def _sample_points(
+        feature_map: torch.Tensor,
+        points: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
+        b, channels, feature_h, feature_w = feature_map.shape
         q, p = points.shape[1], points.shape[2]
-        grid = points.to(device=feature_map.device, dtype=feature_map.dtype) * 2.0 - 1.0
+        grid = _padded_grid_from_normalized_points(
+            points.to(device=feature_map.device, dtype=feature_map.dtype),
+            spatial_shapes,
+            feature_h,
+            feature_w,
+        )
         grid = grid.view(b, q * p, 1, 2)
         sampled = F.grid_sample(feature_map, grid, align_corners=False)
         return sampled.squeeze(-1).transpose(1, 2).view(b, q, p, channels)
@@ -222,7 +348,7 @@ class HumanBoxDeformableAttention(nn.Module):
 
 
 class JointDeformableKeypointAttention(nn.Module):
-    """Joint-centric sparse sampling over the unified P2/P3/P4 pose pyramid."""
+    """Joint-centric sparse sampling over the Locate spatial feature."""
 
     def __init__(
         self,
@@ -232,6 +358,9 @@ class JointDeformableKeypointAttention(nn.Module):
         num_points: int = 4,
         offset_scale: float = 0.35,
         min_radius_cells: float = 2.0,
+        scale_prior_strength: float = 0.5,
+        scale_prior_center_cells: float = 6.0,
+        scale_prior_temperature: float = 1.5,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -240,6 +369,9 @@ class JointDeformableKeypointAttention(nn.Module):
         self.num_points = max(int(num_points), 1)
         self.offset_scale = float(offset_scale)
         self.min_radius_cells = max(float(min_radius_cells), 0.0)
+        self.scale_prior_strength = max(float(scale_prior_strength), 0.0)
+        self.scale_prior_center_cells = float(scale_prior_center_cells)
+        self.scale_prior_temperature = max(float(scale_prior_temperature), 1e-4)
         sample_count = self.num_scales * self.num_points
         self.offset_head = nn.Linear(hidden_dim, sample_count * 2)
         self.weight_head = nn.Linear(hidden_dim, sample_count)
@@ -249,7 +381,12 @@ class JointDeformableKeypointAttention(nn.Module):
         self.context_proj = MLP(hidden_dim * 3, hidden_dim, hidden_dim, depth=2)
         self.scale = nn.Parameter(torch.tensor(-1.0))
         nn.init.zeros_(self.offset_head.weight)
-        nn.init.zeros_(self.offset_head.bias)
+        with torch.no_grad():
+            self.offset_head.bias.copy_(
+                _radial_offset_bias(self.num_scales, self.num_points).to(
+                    dtype=self.offset_head.bias.dtype
+                )
+            )
         nn.init.zeros_(self.weight_head.weight)
         nn.init.zeros_(self.weight_head.bias)
         self._zero_init_last_linear(self.context_proj)
@@ -260,6 +397,7 @@ class JointDeformableKeypointAttention(nn.Module):
         reference_xy: torch.Tensor,
         box_wh: torch.Tensor,
         feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor] | torch.Tensor,
     ) -> torch.Tensor:
         if tokens.numel() == 0 or not feature_maps:
             return tokens
@@ -269,26 +407,40 @@ class JointDeformableKeypointAttention(nn.Module):
         # very large derivative of Fourier/grid-sampling paths in bf16.
         reference_xy = reference_xy.detach()
         box_wh = box_wh.detach()
-        maps = list(feature_maps[: self.num_scales])
-        while len(maps) < self.num_scales:
-            maps.append(maps[-1])
+        maps, level_shapes = _repeat_feature_levels(
+            feature_maps, spatial_shapes, self.num_scales
+        )
         b, q, k, c = tokens.shape
         sample_count = self.num_scales * self.num_points
         token_input = tokens.to(dtype=self.offset_head.weight.dtype)
         offsets = torch.tanh(self.offset_head(token_input).float()).to(dtype=tokens.dtype)
         offsets = offsets.view(b, q, k, self.num_scales, self.num_points, 2)
-        weights = self.weight_head(token_input).float().softmax(dim=-1).to(dtype=tokens.dtype)
-        weights = weights.view(b, q, k, self.num_scales, self.num_points)
+        weight_logits = self.weight_head(token_input).float().view(
+            b, q, k, self.num_scales, self.num_points
+        )
+        if self.num_scales == 2:
+            weight_logits = _apply_two_level_scale_prior(
+                weight_logits,
+                box_wh.float(),
+                level_shapes[1],
+                num_points=self.num_points,
+                strength=self.scale_prior_strength,
+                center_cells=self.scale_prior_center_cells,
+                temperature=self.scale_prior_temperature,
+            )
+        weights = weight_logits.flatten(-2).softmax(dim=-1).view_as(weight_logits)
+        weights = weights.to(dtype=tokens.dtype)
 
         sampled_scales = []
         for scale_idx, feature_map in enumerate(maps):
-            feature_h, feature_w = feature_map.shape[-2:]
-            minimum = box_wh.new_tensor(
+            shape = level_shapes[scale_idx]
+            minimum = torch.stack(
                 [
-                    self.min_radius_cells / max(float(feature_w), 1.0),
-                    self.min_radius_cells / max(float(feature_h), 1.0),
-                ]
-            )
+                    self.min_radius_cells / shape[:, 1].clamp(min=1).to(dtype=box_wh.dtype),
+                    self.min_radius_cells / shape[:, 0].clamp(min=1).to(dtype=box_wh.dtype),
+                ],
+                dim=-1,
+            ).to(device=box_wh.device)[:, None, :]
             radius = torch.maximum(
                 box_wh.to(dtype=tokens.dtype) * self.offset_scale,
                 minimum.to(dtype=tokens.dtype),
@@ -297,7 +449,7 @@ class JointDeformableKeypointAttention(nn.Module):
                 reference_xy.to(dtype=tokens.dtype).unsqueeze(3)
                 + offsets[:, :, :, scale_idx] * radius
             ).clamp(0.0, 1.0)
-            sampled = self._sample_points(feature_map, points)
+            sampled = self._sample_points(feature_map, points, shape)
             projection = self.level_projections[scale_idx]
             sampled = projection(sampled.to(dtype=projection.weight.dtype)).to(dtype=tokens.dtype)
             sampled_scales.append(sampled)
@@ -308,10 +460,19 @@ class JointDeformableKeypointAttention(nn.Module):
         return tokens + self.scale.sigmoid().to(dtype=update.dtype) * update
 
     @staticmethod
-    def _sample_points(feature_map: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-        b, channels, _, _ = feature_map.shape
+    def _sample_points(
+        feature_map: torch.Tensor,
+        points: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
+        b, channels, feature_h, feature_w = feature_map.shape
         q, k, p = points.shape[1], points.shape[2], points.shape[3]
-        grid = points.to(device=feature_map.device, dtype=feature_map.dtype) * 2.0 - 1.0
+        grid = _padded_grid_from_normalized_points(
+            points.to(device=feature_map.device, dtype=feature_map.dtype),
+            spatial_shapes,
+            feature_h,
+            feature_w,
+        )
         grid = grid.view(b, q * k * p, 1, 2)
         sampled = F.grid_sample(feature_map, grid, align_corners=False)
         sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, k, p, channels)
@@ -327,83 +488,115 @@ class JointDeformableKeypointAttention(nn.Module):
                 return
 
 
-class ConvNormAct(nn.Module):
-    """Lightweight RGB stem block used by the trainable visual pose branch."""
+class GroupedPoseDecoderLayer(nn.Module):
+    """GroupPose-style person/joint decoder layer with ROI cross-attention.
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+    Tokens are grouped as one explicit instance token followed by active joint
+    tokens. The layer alternates within-person interaction, same-role
+    cross-person interaction, per-person ROI cross-attention and an FFN.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
-        self.norm = nn.GroupNorm(_group_count(out_channels), out_channels)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.norm(self.conv(x)))
-
-
-class HighResolutionResidualBlock(nn.Module):
-    """Memory-conscious local-detail block for the 1/4-resolution RGB map."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.depthwise = nn.Conv2d(
-            channels,
-            channels,
-            kernel_size=3,
-            padding=1,
-            groups=channels,
-            bias=False,
+        c = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.within_norm = nn.LayerNorm(c)
+        self.within_attention = nn.MultiheadAttention(
+            c, self.num_heads, dropout=float(dropout), batch_first=True
         )
-        self.depthwise_norm = nn.GroupNorm(_group_count(channels), channels)
-        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.pointwise_norm = nn.GroupNorm(_group_count(channels), channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.depthwise(x)
-        residual = F.gelu(self.depthwise_norm(residual))
-        residual = self.pointwise_norm(self.pointwise(residual))
-        return F.gelu(x + residual)
-
-
-class UnifiedPosePyramid(nn.Module):
-    """Single RGB encoder producing stride-4/8/16 pose features from an 800 image."""
-
-    def __init__(self, channels: int = 128, residual_blocks: int = 3) -> None:
-        super().__init__()
-        channels = int(channels)
-        blocks = max(int(residual_blocks), 1)
-        if channels <= 0:
-            raise ValueError("Pose pyramid channels must be positive.")
-        self.stem = nn.Sequential(
-            ConvNormAct(3, 48, stride=2),
-            ConvNormAct(48, 96, stride=2),
+        self.same_role_norm = nn.LayerNorm(c)
+        self.same_role_attention = nn.MultiheadAttention(
+            c, self.num_heads, dropout=float(dropout), batch_first=True
         )
-        self.c2 = nn.Sequential(
-            HighResolutionResidualBlock(96),
-            HighResolutionResidualBlock(96),
+        self.cross_norm = nn.LayerNorm(c)
+        self.roi_cross_attention = nn.MultiheadAttention(
+            c, self.num_heads, dropout=float(dropout), batch_first=True
         )
-        self.c3_down = ConvNormAct(96, 128, stride=2)
-        self.c3 = nn.Sequential(*[HighResolutionResidualBlock(128) for _ in range(blocks)])
-        self.c4_down = ConvNormAct(128, 192, stride=2)
-        self.c4 = nn.Sequential(*[HighResolutionResidualBlock(192) for _ in range(blocks)])
-        self.lateral2 = nn.Conv2d(96, channels, kernel_size=1)
-        self.lateral3 = nn.Conv2d(128, channels, kernel_size=1)
-        self.lateral4 = nn.Conv2d(192, channels, kernel_size=1)
-        self.smooth2 = HighResolutionResidualBlock(channels)
-        self.smooth3 = HighResolutionResidualBlock(channels)
-        self.smooth4 = HighResolutionResidualBlock(channels)
+        self.ffn_norm = nn.LayerNorm(c)
+        self.ffn = nn.Sequential(
+            nn.Linear(c, c * 4),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(c * 4, c),
+        )
+        self.residual_dropout = nn.Dropout(float(dropout))
 
-    def forward(self, images: torch.Tensor) -> list[torch.Tensor]:
-        c2 = self.c2(self.stem(images))
-        c3 = self.c3(self.c3_down(c2))
-        c4 = self.c4(self.c4_down(c3))
-        p4 = self.lateral4(c4)
-        p3 = self.lateral3(c3) + F.interpolate(
-            p4, size=c3.shape[-2:], mode="bilinear", align_corners=False
+    @staticmethod
+    def _safe_padding_mask(valid: torch.Tensor) -> torch.Tensor:
+        padding = ~valid.bool()
+        return padding.masked_fill(padding.all(dim=1, keepdim=True), False)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        role_position: torch.Tensor,
+        token_valid: torch.Tensor,
+        roi_memory: torch.Tensor,
+        same_role_attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        b, num_people, num_roles, c = tokens.shape
+        if num_people == 0:
+            return tokens
+
+        valid_f = token_valid[..., None].to(dtype=tokens.dtype)
+
+        normalized = self.within_norm(tokens)
+        within_query = (normalized + role_position).reshape(
+            b * num_people, num_roles, c
         )
-        p2 = self.lateral2(c2) + F.interpolate(
-            p3, size=c2.shape[-2:], mode="bilinear", align_corners=False
+        within_value = normalized.reshape(b * num_people, num_roles, c)
+        within_valid = token_valid.reshape(b * num_people, num_roles)
+        within_update = self.within_attention(
+            within_query,
+            within_query,
+            within_value,
+            key_padding_mask=self._safe_padding_mask(within_valid),
+            need_weights=False,
+        )[0].view(b, num_people, num_roles, c)
+        tokens = tokens + self.residual_dropout(within_update) * valid_f
+
+        normalized = self.same_role_norm(tokens)
+        same_query = (normalized + role_position).permute(0, 2, 1, 3).reshape(
+            b * num_roles, num_people, c
         )
-        return [self.smooth2(p2), self.smooth3(p3), self.smooth4(p4)]
+        same_value = normalized.permute(0, 2, 1, 3).reshape(
+            b * num_roles, num_people, c
+        )
+        same_valid = token_valid.permute(0, 2, 1).reshape(
+            b * num_roles, num_people
+        )
+        same_update = self.same_role_attention(
+            same_query,
+            same_query,
+            same_value,
+            attn_mask=same_role_attention_mask,
+            key_padding_mask=self._safe_padding_mask(same_valid),
+            need_weights=False,
+        )[0]
+        same_update = same_update.view(b, num_roles, num_people, c).permute(
+            0, 2, 1, 3
+        )
+        tokens = tokens + self.residual_dropout(same_update) * valid_f
+
+        normalized = self.cross_norm(tokens)
+        cross_query = (normalized + role_position).reshape(
+            b * num_people, num_roles, c
+        )
+        cross_update = self.roi_cross_attention(
+            cross_query,
+            roi_memory,
+            roi_memory,
+            need_weights=False,
+        )[0].view(b, num_people, num_roles, c)
+        tokens = tokens + self.residual_dropout(cross_update) * valid_f
+
+        ffn_update = self.ffn(self.ffn_norm(tokens))
+        return (tokens + self.residual_dropout(ffn_update) * valid_f) * valid_f
 
 
 def canonical_joint_priors() -> torch.Tensor:
@@ -629,6 +822,7 @@ def box_soft_gate(
 class QwenPoseConfig:
     hidden_dim: int = 448
     external_dim: int = 2560
+    high_res_external_dim: int = 0
     pose_decoder_layers: int = 3
     refinement_steps: int = 3
     decoder_heads: int = 8
@@ -636,12 +830,14 @@ class QwenPoseConfig:
     box_condition_scale: float = 1.25
     pose_roi_size: int = 16
     use_refinement: bool = True
-    rgb_input_size: int = 800
-    pose_pyramid_channels: int = 128
-    pose_pyramid_blocks: int = 3
+    pose_feature_channels: int = 256
+    use_native_spatial_features: bool = True
     human_decoder_layers: int = 2
     deformable_points: int = 4
     deformable_min_radius_cells: float = 2.0
+    deformable_scale_prior_strength: float = 0.5
+    deformable_scale_prior_center_cells: float = 6.0
+    deformable_scale_prior_temperature: float = 1.5
     enable_box_denoising: bool = True
     enable_keypoint_denoising: bool = True
     ref_text_scale: float = 0.2
@@ -654,10 +850,11 @@ class QwenPoseConfig:
     # people; RefHuman then selects one of those people with ``ref_match_head``.
     use_global_person_queries: bool = False
     num_person_queries: int = 80
-    # ``learned_spread`` is the trainable, non-anatomical default.  The two
-    # remaining modes exist only for controlled ablations/legacy evaluation.
-    pose_coordinate_init: str = "learned_spread"
+    # The default starts from a schema-aligned anatomical reference and predicts
+    # an instance-conditioned residual before iterative decoder refinement.
+    pose_coordinate_init: str = "anatomical_dynamic"
     schema_joint_priors_path: str | None = "configs/schema_joint_priors.json"
+    dynamic_reference_offset_scale: float = 1.5
 
 
 class QwenPoseModel(nn.Module):
@@ -665,48 +862,50 @@ class QwenPoseModel(nn.Module):
         super().__init__()
         self.config = config
         c = int(config.hidden_dim)
-        pyramid_dim = int(config.pose_pyramid_channels)
+        pose_feature_dim = int(config.pose_feature_channels)
         coordinate_init = str(config.pose_coordinate_init).strip().lower()
-        if coordinate_init not in {"learned_spread", "box_center", "schema_prior"}:
+        coordinate_modes = {
+            "anatomical_dynamic",
+            "learned_spread",
+            "box_center",
+            "schema_prior",
+        }
+        if coordinate_init not in coordinate_modes:
             raise ValueError(
-                "pose_coordinate_init must be learned_spread, box_center, or schema_prior, "
-                f"got {config.pose_coordinate_init!r}."
+                "pose_coordinate_init must be anatomical_dynamic, learned_spread, "
+                f"box_center, or schema_prior, got {config.pose_coordinate_init!r}."
             )
         self.config.pose_coordinate_init = coordinate_init
+        if not config.use_native_spatial_features:
+            raise ValueError("Only native-grid Locate spatial features are supported.")
         if config.legacy_checkpoint_compat:
             raise ValueError(
-                "legacy_checkpoint_compat is not supported by the unified 800x800 pose pyramid. "
+                "legacy_checkpoint_compat is not supported by the Locate-only pose feature. "
                 "Train a new Stage1 checkpoint for this architecture."
             )
-        self.pose_pyramid = UnifiedPosePyramid(
-            channels=pyramid_dim,
-            residual_blocks=config.pose_pyramid_blocks,
+        self.num_feature_levels = 2 if int(config.high_res_external_dim) > 0 else 1
+        self.high_res_feature_proj = (
+            nn.Conv2d(int(config.high_res_external_dim), pose_feature_dim, 1)
+            if self.num_feature_levels == 2
+            else None
         )
-        self.external_feature_proj = nn.Conv2d(config.external_dim, pyramid_dim, 1)
-        self.spatial_injector = SpatialFeatureInjector(pyramid_dim)
-        self.locate_fuse = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(pyramid_dim * 2, pyramid_dim, kernel_size=1),
-                    nn.GELU(),
-                    nn.Conv2d(pyramid_dim, pyramid_dim, kernel_size=3, padding=1),
-                )
-                for _ in range(3)
-            ]
+        self.external_feature_proj = nn.Conv2d(config.external_dim, pose_feature_dim, 1)
+        self.feature_level_embeddings = nn.Parameter(
+            torch.zeros(self.num_feature_levels, pose_feature_dim)
         )
-        self.locate_fuse_gates = nn.Parameter(torch.full((3,), -2.0))
+        nn.init.normal_(self.feature_level_embeddings, mean=0.0, std=0.02)
         self.external_text_proj = nn.Sequential(
             nn.LayerNorm(config.external_dim),
             nn.Linear(config.external_dim, c),
             nn.GELU(),
         )
         self.ref_visual_modulators = nn.ModuleList(
-            [nn.Linear(c, pyramid_dim * 2) for _ in range(3)]
+            [nn.Linear(c, pose_feature_dim * 2) for _ in range(self.num_feature_levels)]
         )
         # A zero scalar gate keeps Stage3 initialization exactly identical to
         # Stage2, while the randomly initialized FiLM projection gives the gate
         # a non-zero first-step gradient. Once the gate opens, both learn jointly.
-        self.ref_visual_gates = nn.Parameter(torch.zeros(3))
+        self.ref_visual_gates = nn.Parameter(torch.zeros(self.num_feature_levels))
         self.ref_candidate_proj = nn.Sequential(
             nn.LayerNorm(c),
             nn.Linear(c, c),
@@ -724,19 +923,9 @@ class QwenPoseModel(nn.Module):
         nn.init.normal_(ref_output.weight, mean=0.0, std=1e-3)
         if ref_output.bias is not None:
             nn.init.zeros_(ref_output.bias)
-        self.register_buffer(
-            "rgb_mean",
-            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
-            persistent=True,
-        )
-        self.register_buffer(
-            "rgb_std",
-            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
-            persistent=True,
-        )
         self.human_context_proj = nn.Sequential(
-            nn.LayerNorm(pyramid_dim * 3),
-            nn.Linear(pyramid_dim * 3, c),
+            nn.LayerNorm(pose_feature_dim),
+            nn.Linear(pose_feature_dim, c),
             nn.GELU(),
             nn.Linear(c, c),
         )
@@ -780,11 +969,14 @@ class QwenPoseModel(nn.Module):
             [
                 HumanBoxDeformableAttention(
                     c,
-                    feature_dim=pyramid_dim,
-                    num_scales=3,
+                    feature_dim=pose_feature_dim,
+                    num_scales=self.num_feature_levels,
                     num_points=config.deformable_points,
                     offset_scale=0.5,
                     min_radius_cells=config.deformable_min_radius_cells,
+                    scale_prior_strength=config.deformable_scale_prior_strength,
+                    scale_prior_center_cells=config.deformable_scale_prior_center_cells,
+                    scale_prior_temperature=config.deformable_scale_prior_temperature,
                 )
                 for _ in self.human_decoder_layers
             ]
@@ -799,7 +991,7 @@ class QwenPoseModel(nn.Module):
             self._zero_init_last_linear(box_head)
         for objectness_head in self.human_objectness_heads:
             self._zero_init_last_linear(objectness_head)
-        self.roi_memory_proj = nn.Conv2d(pyramid_dim * 3, c, kernel_size=1)
+        self.roi_memory_proj = nn.Conv2d(pose_feature_dim, c, kernel_size=1)
         self.pos_encoding = SinePositionEncoding(c)
 
         # Schema identity controls only the active joint set. Joint semantics
@@ -811,6 +1003,8 @@ class QwenPoseModel(nn.Module):
         self.schema_embed.weight.requires_grad_(False)
         self.task_embed = nn.Embedding(2, c)
         self.joint_embed = nn.Embedding(len(UNION_KEYPOINTS), c)
+        self.pose_token_type_embed = nn.Embedding(2, c)
+        nn.init.normal_(self.pose_token_type_embed.weight, mean=0.0, std=0.02)
         self.joint_reference_logits = (
             nn.Parameter(
                 torch.logit(
@@ -820,6 +1014,13 @@ class QwenPoseModel(nn.Module):
             if coordinate_init == "learned_spread"
             else None
         )
+        self.reference_offset_head = (
+            MLP(c * 2, c, 2, depth=3)
+            if coordinate_init == "anatomical_dynamic"
+            else None
+        )
+        if self.reference_offset_head is not None:
+            self._zero_init_last_linear(self.reference_offset_head)
         # Training-only keypoint DN branches share the complete pose decoder.
         # This tiny type embedding tells positive reconstruction queries apart
         # from contrastive negative queries; it is never used at inference.
@@ -828,12 +1029,13 @@ class QwenPoseModel(nn.Module):
         )
         if self.keypoint_dn_type_embed is not None:
             nn.init.normal_(self.keypoint_dn_type_embed.weight, mean=0.0, std=0.02)
-        # Keep the old buffer only when explicitly constructing the legacy
-        # coordinate graph. New checkpoints contain no fixed skeleton tensor.
+        # Dynamic anatomical references and legacy fixed-prior evaluation both
+        # need a checkpoint-contained schema prior tensor. Ablation modes keep
+        # the old state-dict behavior and do not read the prior file.
         self.register_buffer(
             "schema_joint_priors",
             build_schema_joint_priors(config.schema_joint_priors_path)
-            if coordinate_init == "schema_prior"
+            if coordinate_init in {"anatomical_dynamic", "schema_prior"}
             else None,
             persistent=True,
         )
@@ -848,16 +1050,8 @@ class QwenPoseModel(nn.Module):
             MLP(c, c, c, depth=2),
             nn.LayerNorm(c),
         )
-        same_joint_layer = nn.TransformerEncoderLayer(
-            d_model=c,
-            nhead=config.decoder_heads,
-            dim_feedforward=c * 4,
-            dropout=float(config.dropout),
-            activation="gelu",
-            batch_first=True,
-        )
-        self.same_joint_context = nn.TransformerEncoder(same_joint_layer, num_layers=1)
         self.instance_query_norm = nn.LayerNorm(c)
+        self.pose_instance_token_norm = nn.LayerNorm(c)
         self.pose_query_norm = nn.LayerNorm(c)
         max_schema_keypoints = max(int(indices.numel()) for indices in SCHEMA_INDICES.values())
         schema_joint_indices = torch.zeros(len(SCHEMA_NAMES), max_schema_keypoints, dtype=torch.long)
@@ -868,22 +1062,54 @@ class QwenPoseModel(nn.Module):
             schema_joint_valid[schema_id, : indices.numel()] = True
         self.register_buffer("schema_joint_indices", schema_joint_indices, persistent=False)
         self.register_buffer("schema_joint_valid", schema_joint_valid, persistent=False)
-        pose_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=c,
-            nhead=config.decoder_heads,
-            dim_feedforward=c * 4,
-            dropout=float(config.dropout),
-            activation="gelu",
-            batch_first=True,
+        pose_decoder_layers = max(int(config.pose_decoder_layers), 1)
+        self.pose_group_decoder_layers = nn.ModuleList(
+            [
+                GroupedPoseDecoderLayer(
+                    c,
+                    num_heads=config.decoder_heads,
+                    dropout=float(config.dropout),
+                )
+                for _ in range(pose_decoder_layers)
+            ]
         )
-        self.pose_decoder = nn.TransformerDecoder(pose_decoder_layer, num_layers=config.pose_decoder_layers)
+        decoder_offset_scales = (0.25, 0.15, 0.08)
+        decoder_min_radius_cells = (2.0, 1.0, 0.5)
+        self.pose_decoder_deformable_attention = nn.ModuleList(
+            [
+                JointDeformableKeypointAttention(
+                    c,
+                    feature_dim=pose_feature_dim,
+                    num_scales=self.num_feature_levels,
+                    num_points=config.deformable_points,
+                    offset_scale=decoder_offset_scales[
+                        min(layer_idx, len(decoder_offset_scales) - 1)
+                    ],
+                    min_radius_cells=decoder_min_radius_cells[
+                        min(layer_idx, len(decoder_min_radius_cells) - 1)
+                    ],
+                    scale_prior_strength=config.deformable_scale_prior_strength,
+                    scale_prior_center_cells=config.deformable_scale_prior_center_cells,
+                    scale_prior_temperature=config.deformable_scale_prior_temperature,
+                )
+                for layer_idx in range(pose_decoder_layers)
+            ]
+        )
+        self.pose_decoder_coordinate_heads = nn.ModuleList(
+            [MLP(c, c, 2, depth=3) for _ in range(pose_decoder_layers)]
+        )
+        for coordinate_head in self.pose_decoder_coordinate_heads:
+            self._zero_init_last_linear(coordinate_head)
         self.deformable_joint_attention = JointDeformableKeypointAttention(
             c,
-            feature_dim=pyramid_dim,
-            num_scales=3,
+            feature_dim=pose_feature_dim,
+            num_scales=self.num_feature_levels,
             num_points=config.deformable_points,
-            offset_scale=0.35,
-            min_radius_cells=config.deformable_min_radius_cells,
+            offset_scale=0.08,
+            min_radius_cells=0.5,
+            scale_prior_strength=config.deformable_scale_prior_strength,
+            scale_prior_center_cells=config.deformable_scale_prior_center_cells,
+            scale_prior_temperature=config.deformable_scale_prior_temperature,
         )
         self.coarse_xy_head = MLP(c, c, 2, depth=3)
         self.pose_xy_head = MLP(c, c, 2, depth=3)
@@ -895,7 +1121,7 @@ class QwenPoseModel(nn.Module):
             else None
         )
         if config.use_refinement:
-            self.local_proj = nn.Conv2d(pyramid_dim, c, 1)
+            self.local_proj = nn.Conv2d(pose_feature_dim, c, 1)
             joint_context_layer = nn.TransformerEncoderLayer(
                 d_model=c,
                 nhead=config.decoder_heads,
@@ -911,7 +1137,11 @@ class QwenPoseModel(nn.Module):
             self.refine_patch_weight_heads = nn.ModuleList(
                 [nn.Linear(c, 9) for _ in range(refinement_steps)]
             )
-            self.refine_step_scales = nn.Parameter(torch.full((refinement_steps,), -0.5))
+            initial_scales = torch.tensor(
+                [0.75, 0.50, 0.35] + [0.35] * max(refinement_steps - 3, 0),
+                dtype=torch.float32,
+            )[:refinement_steps]
+            self.refine_step_scales = nn.Parameter(torch.logit(initial_scales))
             for head in self.refine_heads:
                 self._zero_init_last_linear(head)
             for fuser in self.refine_token_fusers:
@@ -936,12 +1166,87 @@ class QwenPoseModel(nn.Module):
         if self.person_confidence_head is not None:
             self._zero_init_last_linear(self.person_confidence_head)
 
+    def build_locate_pose_features(
+        self,
+        external_feature_map: torch.Tensor | SpatialFeatureBatch | MultiScaleSpatialFeatureBatch,
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        int,
+        int,
+    ]:
+        """Project true P2/P3 native grids independently before dynamic padding."""
+
+        def as_spatial_batch(value: torch.Tensor | SpatialFeatureBatch) -> SpatialFeatureBatch:
+            if isinstance(value, SpatialFeatureBatch):
+                return value
+            batch_size, _, height, width = value.shape
+            shapes = torch.tensor(
+                [[height, width]] * batch_size,
+                device=value.device,
+                dtype=torch.long,
+            )
+            return SpatialFeatureBatch(value, shapes)
+
+        if isinstance(external_feature_map, MultiScaleSpatialFeatureBatch):
+            if self.num_feature_levels != 2 or self.high_res_feature_proj is None:
+                raise ValueError(
+                    "Received Locate P2/P3 features but PoseHead was not configured "
+                    "with high_res_external_dim."
+                )
+            if len(external_feature_map.levels) != 2:
+                raise ValueError("Locate multi-scale input must contain exactly P2 and P3.")
+            raw_levels = list(external_feature_map.levels)
+            projections = [self.high_res_feature_proj, self.external_feature_proj]
+            roi_level_idx = 1
+            local_level_idx = 0
+        else:
+            if self.num_feature_levels != 1:
+                raise ValueError(
+                    "PoseHead expects true Locate P2/P3 features but received one feature level."
+                )
+            raw_levels = [as_spatial_batch(external_feature_map)]
+            projections = [self.external_feature_proj]
+            roi_level_idx = 0
+            local_level_idx = 0
+
+        projected_levels: list[torch.Tensor] = []
+        spatial_shapes: list[torch.Tensor] = []
+        valid_masks: list[torch.Tensor] = []
+        for level_idx, (raw_level, projection) in enumerate(zip(raw_levels, projections)):
+            projection_dtype = projection.weight.dtype
+            projected_maps = []
+            level_embed = self.feature_level_embeddings[level_idx].to(
+                device=raw_level.device,
+                dtype=projection_dtype,
+            ).view(-1, 1, 1)
+            for batch_idx, (height, width) in enumerate(
+                raw_level.spatial_shapes.detach().cpu().tolist()
+            ):
+                native_map = raw_level.tensor[
+                    batch_idx : batch_idx + 1, :, : int(height), : int(width)
+                ]
+                projected = projection(native_map.to(dtype=projection_dtype)).squeeze(0)
+                projected_maps.append(projected + level_embed)
+            projected_batch = SpatialFeatureBatch.from_maps(projected_maps)
+            projected_levels.append(projected_batch.tensor)
+            spatial_shapes.append(projected_batch.spatial_shapes)
+            valid_masks.append(projected_batch.valid_mask())
+        return (
+            projected_levels,
+            spatial_shapes,
+            valid_masks,
+            roi_level_idx,
+            local_level_idx,
+        )
+
     def forward(
         self,
         schema_ids: torch.Tensor,
         task_ids: torch.Tensor,
         images: torch.Tensor | None = None,
-        external_feature_map: torch.Tensor | None = None,
+        external_feature_map: torch.Tensor | SpatialFeatureBatch | MultiScaleSpatialFeatureBatch | None = None,
         external_text_embed: torch.Tensor | None = None,
         target_boxes: torch.Tensor | None = None,
         target_box_mask: torch.Tensor | None = None,
@@ -961,62 +1266,47 @@ class QwenPoseModel(nn.Module):
         keypoint_dn_source_indices: torch.Tensor | None = None,
         keypoint_dn_group_ids: torch.Tensor | None = None,
         keypoint_dn_box_query_indices: torch.Tensor | None = None,
+        pose_condition_box_mode: str = "refined_detached",
     ) -> dict[str, torch.Tensor]:
         if external_feature_map is None or external_text_embed is None:
-            raise ValueError("QwenPoseModel now requires Qwen3-VL external_feature_map and external_text_embed.")
+            raise ValueError(
+                "QwenPoseModel requires backbone external_feature_map and external_text_embed."
+            )
+        if pose_condition_box_mode not in {"refined_detached", "input"}:
+            raise ValueError(
+                "pose_condition_box_mode must be 'refined_detached' or 'input', "
+                f"got {pose_condition_box_mode!r}."
+            )
         use_person_queries = bool(self.config.use_global_person_queries)
         if not use_person_queries and (target_boxes is None or target_box_mask is None):
             raise ValueError("QwenPoseModel requires external box conditions when person queries are disabled.")
+        feature_device = external_feature_map.device
         batch_size = int(external_feature_map.shape[0])
         if use_person_queries:
             if self.person_query_reference_logits is None or self.person_query_embed is None:
                 raise RuntimeError("Global person-query mode was enabled without person-query parameters.")
             target_boxes = boxes_from_cxcywh(
                 self.person_query_reference_logits.to(
-                    device=external_feature_map.device, dtype=torch.float32
+                    device=feature_device, dtype=torch.float32
                 )
             )[None].expand(batch_size, -1, -1)
             target_box_mask = torch.ones(
                 batch_size,
                 int(self.config.num_person_queries),
-                device=external_feature_map.device,
+                device=feature_device,
                 dtype=torch.bool,
             )
         else:
             assert target_boxes is not None and target_box_mask is not None
-            target_boxes = target_boxes.to(device=external_feature_map.device, dtype=torch.float32).clamp(0.0, 1.0)
-            target_box_mask = target_box_mask.to(device=external_feature_map.device).bool()
-        if images is None or images.shape[-2] <= 1 or images.shape[-1] <= 1:
-            raise ValueError("The unified pose pyramid requires the 800x800 RGB tensor.")
-        pyramid_dtype = self.external_feature_proj.weight.dtype
-        rgb_images = images.to(device=external_feature_map.device, dtype=pyramid_dtype)
-        image_size = max(int(self.config.rgb_input_size), 1)
-        if tuple(rgb_images.shape[-2:]) != (image_size, image_size):
-            rgb_images = F.interpolate(
-                rgb_images,
-                size=(image_size, image_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-        rgb_mean = self.rgb_mean.to(device=rgb_images.device, dtype=rgb_images.dtype)
-        rgb_std = self.rgb_std.to(device=rgb_images.device, dtype=rgb_images.dtype)
-        rgb_pyramid = self.pose_pyramid((rgb_images - rgb_mean) / rgb_std)
-
-        locate_map = self.external_feature_proj(external_feature_map.to(dtype=pyramid_dtype))
-        locate_map = self.spatial_injector(locate_map)
-        feature_maps: list[torch.Tensor] = []
-        for level_idx, rgb_feature in enumerate(rgb_pyramid):
-            locate_level = F.interpolate(
-                locate_map,
-                size=rgb_feature.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            fuse_delta = self.locate_fuse[level_idx](
-                torch.cat([rgb_feature, locate_level], dim=1)
-            )
-            gate = self.locate_fuse_gates[level_idx].sigmoid().to(dtype=fuse_delta.dtype)
-            feature_maps.append(rgb_feature + gate * fuse_delta)
+            target_boxes = target_boxes.to(device=feature_device, dtype=torch.float32).clamp(0.0, 1.0)
+            target_box_mask = target_box_mask.to(device=feature_device).bool()
+        (
+            feature_maps,
+            spatial_shapes,
+            spatial_valid_masks,
+            roi_level_idx,
+            local_level_idx,
+        ) = self.build_locate_pose_features(external_feature_map)
         text_dtype = next(self.external_text_proj.parameters()).dtype
         text_embed = self.external_text_proj(external_text_embed.to(dtype=text_dtype))
         b = int(target_boxes.shape[0])
@@ -1044,11 +1334,14 @@ class QwenPoseModel(nn.Module):
                     dtype=feature.dtype,
                 )
                 conditioned_maps.append(
-                    feature * (1.0 + task_level_gate * gamma)
-                    + task_level_gate * beta
+                    (
+                        feature * (1.0 + task_level_gate * gamma)
+                        + task_level_gate * beta
+                    )
+                    * spatial_valid_masks[level_idx][:, None].to(dtype=feature.dtype)
                 )
             feature_maps = conditioned_maps
-        feature_map = feature_maps[1]
+        feature_map = feature_maps[roi_level_idx]
         main_count = int(target_boxes.shape[1])
         box_mask = target_box_mask
 
@@ -1092,13 +1385,16 @@ class QwenPoseModel(nn.Module):
             )
 
         def pooled_human_context(current_boxes: torch.Tensor) -> torch.Tensor:
-            pooled_levels = []
-            for level in feature_maps:
-                pooled = self._sample_box_feature_maps(level, current_boxes, 3).mean(dim=(-2, -1))
-                pooled_levels.append(pooled)
-            concatenated = torch.cat(pooled_levels, dim=-1)
+            # Dense person identity/context remains anchored to P3; P2/P3 are
+            # both available through the sparse deformable branch below.
+            pooled = self._sample_box_feature_maps(
+                feature_maps[roi_level_idx],
+                current_boxes,
+                3,
+                spatial_shapes[roi_level_idx],
+            ).mean(dim=(-2, -1))
             projection_dtype = next(self.human_context_proj.parameters()).dtype
-            return self.human_context_proj(concatenated.to(dtype=projection_dtype))
+            return self.human_context_proj(pooled.to(dtype=projection_dtype))
 
         current_boxes = all_boxes
         human_context = pooled_human_context(current_boxes)
@@ -1135,6 +1431,7 @@ class QwenPoseModel(nn.Module):
                 human_tokens,
                 current_boxes,
                 feature_maps,
+                spatial_shapes,
             )
             deltas = self.human_box_heads[layer_idx](human_tokens)
             current_boxes = refine_boxes_xyxy(current_boxes, deltas)
@@ -1251,11 +1548,14 @@ class QwenPoseModel(nn.Module):
                 torch.zeros_like(paired_dn_boxes),
             )
 
-        # Box and pose are separately supervised regression branches.  Pose
-        # consumes the refined box geometrically, but must not update the box
-        # decoder through ROIAlign/Fourier sampling.  This is also identical to
-        # the paired box-DN -> pose-DN boundary below.
-        combined_boxes = refined_boxes.detach()
+        # The normal path keeps the historical box->pose detach boundary.  Joint
+        # soft-box training feeds differentiable Locate boxes into the same main
+        # PoseHead pass so downstream pose/box error can update both PoseHead and Locate LoRA.
+        combined_boxes = (
+            input_boxes
+            if pose_condition_box_mode == "input"
+            else refined_boxes.detach()
+        )
         combined_box_mask = box_mask
         combined_initial_keypoints: torch.Tensor | None = None
         combined_initial_valid: torch.Tensor | None = None
@@ -1264,7 +1564,12 @@ class QwenPoseModel(nn.Module):
         combined_dn_groups: torch.Tensor | None = None
         if pose_dn_count > 0 and paired_dn_boxes is not None and pose_dn_mask is not None:
             union_count = int(keypoint_dn_noisy_keypoints.shape[2])
-            combined_boxes = torch.cat([refined_boxes.detach(), paired_dn_boxes], dim=1)
+            main_pose_boxes = (
+                input_boxes
+                if pose_condition_box_mode == "input"
+                else refined_boxes.detach()
+            )
+            combined_boxes = torch.cat([main_pose_boxes, paired_dn_boxes], dim=1)
             combined_box_mask = torch.cat([box_mask, pose_dn_mask], dim=1)
             main_initial = keypoint_dn_noisy_keypoints.new_zeros(
                 (b, main_count, union_count, 2)
@@ -1310,6 +1615,9 @@ class QwenPoseModel(nn.Module):
 
         combined_pose = self._run_pose_branch(
             feature_maps=feature_maps,
+            spatial_shapes=spatial_shapes,
+            roi_level_idx=roi_level_idx,
+            local_level_idx=local_level_idx,
             text_embed=text_embed,
             ref_task_gate=(torch.zeros_like(ref_task_gate) if use_person_queries else ref_task_gate),
             schema_ids=schema_ids,
@@ -1337,6 +1645,10 @@ class QwenPoseModel(nn.Module):
             "keypoint_confidence_logits": query_slice(
                 combined_pose["keypoint_confidence_logits"], 0, main_count
             ),
+            "decoder_keypoints": [
+                query_slice(value, 0, main_count)
+                for value in combined_pose["decoder_keypoints"]
+            ],
             "coarse_keypoints": query_slice(
                 combined_pose["coarse_keypoints"], 0, main_count
             ),
@@ -1383,6 +1695,7 @@ class QwenPoseModel(nn.Module):
             "keypoints": main_pose["keypoints"],
             "keypoint_valid_mask": main_pose["keypoint_valid_mask"],
             "keypoint_confidence_logits": main_pose["keypoint_confidence_logits"],
+            "decoder_keypoints": main_pose["decoder_keypoints"],
             "coarse_keypoints": main_pose["coarse_keypoints"],
             "deform_keypoints": main_pose["deform_keypoints"],
             "ref_logits": ref_logits,
@@ -1418,6 +1731,8 @@ class QwenPoseModel(nn.Module):
                     else current_boxes[:, main_count:].detach(),
                 }
             )
+        if main_pose["decoder_keypoints"]:
+            outputs["decoder_keypoints"] = main_pose["decoder_keypoints"]
         if main_pose["refine_keypoints"]:
             outputs["refine_keypoints"] = main_pose["refine_keypoints"]
 
@@ -1429,6 +1744,10 @@ class QwenPoseModel(nn.Module):
                     "keypoint_dn_keypoints": query_slice(
                         combined_pose["keypoints"], pose_start, pose_end
                     ),
+                    "keypoint_dn_decoder_keypoints": [
+                        query_slice(value, pose_start, pose_end)
+                        for value in combined_pose["decoder_keypoints"]
+                    ],
                     "keypoint_dn_coarse_keypoints": query_slice(
                         combined_pose["coarse_keypoints"], pose_start, pose_end
                     ),
@@ -1466,6 +1785,9 @@ class QwenPoseModel(nn.Module):
         self,
         *,
         feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        roi_level_idx: int,
+        local_level_idx: int,
         text_embed: torch.Tensor,
         ref_task_gate: torch.Tensor,
         schema_ids: torch.Tensor,
@@ -1481,11 +1803,10 @@ class QwenPoseModel(nn.Module):
         """Run normal and training-only paired-DN persons in one pose stack.
 
         ``initial_query_mask`` marks the DN slots that receive noisy keypoint
-        references. Main and DN slots share computation and weights but are
-        mutually blocked in same-joint self-attention; DN groups are isolated
-        from one another as well.
+        references. Main queries cannot read DN slots, DN queries may read main
+        slots, and different DN groups remain isolated in same-role attention.
         """
-        feature_map = feature_maps[1]
+        feature_map = feature_maps[roi_level_idx]
         b, num_boxes = int(refined_boxes.shape[0]), int(refined_boxes.shape[1])
         c = int(self.config.hidden_dim)
         boxes = expand_boxes_xyxy(
@@ -1494,26 +1815,29 @@ class QwenPoseModel(nn.Module):
         box_mask = box_mask.to(device=feature_map.device).bool()
         box_embed = self.box_query_proj(box_fourier_pe(refined_boxes, c))
         roi_size = max(int(self.config.pose_roi_size), 2)
-        roi_levels = [
-            self._sample_box_feature_maps(level, boxes, roi_size)
-            for level in feature_maps
-        ]
-        roi_concat = torch.cat(roi_levels, dim=2)
-        roi_concat = roi_concat * box_mask.view(b, num_boxes, 1, 1, 1).to(
-            dtype=roi_concat.dtype
+        # The dense ROI is intentionally P3-only: it anchors person identity and
+        # whole-body structure without compressing P2 into another fixed memory.
+        roi_source = self._sample_box_feature_maps(
+            feature_maps[roi_level_idx],
+            boxes,
+            roi_size,
+            spatial_shapes[roi_level_idx],
         )
-        flat_roi = roi_concat.reshape(
-            b * num_boxes, roi_concat.shape[2], roi_size, roi_size
+        roi_source = roi_source * box_mask.view(b, num_boxes, 1, 1, 1).to(
+            dtype=roi_source.dtype
+        )
+        flat_roi = roi_source.reshape(
+            b * num_boxes, roi_source.shape[2], roi_size, roi_size
         )
         roi_features = self.roi_memory_proj(flat_roi).view(
             b, num_boxes, c, roi_size, roi_size
         )
         roi_embed = self.roi_pool_proj(roi_features.mean(dim=(-2, -1)))
-        global_pyramid = torch.cat(
-            [level.mean(dim=(-2, -1)) for level in feature_maps], dim=-1
+        global_visual = _masked_spatial_mean(
+            feature_maps[roi_level_idx], spatial_shapes[roi_level_idx]
         )
         image_embed = self.human_context_proj(
-            global_pyramid.to(dtype=next(self.human_context_proj.parameters()).dtype)
+            global_visual.to(dtype=next(self.human_context_proj.parameters()).dtype)
         )
         instance_text = (
             float(self.config.ref_text_scale)
@@ -1543,24 +1867,56 @@ class QwenPoseModel(nn.Module):
             * ref_task_gate.view(b, 1, 1, 1)
             * text_embed.view(b, 1, 1, c)
         )
+        joint_type = self.pose_token_type_embed.weight[1].view(1, 1, 1, c)
         pose_tokens = (
             instance[:, :, None, :]
             + joint_base
             + task
             + box_pe
             + text_condition
+            + joint_type
         )
-        joint_reference: torch.Tensor | None = None
-        if self.config.pose_coordinate_init == "schema_prior":
-            if self.schema_joint_priors is None:
-                raise RuntimeError("Legacy schema-prior mode requires its prior buffer.")
+        instance_type = self.pose_token_type_embed.weight[0].view(1, 1, c)
+        instance_token = self.pose_instance_token_norm(instance + instance_type)
+
+        schema_prior_active: torch.Tensor | None = None
+        if self.schema_joint_priors is not None:
             schema_prior_all = self.schema_joint_priors.to(
                 device=feature_map.device, dtype=feature_map.dtype
             )[schema_ids]
-            joint_reference = torch.gather(
+            schema_prior_active = torch.gather(
                 schema_prior_all,
                 dim=1,
                 index=schema_joint_indices[..., None].expand(-1, -1, 2),
+            )
+
+        if self.config.pose_coordinate_init == "anatomical_dynamic":
+            if schema_prior_active is None or self.reference_offset_head is None:
+                raise RuntimeError(
+                    "Dynamic anatomical mode requires schema priors and a reference offset head."
+                )
+            expanded_joint = joint_base.expand(-1, num_boxes, -1, -1)
+            expanded_instance = instance[:, :, None, :].expand(-1, -1, active_k, -1)
+            reference_input = torch.cat([expanded_instance, expanded_joint], dim=-1)
+            reference_dtype = next(self.reference_offset_head.parameters()).dtype
+            reference_offset = self.reference_offset_head(
+                reference_input.to(dtype=reference_dtype)
+            ).float()
+            reference_offset = (
+                float(self.config.dynamic_reference_offset_scale)
+                * torch.tanh(reference_offset)
+            )
+            prior_logits = torch.logit(
+                schema_prior_active.float().clamp(1e-4, 1.0 - 1e-4)
+            )[:, None]
+            default_reference_rel = torch.sigmoid(
+                prior_logits + reference_offset
+            ).to(dtype=feature_map.dtype)
+        elif self.config.pose_coordinate_init == "schema_prior":
+            if schema_prior_active is None:
+                raise RuntimeError("Legacy schema-prior mode requires its prior buffer.")
+            default_reference_rel = schema_prior_active[:, None].expand(
+                -1, num_boxes, -1, -1
             )
         elif self.config.pose_coordinate_init == "learned_spread":
             if self.joint_reference_logits is None:
@@ -1569,21 +1925,17 @@ class QwenPoseModel(nn.Module):
                 device=feature_map.device,
                 dtype=feature_map.dtype,
             )
-            joint_reference = torch.gather(
+            active_reference = torch.gather(
                 union_reference[None].expand(b, -1, -1),
                 dim=1,
                 index=schema_joint_indices[..., None].expand(-1, -1, 2),
             )
-        if joint_reference is not None:
-            # A reference point is a spatial anchor, not an alternate
-            # high-frequency regression path.  The largest Fourier component
-            # has a derivative of roughly 256*pi; allowing it to update the
-            # learned anchors caused bf16 gradients for
-            # ``joint_reference_logits`` (and then the shared decoder) to
-            # overflow.  The anchors still learn from the explicitly
-            # supervised coarse-coordinate base below.
-            pose_tokens = pose_tokens + point_fourier_pe(joint_reference.detach(), c).view(
-                b, 1, active_k, c
+            default_reference_rel = active_reference[:, None].expand(
+                -1, num_boxes, -1, -1
+            )
+        else:
+            default_reference_rel = boxes.new_full(
+                (b, num_boxes, active_k, 2), 0.5
             )
 
         initial_active: torch.Tensor | None = None
@@ -1609,16 +1961,10 @@ class QwenPoseModel(nn.Module):
             )
             initial_active = torch.gather(initial_keypoints, dim=2, index=gather_index)
             wh_for_reference = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
-            if joint_reference is None:
-                fallback_absolute = (
-                    boxes[..., None, :2] + 0.5 * wh_for_reference[..., None, :]
-                ).expand(-1, -1, active_k, -1)
-            else:
-                fallback_absolute = (
-                    boxes[..., None, :2]
-                    + joint_reference.detach()[:, None, :, :]
-                    * wh_for_reference[..., None, :]
-                )
+            fallback_absolute = (
+                boxes[..., None, :2]
+                + default_reference_rel.detach() * wh_for_reference[..., None, :]
+            )
             if initial_keypoint_valid is not None:
                 initial_valid_active = torch.gather(
                     initial_keypoint_valid.to(device=feature_map.device).bool(),
@@ -1631,10 +1977,6 @@ class QwenPoseModel(nn.Module):
                     initial_valid_active[..., None], initial_active, fallback_absolute
                 )
             initial_active = initial_active.clamp(0.0, 1.0)
-            initial_pe = point_fourier_pe(initial_active, c)
-            pose_tokens = pose_tokens + initial_pe * active_initial_query_mask[
-                ..., None, None
-            ].to(dtype=initial_pe.dtype)
             if dn_labels is not None and self.keypoint_dn_type_embed is not None:
                 type_indices = dn_labels.to(
                     device=feature_map.device, dtype=torch.long
@@ -1649,68 +1991,29 @@ class QwenPoseModel(nn.Module):
             schema_joint_valid[:, None, :].expand(b, num_boxes, active_k)
             & box_mask[:, :, None]
         )
-        same_joint_tokens = pose_tokens.permute(0, 2, 1, 3).reshape(
-            b * active_k, num_boxes, c
-        )
-        same_joint_valid = (
-            schema_joint_valid[:, :, None].expand(b, active_k, num_boxes)
-            & box_mask[:, None, :]
-        ).reshape(b * active_k, num_boxes)
-        same_joint_padding_mask = ~same_joint_valid
-        same_joint_padding_mask = same_joint_padding_mask.masked_fill(
-            same_joint_padding_mask.all(dim=1, keepdim=True), False
-        )
-        same_joint_attention_mask: torch.Tensor | None = None
-        if dn_group_ids is not None or active_initial_query_mask is not None:
-            # TransformerEncoder accepts a per-(batch*head) attention mask.
-            # The flattening order below matches same_joint_tokens: batch first,
-            # then active joint. Main<->DN information paths and cross-group DN
-            # paths are both blocked.
-            group_ids = (
-                dn_group_ids.to(device=feature_map.device, dtype=torch.long)
-                if dn_group_ids is not None
-                else torch.full(
-                    (b, num_boxes),
-                    -1,
-                    device=feature_map.device,
-                    dtype=torch.long,
+        wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
+        current_reference_rel = default_reference_rel.clamp(1e-4, 1.0 - 1e-4)
+        if initial_active is not None:
+            initial_rel = (
+                (initial_active - boxes[..., None, :2]) / wh[..., None, :]
+            ).clamp(1e-4, 1.0 - 1e-4)
+            if active_initial_query_mask is None:
+                current_reference_rel = initial_rel
+            else:
+                current_reference_rel = torch.where(
+                    active_initial_query_mask[..., None, None],
+                    initial_rel,
+                    current_reference_rel,
                 )
-            )
-            if group_ids.shape != (b, num_boxes):
-                raise ValueError(
-                    "keypoint DN group IDs must have shape "
-                    f"{(b, num_boxes)}, got {tuple(group_ids.shape)}."
-                )
-            dn_queries = (
-                active_initial_query_mask
-                if active_initial_query_mask is not None
-                else group_ids.ge(0) & box_mask
-            )
-            cross_role = (
-                dn_queries[:, :, None].ne(dn_queries[:, None, :])
-                & box_mask[:, :, None]
-                & box_mask[:, None, :]
-            )
-            valid_groups = group_ids.ge(0) & box_mask & dn_queries
-            cross_group = (
-                group_ids[:, :, None].ne(group_ids[:, None, :])
-                & valid_groups[:, :, None]
-                & valid_groups[:, None, :]
-            )
-            per_joint_mask = (cross_role | cross_group)[:, None, :, :].expand(
-                b, active_k, num_boxes, num_boxes
-            ).reshape(b * active_k, num_boxes, num_boxes)
-            same_joint_attention_mask = per_joint_mask.repeat_interleave(
-                int(self.config.decoder_heads), dim=0
-            )
-        same_joint_tokens = self.same_joint_context(
-            same_joint_tokens,
-            mask=same_joint_attention_mask,
-            src_key_padding_mask=same_joint_padding_mask,
+
+        group_tokens = torch.cat([instance_token[:, :, None, :], pose_tokens], dim=2)
+        group_valid = torch.cat([box_mask[:, :, None], pose_valid], dim=2)
+        same_role_attention_mask = self._build_group_pose_attention_mask(
+            box_mask=box_mask,
+            dn_query_mask=active_initial_query_mask,
+            dn_group_ids=dn_group_ids,
+            num_roles=active_k + 1,
         )
-        pose_tokens = same_joint_tokens.view(
-            b, active_k, num_boxes, c
-        ).permute(0, 2, 1, 3)
 
         roi_memory = roi_features.flatten(3).permute(0, 1, 3, 2)
         roi_pe = self.pos_encoding(roi_size, roi_size, feature_map.device).to(
@@ -1719,83 +2022,86 @@ class QwenPoseModel(nn.Module):
         roi_memory = self.roi_memory_norm(
             roi_memory + roi_pe.view(1, 1, roi_size * roi_size, c)
         ).reshape(b * num_boxes, roi_size * roi_size, c)
-        pose_tokens = pose_tokens.reshape(b * num_boxes, active_k, c)
-        pose_padding_mask = ~pose_valid.reshape(b * num_boxes, active_k)
-        pose_padding_mask = pose_padding_mask.masked_fill(
-            pose_padding_mask.all(dim=1, keepdim=True), False
-        )
-        pose_tokens = self.pose_decoder(
-            pose_tokens, roi_memory, tgt_key_padding_mask=pose_padding_mask
-        ).view(b, num_boxes, active_k, c)
 
-        wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=1e-4)
-        if joint_reference is None:
-            # sigmoid(0)=0.5: a neutral center reference that contains no
-            # articulated pose. The image-conditioned coarse head must earn
-            # the first actual skeleton prediction.
-            default_coarse_base_logits = boxes.new_zeros((b, 1, active_k, 2))
-        else:
-            default_coarse_base_logits = torch.logit(
-                joint_reference.clamp(1e-4, 1.0 - 1e-4)
-            ).view(b, 1, active_k, 2)
-        default_coarse_base_logits = default_coarse_base_logits.expand(
-            -1, num_boxes, -1, -1
-        )
-        if initial_active is None:
-            coarse_base_logits = default_coarse_base_logits
-        else:
-            initial_rel = (
-                (initial_active - boxes[..., None, :2]) / wh[..., None, :]
-            ).clamp(1e-4, 1.0 - 1e-4)
-            initial_base_logits = torch.logit(initial_rel)
-            if active_initial_query_mask is None:
-                coarse_base_logits = initial_base_logits
-            else:
-                coarse_base_logits = torch.where(
-                    active_initial_query_mask[..., None, None],
-                    initial_base_logits,
-                    default_coarse_base_logits,
-                )
+        decoder_reference_xy_steps: list[torch.Tensor] = []
+        center_reference = current_reference_rel.new_full((b, num_boxes, 1, 2), 0.5)
+        for decoder_idx, (
+            decoder_layer,
+            decoder_deformable,
+            decoder_coordinate_head,
+        ) in enumerate(
+            zip(
+                self.pose_group_decoder_layers,
+                self.pose_decoder_deformable_attention,
+                self.pose_decoder_coordinate_heads,
+            )
+        ):
+            role_reference = torch.cat(
+                [center_reference, current_reference_rel.detach()], dim=2
+            )
+            role_position = point_fourier_pe(role_reference, c)
+            group_tokens = decoder_layer(
+                group_tokens,
+                role_position,
+                group_valid,
+                roi_memory,
+                same_role_attention_mask,
+            )
+            pose_tokens = group_tokens[:, :, 1:]
+            current_reference_xy = (
+                boxes[..., None, :2]
+                + current_reference_rel.detach() * wh[..., None, :]
+            ).clamp(0.0, 1.0)
+            pose_tokens = decoder_deformable(
+                pose_tokens,
+                current_reference_xy,
+                wh,
+                feature_maps,
+                spatial_shapes,
+            )
+            reference_base = (
+                current_reference_rel
+                if decoder_idx == 0
+                else current_reference_rel.detach()
+            )
+            reference_delta = decoder_coordinate_head(pose_tokens).float()
+            current_reference_rel = torch.sigmoid(
+                torch.logit(reference_base.float().clamp(1e-4, 1.0 - 1e-4))
+                + reference_delta
+            ).to(dtype=feature_map.dtype)
+            decoder_reference_xy_steps.append(
+                (
+                    boxes[..., None, :2]
+                    + current_reference_rel * wh[..., None, :]
+                ).clamp(0.0, 1.0)
+            )
+            group_tokens = torch.cat(
+                [group_tokens[:, :, :1], pose_tokens], dim=2
+            )
+
         coarse_tokens = pose_tokens
         coarse_rel_xy = torch.sigmoid(
-            coarse_base_logits + self.coarse_xy_head(coarse_tokens)
-        )
+            torch.logit(current_reference_rel.float().clamp(1e-4, 1.0 - 1e-4))
+            + self.coarse_xy_head(coarse_tokens).float()
+        ).to(dtype=feature_map.dtype)
         coarse_reference_xy = (
             boxes[..., None, :2] + coarse_rel_xy * wh[..., None, :]
         ).clamp(0.0, 1.0)
         pose_tokens = self.deformable_joint_attention(
-            coarse_tokens, coarse_reference_xy, wh, feature_maps
+            coarse_tokens, coarse_reference_xy, wh, feature_maps, spatial_shapes
         )
 
         coarse_rel_detached = (
             (coarse_reference_xy.detach() - boxes[..., None, :2])
             / wh[..., None, :]
         ).clamp(1e-4, 1.0 - 1e-4)
-        coarse_deform_base_logits = torch.logit(coarse_rel_detached)
-        if self.config.pose_coordinate_init == "schema_prior":
-            assert joint_reference is not None
-            # Parameter-exact legacy behavior for evaluating old checkpoints.
-            legacy_deform_base_logits = torch.logit(
-                joint_reference.clamp(1e-4, 1.0 - 1e-4)
-            ).view(b, 1, active_k, 2).expand(-1, num_boxes, -1, -1)
-            if active_initial_query_mask is None:
-                deform_base_logits = (
-                    legacy_deform_base_logits
-                    if initial_active is None
-                    else coarse_deform_base_logits
-                )
-            else:
-                deform_base_logits = torch.where(
-                    active_initial_query_mask[..., None, None],
-                    coarse_deform_base_logits,
-                    legacy_deform_base_logits,
-                )
-        else:
-            # The learned coarse prediction is the sole spatial reference for
-            # the deform stage. Detaching follows iterative DAB/DINO refinement
-            # and prevents later losses from bypassing coarse supervision.
-            deform_base_logits = coarse_deform_base_logits
-        rel_xy = torch.sigmoid(deform_base_logits + self.pose_xy_head(pose_tokens))
+        # Every coordinate mode now uses the final grouped-decoder/coarse output
+        # as the sole deformable-stage reference. This keeps the iterative path
+        # identical for main and DN queries.
+        deform_base_logits = torch.logit(coarse_rel_detached.float())
+        rel_xy = torch.sigmoid(
+            deform_base_logits + self.pose_xy_head(pose_tokens).float()
+        ).to(dtype=feature_map.dtype)
         keypoint_xy = (
             boxes[..., None, :2] + rel_xy * wh[..., None, :]
         ).clamp(0.0, 1.0)
@@ -1809,11 +2115,29 @@ class QwenPoseModel(nn.Module):
             and self.joint_context is not None
             and self.local_proj is not None
         ):
-            local_feature_map = self.local_proj(feature_maps[0])
+            # Final coordinate refinement reads only the true high-resolution
+            # P2 grid when present; samples remain free to move outside the ROI.
+            local_feature_map = self.local_proj(feature_maps[local_level_idx])
+            local_shapes = spatial_shapes[local_level_idx]
+            local_rows = torch.arange(
+                local_feature_map.shape[-2], device=local_feature_map.device
+            )[None, :, None]
+            local_cols = torch.arange(
+                local_feature_map.shape[-1], device=local_feature_map.device
+            )[None, None, :]
+            local_valid = (
+                (local_rows < local_shapes[:, 0, None, None])
+                & (local_cols < local_shapes[:, 1, None, None])
+            )
+            local_feature_map = local_feature_map * local_valid[:, None].to(
+                dtype=local_feature_map.dtype
+            )
             context_mask = ~pose_valid.reshape(b * num_boxes, active_k)
             context_mask = context_mask.masked_fill(
                 context_mask.all(dim=1, keepdim=True), False
             )
+            refine_radius_scales = (0.06, 0.03, 0.015)
+            refine_min_radius_cells = (2.0, 1.0, 0.5)
             for refine_idx, (refine_head, token_fuser, patch_weight_head) in enumerate(
                 zip(
                     self.refine_heads,
@@ -1833,19 +2157,28 @@ class QwenPoseModel(nn.Module):
                     keypoint_xy.detach(),
                     wh.detach(),
                     patch_logits,
+                    local_shapes,
                     patch_size=3,
-                    radius_scale=0.08,
-                    min_radius_cells=self.config.deformable_min_radius_cells,
+                    radius_scale=refine_radius_scales[
+                        min(refine_idx, len(refine_radius_scales) - 1)
+                    ],
+                    min_radius_cells=refine_min_radius_cells[
+                        min(refine_idx, len(refine_min_radius_cells) - 1)
+                    ],
                 )
                 point_pe = point_fourier_pe(keypoint_xy.detach(), c)
                 refine_input = torch.cat([pose_tokens, local, point_pe], dim=-1)
-                delta = torch.tanh(refine_head(refine_input))
-                scale = (
-                    self.refine_step_scales[refine_idx].sigmoid().to(dtype=delta.dtype)
-                    * 0.35
-                )
+                delta = torch.tanh(refine_head(refine_input)).float()
+                scale = self.refine_step_scales[refine_idx].sigmoid().float()
+                current_rel = (
+                    (keypoint_xy.detach() - boxes[..., None, :2])
+                    / wh[..., None, :]
+                ).float().clamp(1e-4, 1.0 - 1e-4)
+                refined_rel = torch.sigmoid(
+                    torch.logit(current_rel) + delta * scale
+                ).to(dtype=feature_map.dtype)
                 keypoint_xy = (
-                    keypoint_xy + delta * wh[..., None, :] * scale
+                    boxes[..., None, :2] + refined_rel * wh[..., None, :]
                 ).clamp(0.0, 1.0)
                 refine_keypoint_xy_steps.append(keypoint_xy)
                 pose_tokens = pose_tokens + token_fuser(refine_input)
@@ -1881,6 +2214,12 @@ class QwenPoseModel(nn.Module):
         keypoint_confidence_logits = self._scatter_schema_keypoints(
             schema_confidence_logits, schema_scatter_map
         ).squeeze(-1)
+        decoder_keypoints = [
+            self._scatter_schema_keypoints(
+                torch.cat([xy, aux_confidence], dim=-1), schema_scatter_map
+            )
+            for xy in decoder_reference_xy_steps
+        ]
         refine_keypoints = [
             self._scatter_schema_keypoints(
                 torch.cat([xy, aux_confidence], dim=-1), schema_scatter_map
@@ -1894,6 +2233,7 @@ class QwenPoseModel(nn.Module):
             "keypoints": keypoints,
             "keypoint_valid_mask": schema_scatter_map.bool().any(dim=1),
             "keypoint_confidence_logits": keypoint_confidence_logits,
+            "decoder_keypoints": decoder_keypoints,
             "coarse_keypoints": coarse_keypoints,
             "deform_keypoints": deform_keypoints,
             "refine_keypoints": refine_keypoints,
@@ -1903,9 +2243,67 @@ class QwenPoseModel(nn.Module):
 
     def initialize_person_confidence_from_visibility(self) -> None:
         raise RuntimeError(
-            "Legacy visibility-head rescue is incompatible with the unified 800x800 architecture. "
+            "Legacy visibility-head rescue is incompatible with the Locate-only architecture. "
             "Train a new Stage1 checkpoint."
         )
+
+    def _build_group_pose_attention_mask(
+        self,
+        *,
+        box_mask: torch.Tensor,
+        dn_query_mask: torch.Tensor | None,
+        dn_group_ids: torch.Tensor | None,
+        num_roles: int,
+    ) -> torch.Tensor | None:
+        """Build the asymmetric main/DN mask for same-role attention.
+
+        Main queries cannot read DN queries. DN queries may read main queries,
+        while DN queries from different groups remain mutually isolated.
+        """
+        b, num_people = box_mask.shape
+        if dn_query_mask is None and dn_group_ids is None:
+            return None
+        if dn_query_mask is None:
+            assert dn_group_ids is not None
+            dn_query_mask = dn_group_ids.to(device=box_mask.device).ge(0)
+        dn_queries = dn_query_mask.to(device=box_mask.device).bool() & box_mask
+        if dn_queries.shape != (b, num_people):
+            raise ValueError(
+                "keypoint DN query mask must have shape "
+                f"{(b, num_people)}, got {tuple(dn_queries.shape)}."
+            )
+        if dn_group_ids is None:
+            group_ids = torch.full(
+                (b, num_people),
+                -1,
+                device=box_mask.device,
+                dtype=torch.long,
+            )
+        else:
+            group_ids = dn_group_ids.to(device=box_mask.device, dtype=torch.long)
+            if group_ids.shape != (b, num_people):
+                raise ValueError(
+                    "keypoint DN group IDs must have shape "
+                    f"{(b, num_people)}, got {tuple(group_ids.shape)}."
+                )
+
+        main_queries = box_mask & ~dn_queries
+        main_to_dn = main_queries[:, :, None] & dn_queries[:, None, :]
+        valid_dn_groups = dn_queries & group_ids.ge(0)
+        cross_group = (
+            valid_dn_groups[:, :, None]
+            & valid_dn_groups[:, None, :]
+            & group_ids[:, :, None].ne(group_ids[:, None, :])
+        )
+        per_sample = main_to_dn | cross_group
+        diagonal = torch.eye(
+            num_people, device=box_mask.device, dtype=torch.bool
+        )[None]
+        per_sample = per_sample & ~diagonal
+        per_role = per_sample[:, None].expand(
+            b, int(num_roles), num_people, num_people
+        ).reshape(b * int(num_roles), num_people, num_people)
+        return per_role.repeat_interleave(int(self.config.decoder_heads), dim=0)
 
     @staticmethod
     def _build_schema_scatter_map(
@@ -1925,10 +2323,19 @@ class QwenPoseModel(nn.Module):
         return torch.einsum("bqkd,bku->bqud", values, schema_scatter_map)
 
     @staticmethod
-    def _sample_local_features(feature_map: torch.Tensor, keypoint_xy: torch.Tensor) -> torch.Tensor:
-        b, c, _, _ = feature_map.shape
+    def _sample_local_features(
+        feature_map: torch.Tensor,
+        keypoint_xy: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
+        b, c, feature_h, feature_w = feature_map.shape
         q, u = keypoint_xy.shape[1], keypoint_xy.shape[2]
-        grid = keypoint_xy * 2.0 - 1.0
+        grid = _padded_grid_from_normalized_points(
+            keypoint_xy.to(device=feature_map.device, dtype=feature_map.dtype),
+            spatial_shapes,
+            feature_h,
+            feature_w,
+        )
         grid = grid.view(b, q * u, 1, 2)
         sampled = F.grid_sample(feature_map, grid, align_corners=False)
         sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, u, c)
@@ -1940,6 +2347,7 @@ class QwenPoseModel(nn.Module):
         keypoint_xy: torch.Tensor,
         box_wh: torch.Tensor,
         patch_logits: torch.Tensor | None,
+        spatial_shapes: torch.Tensor,
         *,
         patch_size: int = 3,
         radius_scale: float = 0.08,
@@ -1956,16 +2364,22 @@ class QwenPoseModel(nn.Module):
         offsets = torch.stack([x, y], dim=-1).view(1, 1, 1, patch_size * patch_size, 2)
         radius = box_wh.to(device=feature_map.device, dtype=feature_map.dtype) * float(radius_scale)
         feature_h, feature_w = feature_map.shape[-2:]
-        minimum = radius.new_tensor(
+        minimum = torch.stack(
             [
-                float(min_radius_cells) / max(float(feature_w), 1.0),
-                float(min_radius_cells) / max(float(feature_h), 1.0),
-            ]
-        )
+                float(min_radius_cells) / spatial_shapes[:, 1].clamp(min=1).to(dtype=radius.dtype),
+                float(min_radius_cells) / spatial_shapes[:, 0].clamp(min=1).to(dtype=radius.dtype),
+            ],
+            dim=-1,
+        ).to(device=radius.device)[:, None, :]
         radius = torch.maximum(radius, minimum).view(b, q, 1, 1, 2)
         points = keypoint_xy.to(device=feature_map.device, dtype=feature_map.dtype).unsqueeze(3) + offsets * radius
         points = points.clamp(0.0, 1.0)
-        grid = points.view(b, q * u * patch_size * patch_size, 1, 2) * 2.0 - 1.0
+        grid = _padded_grid_from_normalized_points(
+            points,
+            spatial_shapes,
+            feature_h,
+            feature_w,
+        ).view(b, q * u * patch_size * patch_size, 1, 2)
         sampled = F.grid_sample(feature_map, grid, align_corners=False)
         sampled = sampled.squeeze(-1).transpose(1, 2).view(b, q, u, patch_size * patch_size, c)
         if patch_logits is None or patch_logits.shape[-1] != patch_size * patch_size:
@@ -1975,18 +2389,32 @@ class QwenPoseModel(nn.Module):
         return (sampled * weights.unsqueeze(-1)).sum(dim=3)
 
     @staticmethod
-    def _sample_box_feature_maps(feature_map: torch.Tensor, boxes: torch.Tensor, roi_size: int) -> torch.Tensor:
+    def _sample_box_feature_maps(
+        feature_map: torch.Tensor,
+        boxes: torch.Tensor,
+        roi_size: int,
+        spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
         b, c, _, _ = feature_map.shape
         num_boxes = boxes.shape[1]
         if num_boxes == 0:
             return feature_map.new_zeros(b, 0, c, roi_size, roi_size)
         if torchvision_roi_align is not None:
-            feature_h, feature_w = feature_map.shape[-2:]
             # Refined boxes carry gradients. Clone before numerical safety edits
             # so ROIAlign preparation never mutates an autograd view in-place.
             flat_boxes = boxes.to(dtype=feature_map.dtype).reshape(b * num_boxes, 4).clone()
-            scales = flat_boxes.new_tensor([feature_w, feature_h, feature_w, feature_h])
-            flat_boxes = flat_boxes * scales
+            per_sample_scales = torch.stack(
+                [
+                    spatial_shapes[:, 1],
+                    spatial_shapes[:, 0],
+                    spatial_shapes[:, 1],
+                    spatial_shapes[:, 0],
+                ],
+                dim=-1,
+            ).to(device=feature_map.device, dtype=flat_boxes.dtype)
+            flat_boxes = flat_boxes * per_sample_scales[:, None, :].expand(
+                -1, num_boxes, -1
+            ).reshape(b * num_boxes, 4)
             # Keep zero-padded/degenerate boxes numerically safe without any
             # in-place slice writes, because refined boxes carry gradients.
             xy1 = flat_boxes[:, :2]
@@ -2025,7 +2453,13 @@ class QwenPoseModel(nn.Module):
         sample_boxes = boxes.to(dtype=feature_map.dtype)
         xy1 = sample_boxes[..., :2].unsqueeze(2).unsqueeze(2)
         wh = (sample_boxes[..., 2:] - sample_boxes[..., :2]).clamp(min=1e-4).unsqueeze(2).unsqueeze(2)
-        grid = (xy1 + base * wh).clamp(0.0, 1.0) * 2.0 - 1.0
+        normalized_points = (xy1 + base * wh).clamp(0.0, 1.0)
+        grid = _padded_grid_from_normalized_points(
+            normalized_points,
+            spatial_shapes,
+            int(feature_map.shape[-2]),
+            int(feature_map.shape[-1]),
+        )
         flat_grid = grid.view(b * num_boxes, roi_size, roi_size, 2)
         batch_indices = torch.arange(b, device=feature_map.device, dtype=torch.long).repeat_interleave(num_boxes)
         flat_features = feature_map.index_select(0, batch_indices)

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # LocatePose 三阶段解耦训练：
-#   Stage 1：只加载 MoonViT + mlp1，不加载 LLM；用 GT 框训练 PoseHead，
-#            同时训练全部 MoonViT block 的视觉 LoRA 和完整视觉 projector。
-#   Stage 2：加载完整 LocateAnything；冻结 PoseHead 和视觉 LoRA，训练指定
-#            Qwen2.5 层的 LLM LoRA 与完整视觉 projector，恢复 grounding 能力。
+#   Stage 1：只加载 MoonViT + mlp1，不加载 LLM；以全局 person queries 训练
+#            无 ROI PoseHead，同时训练全部 MoonViT block 的视觉 LoRA 和完整 projector。
+#   Stage 2：加载完整 LocateAnything；冻结 PoseHead、视觉 LoRA 和 Stage1
+#            训练后的视觉 projector，只训练指定 Qwen2.5 层的 LLM LoRA。
 #   Stage 3：冻结完整 LocateAnything；使用其真实生成框训练/校准 PoseHead，
 #            解决 GT 框训练与推理生成框之间的分布差异。
 #
@@ -141,8 +141,8 @@ STAGE3_INIT_WEIGHTS_DIR="${STAGE3_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage3_init_we
 # DATASET_ROOT：所有数据集的共同根目录，内部包含 coco、mpii、crowdpose、refhuman。
 DATASET_ROOT="${DATASET_ROOT:-datasets}"
 
-# STAGE1_TRAIN_DATASETS：第一阶段数据集；默认不含 RefHuman，保证可以完全不加载 LLM。
-STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose}"
+# STAGE1_TRAIN_DATASETS：无 ROI pose-set 训练；RefHuman 读取离线文本 embedding。
+STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 
 # STAGE2_TRAIN_DATASETS：第二阶段 grounding 恢复数据集；默认四个数据集全部参与。
 STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
@@ -151,7 +151,11 @@ STAGE2_TRAIN_DATASETS="${STAGE2_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 STAGE3_TRAIN_DATASETS="${STAGE3_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 
 # STAGE1_DATASET_MIX_WEIGHTS：第一阶段各数据集每 epoch 的遍历倍率。
-STAGE1_DATASET_MIX_WEIGHTS="${STAGE1_DATASET_MIX_WEIGHTS:-coco:1,mpii:1,crowdpose:1}"
+STAGE1_DATASET_MIX_WEIGHTS="${STAGE1_DATASET_MIX_WEIGHTS:-coco:1,mpii:1,crowdpose:1,refhuman:1}"
+
+# PROMPT_EMBEDDING_CACHE：完整规范 prompt 的 prompt-only token/pooled 缓存；
+# Stage1 对全部数据集读取该缓存，因此不加载 Qwen2.5 LLM。
+PROMPT_EMBEDDING_CACHE="${PROMPT_EMBEDDING_CACHE:-${REFHUMAN_TEXT_EMBEDDING_CACHE:-.cache/qwenpose_text/locateanything_prompt_tokens.pt}}"
 
 # STAGE2_DATASET_MIX_WEIGHTS：第二阶段各数据集每 epoch 的遍历倍率。
 STAGE2_DATASET_MIX_WEIGHTS="${STAGE2_DATASET_MIX_WEIGHTS:-coco:1,mpii:1,crowdpose:1,refhuman:1}"
@@ -207,14 +211,26 @@ POSE_HIDDEN_DIM="${POSE_HIDDEN_DIM:-448}"
 # POSE_FEATURE_CHANNELS：MoonViT P2/P3 特征经 1×1 投影后的通道数。
 POSE_FEATURE_CHANNELS="${POSE_FEATURE_CHANNELS:-256}"
 
-# POSE_HUMAN_DECODER_LAYERS：人体框 query 的迭代细化层数。
+# POSE_HUMAN_DECODER_LAYERS：旧框 decoder 兼容字段；新图中不执行。
 POSE_HUMAN_DECODER_LAYERS="${POSE_HUMAN_DECODER_LAYERS:-2}"
 
-# POSE_DECODER_LAYERS：每个人体 ROI 内关键点 grouped decoder 层数。
+# POSE_NUM_PERSON_QUERIES：内部多人 pose-set 候选数。
+POSE_NUM_PERSON_QUERIES="${POSE_NUM_PERSON_QUERIES:-60}"
+
+# POSE_NUM_REF_QUERIES：RefHuman 文本条件候选数（含可选 Locate box 候选）。
+POSE_NUM_REF_QUERIES="${POSE_NUM_REF_QUERIES:-4}"
+
+# POSE_MULTISCALE_ENCODER_LAYERS：P2/P3/P4 可学习 deformable encoder 层数。
+POSE_MULTISCALE_ENCODER_LAYERS="${POSE_MULTISCALE_ENCODER_LAYERS:-2}"
+
+# POSE_MULTISCALE_ENCODER_POINTS：encoder 每尺度采样点数。
+POSE_MULTISCALE_ENCODER_POINTS="${POSE_MULTISCALE_ENCODER_POINTS:-4}"
+
+# POSE_DECODER_LAYERS：无 ROI GroupPose deformable decoder 层数。
 POSE_DECODER_LAYERS="${POSE_DECODER_LAYERS:-3}"
 
 # POSE_REFINEMENT_STEPS：主 decoder 后局部关键点 refinement 次数。
-POSE_REFINEMENT_STEPS="${POSE_REFINEMENT_STEPS:-3}"
+POSE_REFINEMENT_STEPS="${POSE_REFINEMENT_STEPS:-1}"
 
 # POSE_DECODER_HEADS：人体与关键点 Transformer 的注意力头数。
 POSE_DECODER_HEADS="${POSE_DECODER_HEADS:-8}"
@@ -222,10 +238,10 @@ POSE_DECODER_HEADS="${POSE_DECODER_HEADS:-8}"
 # POSE_DROPOUT：PoseHead Transformer dropout；默认 0。
 POSE_DROPOUT="${POSE_DROPOUT:-0}"
 
-# POSE_ROI_SIZE：每个人体框采样出的正方形 ROI memory 边长。
+# POSE_ROI_SIZE：旧 checkpoint 兼容字段；无 ROI 图中不使用。
 POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
 
-# POSE_BOX_CONDITION_SCALE：提取姿态 ROI 前对条件框的中心缩放倍率。
+# POSE_BOX_CONDITION_SCALE：旧 ROI 条件兼容字段；无 ROI 图中不使用。
 POSE_BOX_CONDITION_SCALE="${POSE_BOX_CONDITION_SCALE:-1.25}"
 
 # POSE_DEFORMABLE_POINTS：人体框和关键点可变形注意力每层每尺度采样点数。
@@ -250,8 +266,9 @@ POSE_DYNAMIC_REFERENCE_OFFSET_SCALE="${POSE_DYNAMIC_REFERENCE_OFFSET_SCALE:-1.5}
 # LOCATE_VISION_LAYERS：Stage1 允许训练的 MoonViT block；默认覆盖全部 0～26。
 LOCATE_VISION_LAYERS="${LOCATE_VISION_LAYERS:-0-26}"
 
-# LOCATE_LLM_LAYERS：Stage2 允许训练的 Qwen2.5 decoder 层；有效编号为 0～35。
-LOCATE_LLM_LAYERS="${LOCATE_LLM_LAYERS:-32-35}"
+# LOCATE_LLM_LAYERS：Stage2 允许训练的 Qwen2.5 decoder 层；默认覆盖全部 0～35，
+# 让早期层适配 Stage1 固定后的视觉 token，后期层恢复坐标 token 生成。
+LOCATE_LLM_LAYERS="${LOCATE_LLM_LAYERS:-0-35}"
 
 # LOCATE_VISION_MODULES：Stage1 视觉 LoRA 的目标投影；wqkv/wo 为注意力，
 # fc0/fc1 为视觉 MLP。
@@ -263,13 +280,19 @@ LOCATE_LLM_MODULES="${LOCATE_LLM_MODULES:-q_proj,v_proj}"
 # LOCATE_VISION_SCALE：视觉 LoRA 与全量视觉 projector 的学习率倍率。
 LOCATE_VISION_SCALE="${LOCATE_VISION_SCALE:-0.10}"
 
-# TRAIN_LOCATE_PROJECTOR：非 frozen 阶段是否全量训练 LocateAnything 视觉 projector。
-# 默认开启；设为 0 可显式冻结 projector。
-TRAIN_LOCATE_PROJECTOR="${TRAIN_LOCATE_PROJECTOR:-1}"
-if [[ ! "${TRAIN_LOCATE_PROJECTOR}" =~ ^[01]$ ]]; then
-  echo "TRAIN_LOCATE_PROJECTOR 只能是 0 或 1；当前值：${TRAIN_LOCATE_PROJECTOR}" >&2
-  exit 2
-fi
+# STAGE1_TRAIN_LOCATE_PROJECTOR：Stage1 是否完整训练视觉 projector；默认开启。
+# STAGE2_TRAIN_LOCATE_PROJECTOR：Stage2 是否再次训练 projector；默认关闭，避免
+# grounding loss 改写已经适配 PoseHead 的 P3 特征分布。
+# 旧 TRAIN_LOCATE_PROJECTOR 仍可同时覆盖两阶段，阶段专用变量的优先级更高。
+STAGE1_TRAIN_LOCATE_PROJECTOR="${STAGE1_TRAIN_LOCATE_PROJECTOR:-${TRAIN_LOCATE_PROJECTOR:-1}}"
+STAGE2_TRAIN_LOCATE_PROJECTOR="${STAGE2_TRAIN_LOCATE_PROJECTOR:-${TRAIN_LOCATE_PROJECTOR:-0}}"
+for projector_flag_name in STAGE1_TRAIN_LOCATE_PROJECTOR STAGE2_TRAIN_LOCATE_PROJECTOR; do
+  projector_flag="${!projector_flag_name}"
+  if [[ ! "${projector_flag}" =~ ^[01]$ ]]; then
+    echo "${projector_flag_name} 只能是 0 或 1；当前值：${projector_flag}" >&2
+    exit 2
+  fi
+done
 
 # LOCATE_LLM_SCALE：LLM LoRA 学习率相对阶段基础学习率的倍率。
 LOCATE_LLM_SCALE="${LOCATE_LLM_SCALE:-0.10}"
@@ -278,22 +301,27 @@ LOCATE_LLM_SCALE="${LOCATE_LLM_SCALE:-0.10}"
 # 8. 三个阶段的 epoch、batch、梯度累积与基础学习率
 # ==============================================================================
 
-# STAGE1_EPOCHS：Stage1 训练 epoch 数；默认 30。
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-30}"
+# STAGE1_EPOCHS：Stage1 训练 epoch 数；默认 50。
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-50}"
 
 # STAGE1_MAX_STEPS：Stage1 optimizer step 上限；0 表示只由 epoch 控制。
 STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-0}"
 
-# STAGE1_BATCH_SIZE：Stage1 单卡 micro-batch。800×800 letterbox 下四卡实测：
-# batch=12 OOM，batch=10 峰值约 23.6～24.2GB，batch=9 峰值约 21.7～21.9GB。
-# 默认 9，在目标 20～24GB 区间内保留长期训练安全余量。
-STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-9}"
+# STAGE1_BATCH_SIZE：Stage1 单卡 micro-batch。新无 ROI Pose DETR 图默认保守使用 4；
+# 更大的历史实测数据来自旧图，不能直接作为当前结构的显存依据。
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-24}"
 
 # STAGE1_GRAD_ACCUM_STEPS：Stage1 梯度累积步数。
 STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
 
 # STAGE1_LR：Stage1 PoseHead 基础学习率；视觉 LoRA 再乘 LOCATE_VISION_SCALE。
 STAGE1_LR="${STAGE1_LR:-2e-4}"
+
+# 半数 Stage1 batch 使用带小噪声的 GT 框模拟 LocateAnything 外部框；
+# 其余 batch 保持当前纯内部 person-query 路线。
+STAGE1_LOCATE_PROXY_PROBABILITY="${STAGE1_LOCATE_PROXY_PROBABILITY:-0.5}"
+STAGE1_LOCATE_PROXY_CENTER_NOISE="${STAGE1_LOCATE_PROXY_CENTER_NOISE:-0.03}"
+STAGE1_LOCATE_PROXY_SCALE_NOISE="${STAGE1_LOCATE_PROXY_SCALE_NOISE:-0.06}"
 
 # STAGE2_EPOCHS：Stage2 grounding 恢复 epoch 数；默认 10。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-10}"
@@ -363,7 +391,7 @@ STAGE3_INIT_FROM_STAGE2="${STAGE3_INIT_FROM_STAGE2:-1}"
 STAGE3_ALLOW_STAGE1_FALLBACK="${STAGE3_ALLOW_STAGE1_FALLBACK:-1}"
 
 # ==============================================================================
-# 10. Pose、人体框、DN、grounding LM 与 PBD loss 权重
+# 10. Pose、人体框、DN 与 grounding LM loss 权重
 # ==============================================================================
 
 # W_OKS：最终关键点标准 OKS loss 权重。
@@ -376,9 +404,9 @@ W_IMAGE_COORD="${W_IMAGE_COORD:-5.0}"
 W_KEYPOINT_CONFIDENCE="${W_KEYPOINT_CONFIDENCE:-0.1}"
 
 # W_PERSON_CONFIDENCE：人体实例质量置信度 loss 权重；0 表示关闭该头。
-W_PERSON_CONFIDENCE="${W_PERSON_CONFIDENCE:-0.0}"
+W_PERSON_CONFIDENCE="${W_PERSON_CONFIDENCE:-1.0}"
 
-# W_REF_MATCH：RefHuman 文本与人物候选匹配 loss 权重；Stage1 无 RefHuman。
+# W_REF_MATCH：RefHuman CE + margin ranking + contrastive 指定人 loss 权重。
 W_REF_MATCH="${W_REF_MATCH:-1.0}"
 
 # W_HARD_JOINT：困难关键点额外 loss 权重；0 表示关闭。
@@ -391,42 +419,46 @@ HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.2}"
 W_DECODER_COORDS="${W_DECODER_COORDS:-0.25,0.5,0.75}"
 
 # W_COARSE_COORD：粗关键点框内坐标辅助 loss 权重。
-W_COARSE_COORD="${W_COARSE_COORD:-0.5}"
+W_COARSE_COORD="${W_COARSE_COORD:-0.0}"
 
 # W_DEFORM_COORD：可变形关键点阶段坐标辅助 loss 权重。
-W_DEFORM_COORD="${W_DEFORM_COORD:-0.75}"
+W_DEFORM_COORD="${W_DEFORM_COORD:-0.0}"
 
 # W_REFINE_COORDS：最终输出之前各 refinement 坐标辅助权重。
-W_REFINE_COORDS="${W_REFINE_COORDS:-0.75,1.0}"
+W_REFINE_COORDS="${W_REFINE_COORDS:-}"
 
-# W_BOX_OBJECTNESS：人体框前景/背景分类 loss 权重。
+# W_BOX_OBJECTNESS：内部 proposal 的人体/背景 focal loss 权重。
 W_BOX_OBJECTNESS="${W_BOX_OBJECTNESS:-1.0}"
+# W_BOX_QUALITY：独立人体框的 IoU 质量校准权重，用于 bbox AP 排序。
+W_BOX_QUALITY="${W_BOX_QUALITY:-1.0}"
 
-# W_BOX_L1：人体框 L1 loss 权重。
+# W_BOX_L1：内部 proposal box 的整图归一化 L1 loss 权重。
 W_BOX_L1="${W_BOX_L1:-5.0}"
 
-# W_BOX_GIOU：人体框 GIoU loss 权重。
+# W_BOX_GIOU：内部 proposal box 的 GIoU loss 权重。
 W_BOX_GIOU="${W_BOX_GIOU:-2.0}"
 
-# W_BOX_RELATIVE：人体框相对条件框偏移约束权重。
-W_BOX_RELATIVE="${W_BOX_RELATIVE:-1.0}"
+# W_BOX_RELATIVE：额外相对中心/尺寸约束；默认关闭，L1+GIoU 已足够。
+W_BOX_RELATIVE="${W_BOX_RELATIVE:-0.0}"
 
-# W_BOX_DN：BoxDN 正负去噪总 loss 权重。
-W_BOX_DN="${W_BOX_DN:-0.5}"
+# W_BOX_DN：BoxDN 已从当前 pose-set 路径移除，保留兼容参数且固定为 0。
+W_BOX_DN="${W_BOX_DN:-0.0}"
 
 # W_KEYPOINT_DN：关键点 DN 重建与对比总 loss 权重。
 W_KEYPOINT_DN="${W_KEYPOINT_DN:-1.0}"
 
+# MAX_KEYPOINT_DN_QUERIES：关键点 DN 人体骨架 query 总上限。DETRPose 官方实现
+# 传入 dn_number=20，并为每组构造正/负各一份，常见总量约为 40；这里按总量计数。
+MAX_KEYPOINT_DN_QUERIES="${MAX_KEYPOINT_DN_QUERIES:-40}"
+
+# MAX_KEYPOINT_DN_GROUPS：单人图最多 20 组正/负 DN，与 DETRPose 的 dn_number=20
+# 口径对齐；多人图会由总 query 上限自动降低实际组数。
+MAX_KEYPOINT_DN_GROUPS="${MAX_KEYPOINT_DN_GROUPS:-20}"
+
 # W_LOCATE_BOX_LM：Stage2 GT 坐标 token teacher-forcing CE 权重。
-W_LOCATE_BOX_LM="${W_LOCATE_BOX_LM:-0.05}"
+W_LOCATE_BOX_LM="${W_LOCATE_BOX_LM:-0.1}"
 
-# W_LOCATE_PBD：Stage2 六位置框结构、坐标和连续几何 PBD loss 外层权重。
-W_LOCATE_PBD="${W_LOCATE_PBD:-0.05}"
-
-# PBD_TEMPERATURE：Stage2 soft coordinate expectation 温度。
-PBD_TEMPERATURE="${PBD_TEMPERATURE:-1.0}"
-
-# LOCATE_LM_LOSS_EVERY：Stage2 每隔多少 micro-step 加一次 LM CE；PBD 仍每批计算。
+# LOCATE_LM_LOSS_EVERY：Stage2 每隔多少 micro-step 加一次 LM CE。
 LOCATE_LM_LOSS_EVERY="${LOCATE_LM_LOSS_EVERY:-1}"
 
 # LOCATE_LM_MAX_INSTANCES：普通多人样本写入 grounding 答案的最大人体框数。
@@ -462,8 +494,17 @@ SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1}"
 # VISUALIZE_EVERY：Stage1/3 每隔多少 optimizer step 保存训练预测图；0 表示关闭。
 VISUALIZE_EVERY="${VISUALIZE_EVERY:-10}"
 
-# VISUALIZE_MAX_INSTANCES：单张训练可视化最多绘制的人体实例数。
-VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-30}"
+# VISUALIZE_MAX_INSTANCES：NMS 后单张训练可视化最多绘制的人体实例数。
+VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-5}"
+
+# VISUALIZE_NMS_IOU_THRESH：训练图使用最终 person-box 分数排序的 class-agnostic NMS。
+VISUALIZE_NMS_IOU_THRESH="${VISUALIZE_NMS_IOU_THRESH:-0.50}"
+
+# VISUALIZE_OBJECTNESS_THRESHOLD：NMS 后 person*box-quality 展示阈值；不再强制 top-1。
+VISUALIZE_OBJECTNESS_THRESHOLD="${VISUALIZE_OBJECTNESS_THRESHOLD:-0.05}"
+
+# VISUALIZE_POSE_THRESHOLD：person*pose-quality 低于该值时只画框、不画骨架。
+VISUALIZE_POSE_THRESHOLD="${VISUALIZE_POSE_THRESHOLD:-0.05}"
 
 # VISUALIZE_MIN_GT_AREA_RATIO：最大 GT 人体面积低于该比例时跳过可视化。
 VISUALIZE_MIN_GT_AREA_RATIO="${VISUALIZE_MIN_GT_AREA_RATIO:-0.005}"
@@ -585,8 +626,16 @@ common_args() {
 
     # --hidden_dim：PoseHead 主隐藏维度。
     --hidden_dim "${POSE_HIDDEN_DIM}"
-    # --human_decoder_layers：人体框 decoder 层数。
+    # --human_decoder_layers：旧框 decoder 兼容字段，新图中不执行。
     --human_decoder_layers "${POSE_HUMAN_DECODER_LAYERS}"
+    # --num_person_queries：整图 pose-set 候选数。
+    --num_person_queries "${POSE_NUM_PERSON_QUERIES}"
+    # --num_ref_queries：RefHuman 文本条件候选数。
+    --num_ref_queries "${POSE_NUM_REF_QUERIES}"
+    # --multiscale_encoder_layers：P2/P3/P4 deformable encoder 层数。
+    --multiscale_encoder_layers "${POSE_MULTISCALE_ENCODER_LAYERS}"
+    # --multiscale_encoder_points：encoder 每尺度采样点数。
+    --multiscale_encoder_points "${POSE_MULTISCALE_ENCODER_POINTS}"
     # --pose_decoder_layers：关键点 grouped decoder 层数。
     --pose_decoder_layers "${POSE_DECODER_LAYERS}"
     # --refinement_steps：局部关键点 refinement 次数。
@@ -601,7 +650,7 @@ common_args() {
     --pose_coordinate_init "${POSE_COORDINATE_INIT}"
     # --dynamic_reference_offset_scale：动态人体先验 residual 缩放。
     --dynamic_reference_offset_scale "${POSE_DYNAMIC_REFERENCE_OFFSET_SCALE}"
-    # --pose_roi_size：人体 ROI memory 边长。
+    # --pose_roi_size：旧 checkpoint 兼容字段；无 ROI 图中不使用。
     --pose_roi_size "${POSE_ROI_SIZE}"
     # --pose_feature_channels：P2/P3 投影通道数。
     --pose_feature_channels "${POSE_FEATURE_CHANNELS}"
@@ -611,14 +660,16 @@ common_args() {
     --deformable_min_radius_cells "${POSE_DEFORMABLE_MIN_RADIUS_CELLS}"
     # --ref_text_scale：RefHuman 文本条件缩放。
     --ref_text_scale "${POSE_REF_TEXT_SCALE}"
+    # --disable_box_denoising：新图没有 BoxDN。
+    --disable_box_denoising
 
     # --w_oks：最终姿态 OKS loss 权重。
     --w_oks "${W_OKS}"
     # --w_image_coord：最终整图坐标 loss 权重。
     --w_image_coord "${W_IMAGE_COORD}"
-    # --w_keypoint_confidence：关键点质量置信度 loss 权重。
+    # --w_keypoint_confidence：逐关键点存在性/可见性 BCE 权重（兼容旧参数名）。
     --w_keypoint_confidence "${W_KEYPOINT_CONFIDENCE}"
-    # --w_person_confidence：人体实例置信度 loss 权重。
+    # --w_person_confidence：直接 pose AP/OKS 分数头 loss 权重（兼容旧参数名）。
     --w_person_confidence "${W_PERSON_CONFIDENCE}"
     # --w_ref_match：RefHuman 文本匹配 loss 权重。
     --w_ref_match "${W_REF_MATCH}"
@@ -636,6 +687,8 @@ common_args() {
     --w_refine_coords "${W_REFINE_COORDS}"
     # --w_box_objectness：人体框前景分类权重。
     --w_box_objectness "${W_BOX_OBJECTNESS}"
+    # --w_box_quality：直接 person/bbox AP 分数头 IoU loss 权重（兼容旧参数名）。
+    --w_box_quality "${W_BOX_QUALITY}"
     # --w_box_l1：人体框 L1 权重。
     --w_box_l1 "${W_BOX_L1}"
     # --w_box_giou：人体框 GIoU 权重。
@@ -651,10 +704,10 @@ common_args() {
     --dn_positive_noise 0.4
     # --dn_negative_noise：BoxDN 负样本噪声强度。
     --dn_negative_noise 1.0
-    # --max_keypoint_dn_queries：关键点 DN 最大 query 数。
-    --max_keypoint_dn_queries 16
-    # --max_keypoint_dn_groups：关键点 DN 最大组数。
-    --max_keypoint_dn_groups 2
+    # --max_keypoint_dn_queries：关键点 DN 人体骨架 query 总上限。
+    --max_keypoint_dn_queries "${MAX_KEYPOINT_DN_QUERIES}"
+    # --max_keypoint_dn_groups：关键点 DN 最大正/负组数。
+    --max_keypoint_dn_groups "${MAX_KEYPOINT_DN_GROUPS}"
     # --keypoint_dn_positive_ks_min：关键点 DN 正样本最低 KS。
     --keypoint_dn_positive_ks_min 0.5
     # --keypoint_dn_positive_ks_max：关键点 DN 正样本最高 KS。
@@ -684,19 +737,17 @@ common_args() {
     --visualize_every "${VISUALIZE_EVERY}"
     # --visualize_max_instances：单图可视化最大人体数。
     --visualize_max_instances "${VISUALIZE_MAX_INSTANCES}"
+    # --visualize_nms_iou_thresh：训练可视化 proposal Hard-NMS 阈值。
+    --visualize_nms_iou_thresh "${VISUALIZE_NMS_IOU_THRESH}"
+    # --visualize_objectness_threshold：NMS 后的低分 proposal 过滤阈值。
+    --visualize_objectness_threshold "${VISUALIZE_OBJECTNESS_THRESHOLD}"
+    # --visualize_pose_threshold：低姿态质量候选不绘制骨架。
+    --visualize_pose_threshold "${VISUALIZE_POSE_THRESHOLD}"
     # --visualize_min_gt_area_ratio：小人体可视化过滤阈值。
     --visualize_min_gt_area_ratio "${VISUALIZE_MIN_GT_AREA_RATIO}"
     # --device：训练设备类型；物理卡由 CUDA_VISIBLE_DEVICES 控制。
     --device cuda
   )
-
-  # --train_locate_projector：默认全量训练 LocateAnything 视觉 projector；
-  # 可用 TRAIN_LOCATE_PROJECTOR=0 显式关闭。
-  if [[ "${TRAIN_LOCATE_PROJECTOR}" == "1" ]]; then
-    COMMON_ARGS+=(--train_locate_projector)
-  else
-    COMMON_ARGS+=(--no-train_locate_projector)
-  fi
 
   # --locate_batch_token_limit：可选的本地 micro-batch 视觉 token 总预算。
   if [[ -n "${LOCATE_BATCH_TOKEN_LIMIT}" ]]; then
@@ -732,18 +783,21 @@ print_configuration_summary() {
 选择阶段：stage1=${RUN_STAGE1} stage2=${RUN_STAGE2} stage3=${RUN_STAGE3}
 物理 GPU：${CUDA_VISIBLE_DEVICES}；进程数：${NPROC_PER_NODE}
 输出根目录：${OUTPUT_DIR}
-Stage1：vision_only + GT box + full-range vision LoRA + projector；datasets=${STAGE1_TRAIN_DATASETS}
+Stage1：vision_only + no-ROI pose-set + cached RefHuman text + full-range vision LoRA；datasets=${STAGE1_TRAIN_DATASETS}
         epochs=${STAGE1_EPOCHS} batch/gpu=${STAGE1_BATCH_SIZE} accum=${STAGE1_GRAD_ACCUM_STEPS} effective=${stage1_effective} lr=${STAGE1_LR}
-Stage2：raw_visual + grounding_only + freeze_pose + selective_llm_lora + projector；datasets=${STAGE2_TRAIN_DATASETS}
+Stage2：raw_visual + grounding_only + freeze_pose + selective_llm_lora；datasets=${STAGE2_TRAIN_DATASETS}
         epochs=${STAGE2_EPOCHS} batch/gpu=${STAGE2_BATCH_SIZE} accum=${STAGE2_GRAD_ACCUM_STEPS} effective=${stage2_effective} lr=${STAGE2_LR}
 Stage3：raw_visual + hard Locate boxes + freeze Locate + train PoseHead；datasets=${STAGE3_TRAIN_DATASETS}
         epochs=${STAGE3_EPOCHS} batch/gpu=${STAGE3_BATCH_SIZE} accum=${STAGE3_GRAD_ACCUM_STEPS} effective=${stage3_effective} lr=${STAGE3_LR}
 视觉 LoRA：layers=${LOCATE_VISION_LAYERS} modules=${LOCATE_VISION_MODULES} lr_scale=${LOCATE_VISION_SCALE}
-视觉 Projector：full_train=${TRAIN_LOCATE_PROJECTOR} lr_scale=${LOCATE_VISION_SCALE}
+视觉 Projector：stage1_train=${STAGE1_TRAIN_LOCATE_PROJECTOR} stage2_train=${STAGE2_TRAIN_LOCATE_PROJECTOR} lr_scale=${LOCATE_VISION_SCALE}
 LLM LoRA：layers=${LOCATE_LLM_LAYERS} modules=${LOCATE_LLM_MODULES} lr_scale=${LOCATE_LLM_SCALE}
 统一输入：letterbox=${LETTERBOX_SIZE}x${LETTERBOX_SIZE} fill=${LETTERBOX_FILL}
 视觉 token：image_limit=${LOCATE_IMAGE_TOKEN_LIMIT} batch_limit=${LOCATE_BATCH_TOKEN_LIMIT:-unlimited}
-Stage2 grounding：lm=${W_LOCATE_BOX_LM} pbd=${W_LOCATE_PBD} temperature=${PBD_TEMPERATURE}
+Pose DETR：queries=${POSE_NUM_PERSON_QUERIES} ref_queries=${POSE_NUM_REF_QUERIES} encoder=${POSE_MULTISCALE_ENCODER_LAYERS}x${POSE_MULTISCALE_ENCODER_POINTS} refinement=${POSE_REFINEMENT_STEPS}
+关键点 DN：max_queries=${MAX_KEYPOINT_DN_QUERIES} max_groups=${MAX_KEYPOINT_DN_GROUPS}（每组每人 1 正 + 1 负）
+Locate prompt cache：${PROMPT_EMBEDDING_CACHE}
+Stage2 grounding：lm=${W_LOCATE_BOX_LM}
 Stage3 generation：mode=${LOCATE_GENERATION_MODE} max_new_tokens=${LOCATE_BOX_MAX_NEW_TOKENS} refhuman_only=${STAGE3_GENERATE_REFHUMAN_ONLY}
 日志：${LOG_FILE}
 ============================================================
@@ -751,14 +805,19 @@ EOF
 }
 
 # ==============================================================================
-# 14. Stage1：纯视觉 GT 框训练 PoseHead + 指定视觉 LoRA
+# 14. Stage1：无 ROI Pose DETR + 缓存文本 + 全范围视觉 LoRA
 # ==============================================================================
 
 run_stage1() {
   common_args "${STAGE1_DATASET_MIX_WEIGHTS}"
+  if [[ ! -f "${PROMPT_EMBEDDING_CACHE}" ]]; then
+    echo "Stage1 的通用 prompt token 缓存不存在：${PROMPT_EMBEDDING_CACHE}" >&2
+    echo "请先运行：${PYTHON} scripts/cache_refhuman_text_embeddings.py --output ${PROMPT_EMBEDDING_CACHE}" >&2
+    exit 1
+  fi
   mkdir -p "${STAGE1_OUTPUT_DIR}"
   local args=("${COMMON_ARGS[@]}"
-    # --datasets：Stage1 默认仅 COCO/MPII/CrowdPose，不训练 RefHuman。
+    # --datasets：Stage1 同时训练普通多人姿态与 RefHuman 指定人选择。
     --datasets "${STAGE1_TRAIN_DATASETS}"
     # --output_dir：Stage1 输出目录。
     --output_dir "${STAGE1_OUTPUT_DIR}"
@@ -774,25 +833,35 @@ run_stage1() {
     --lr "${STAGE1_LR}"
     # --locate_feature_source=vision_only：只实例化 MoonViT + mlp1，不加载 3B LLM。
     --locate_feature_source vision_only
-    # --box_source=gt：PoseHead 使用数据集 GT 人体框。
-    --box_source gt
+    # --box_source=person_queries：主路径完全依靠整图内部 proposal，不输入 GT box。
+    --box_source person_queries
+    # 50% batch 注入 noisy-GT Locate 代理框；clean GT 始终作为 box/pose target。
+    --locate_proxy_probability "${STAGE1_LOCATE_PROXY_PROBABILITY}"
+    --locate_proxy_center_noise "${STAGE1_LOCATE_PROXY_CENTER_NOISE}"
+    --locate_proxy_scale_noise "${STAGE1_LOCATE_PROXY_SCALE_NOISE}"
+    # --locate_gradient_checkpointing：全 27 层视觉 LoRA 降低激活显存。
+    --locate_gradient_checkpointing
     # --locate_train_scope=selective_vision_lora：训练全范围视觉 LoRA；projector 默认全量训练。
     --locate_train_scope selective_vision_lora
     # --w_locate_box_lm=0：Stage1 不计算 grounding LM loss。
     --w_locate_box_lm 0
-    # --w_locate_pbd=0：Stage1 不计算 PBD loss。
-    --w_locate_pbd 0
-    # --pose_box_grad_scale=0：Stage1 不存在 Pose→Locate 框梯度。
-    --pose_box_grad_scale 0
   )
+  if [[ "${STAGE1_TRAIN_LOCATE_PROJECTOR}" == "1" ]]; then
+    # Stage1 默认完整训练 projector，使 P3 特征适配 PoseHead。
+    args+=(--train_locate_projector)
+  else
+    args+=(--no-train_locate_projector)
+  fi
+  # --prompt_embedding_cache：全部任务使用完整规范 prompt 的冻结缓存。
+  args+=(--prompt_embedding_cache "${PROMPT_EMBEDDING_CACHE}")
   # --resume_from_checkpoint：可选的 Stage1 完整断点续训来源。
   [[ -n "${STAGE1_RESUME_FROM_CHECKPOINT}" ]] && args+=(--resume_from_checkpoint "${STAGE1_RESUME_FROM_CHECKPOINT}")
-  echo "[Stage1] 纯视觉塔 + GT 框；训练 PoseHead、全范围 MoonViT LoRA 与视觉 projector。"
+  echo "[Stage1] 无 ROI P2/P3/P4 Pose DETR；训练 PoseHead、全范围 MoonViT LoRA；projector_train=${STAGE1_TRAIN_LOCATE_PROJECTOR}。"
   run_train_pose "${args[@]}"
 }
 
 # ==============================================================================
-# 15. Stage2：冻结视觉 LoRA 和 PoseHead，训练 LLM LoRA 与视觉 projector
+# 15. Stage2：冻结视觉侧和 PoseHead，只训练 Qwen2.5 LLM LoRA
 # ==============================================================================
 
 run_stage2() {
@@ -832,7 +901,7 @@ run_stage2() {
     --no-prune_locate_generation
     # --box_source=gt：grounding-only 不运行 PoseHead，该值只保持输入契约明确。
     --box_source gt
-    # --locate_train_scope=selective_llm_lora：冻结视觉 LoRA，训练指定 LLM LoRA；projector 默认全量训练。
+    # --locate_train_scope=selective_llm_lora：冻结视觉 LoRA，只训练指定 LLM LoRA。
     --locate_train_scope selective_llm_lora
     # --freeze_pose：冻结 Stage1 训练好的全部 PoseHead 参数。
     --freeze_pose
@@ -842,12 +911,6 @@ run_stage2() {
     --locate_gradient_checkpointing
     # --w_locate_box_lm：GT 坐标 token CE 权重。
     --w_locate_box_lm "${W_LOCATE_BOX_LM}"
-    # --w_locate_pbd：六位置框 PBD 几何监督权重。
-    --w_locate_pbd "${W_LOCATE_PBD}"
-    # --pose_box_grad_scale=0：Stage2 不运行 PoseHead，也不回传姿态梯度。
-    --pose_box_grad_scale 0
-    # --pbd_temperature：soft coordinate expectation 温度。
-    --pbd_temperature "${PBD_TEMPERATURE}"
     # --locate_lm_loss_every：LM CE 监督间隔。
     --locate_lm_loss_every "${LOCATE_LM_LOSS_EVERY}"
     # --locate_lm_max_instances：普通多人样本最大 grounding 框数。
@@ -857,7 +920,13 @@ run_stage2() {
     # --resume_from_checkpoint：Stage2 断点或 Stage1 仅权重初始化包。
     --resume_from_checkpoint "${resume_path}"
   )
-  echo "[Stage2] 冻结视觉塔、视觉 LoRA 和 PoseHead；只训练指定 LLM LoRA 恢复 grounding。"
+  if [[ "${STAGE2_TRAIN_LOCATE_PROJECTOR}" == "1" ]]; then
+    args+=(--train_locate_projector)
+  else
+    # 默认保持 Stage1 projector 原样，避免 PoseHead 的 P3 输入分布漂移。
+    args+=(--no-train_locate_projector)
+  fi
+  echo "[Stage2] 冻结视觉塔、视觉 LoRA 和 PoseHead；projector_train=${STAGE2_TRAIN_LOCATE_PROJECTOR}；训练 ${LOCATE_LLM_LAYERS} 层 ${LOCATE_LLM_MODULES} LoRA。"
   run_train_pose "${args[@]}"
 }
 
@@ -919,23 +988,25 @@ run_stage3() {
     --locate_generation_mode "${LOCATE_GENERATION_MODE}"
     # --w_locate_box_lm=0：Stage3 不再训练 LLM。
     --w_locate_box_lm 0
-    # --w_locate_pbd=0：Stage3 不再训练 PBD。
-    --w_locate_pbd 0
-    # --pose_box_grad_scale=0：生成框作为离散输入，不向 LocateAnything 回传梯度。
-    --pose_box_grad_scale 0
+    # Stage3 冻结完整 LocateAnything，显式禁止 projector 进入优化器。
+    --no-train_locate_projector
     # --resume_from_checkpoint：Stage3 断点或前一阶段仅权重初始化包。
     --resume_from_checkpoint "${resume_path}"
   )
 
   if [[ "${STAGE3_GENERATE_REFHUMAN_ONLY}" == "1" ]]; then
-    # --locate_generate_refhuman_only：仅 RefHuman 用生成框，普通姿态数据仍用 GT。
+    # --locate_generate_refhuman_only：仅 RefHuman 注入 Locate proposal；普通姿态完全走内部 proposals。
     args+=(--locate_generate_refhuman_only)
   else
     # --no-locate_generate_refhuman_only：全部姿态数据都用真实生成框校准。
     args+=(--no-locate_generate_refhuman_only)
   fi
 
-  echo "[Stage3] 冻结完整 LocateAnything；使用真实生成框训练 PoseHead。"
+  if [[ "${STAGE3_GENERATE_REFHUMAN_ONLY}" == "1" ]]; then
+    echo "[Stage3] 冻结完整 LocateAnything；RefHuman 注入真实 Locate proposal，普通多人姿态只用内部 proposals。"
+  else
+    echo "[Stage3] 冻结完整 LocateAnything；全部数据注入真实 Locate proposal，并保留内部 proposals 补足候选。"
+  fi
   run_train_pose "${args[@]}"
 }
 

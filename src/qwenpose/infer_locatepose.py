@@ -572,9 +572,15 @@ def export_schema_results(rows: list[dict[str, Any]], output_path: Path) -> None
                 )
             compact_preds.append(
                 {
+                    "category_id": int(pred.get("category_id", 1)),
+                    "category_name": str(pred.get("category_name", "person")),
                     "score": float(pred["score"]),
                     "person_score": float(pred.get("person_score", 0.0)),
+                    "box_quality_score": float(pred.get("box_quality_score", 0.0)),
+                    "box_score": float(pred.get("box_score", pred.get("person_score", 0.0))),
                     "pose_score": float(pred.get("pose_score", 0.0)),
+                    "joint_score": float(pred.get("joint_score", 0.0)),
+                    "pose_quality_score": float(pred.get("pose_quality_score", 0.0)),
                     "ref_score": float(pred.get("ref_score", 0.0)),
                     "bbox_xyxy": bbox,
                     "bbox_xywh": bbox_xywh,
@@ -1391,6 +1397,8 @@ def main() -> None:
                                 sample_idx=local_idx,
                                 max_instances=args.visualize_max_instances,
                                 score_threshold=args.score_threshold,
+                                prediction_row=rows[local_idx],
+                                ref_pose_quality_alpha=args.ref_pose_quality_alpha,
                             )
                             visualized += 1
                     samples += len(rows)

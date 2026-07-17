@@ -33,8 +33,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from qwenpose.data import (
+    ALL_POSE_PROMPT,
     DATASET_BOX_CONTEXT_SCALE,
     PoseAugmentConfig,
+    build_refhuman_locate_prompt,
     build_datasets,
     pose_collate,
     set_pose_dataset_epoch,
@@ -68,9 +70,7 @@ from qwenpose.eagle_lora import (
     EagleLoRAConfig,
     build_eagle_inputs,
     build_eagle_lm_inputs,
-    compute_eagle_pbd_grounding_losses,
     count_eagle_lora_parameters,
-    extract_eagle_pbd_blocks_from_lm_logits,
     get_eagle_base_model,
     load_eagle_vision_only_with_lora,
     load_eagle_with_lora,
@@ -137,6 +137,17 @@ def parse_args() -> argparse.Namespace:
             "Maximum captions used for each RefHuman person instance in one epoch. "
             "Captions follow a seed-randomized epoch rotation; use 0 to keep all "
             "captions as separate records."
+        ),
+    )
+    parser.add_argument(
+        "--prompt_embedding_cache",
+        "--refhuman_text_embedding_cache",
+        dest="refhuman_text_embedding_cache",
+        type=Path,
+        default=None,
+        help=(
+            "Full-prompt frozen LocateAnything token/pooled cache used by vision-only "
+            "Stage1. Build with scripts/cache_refhuman_text_embeddings.py."
         ),
     )
     parser.add_argument("--num_workers", type=int, default=2)
@@ -342,12 +353,17 @@ def parse_args() -> argparse.Namespace:
         "--locate_grounding_only",
         action="store_true",
         help=(
-            "Run only LocateAnything grounding LM/PBD supervision and skip PoseHead forward. "
+            "Run only LocateAnything grounding LM supervision and skip PoseHead forward. "
             "This is the low-memory Stage-2 path of the decoupled recipe."
         ),
     )
     parser.add_argument("--pose_decoder_layers", type=int, default=3)
-    parser.add_argument("--refinement_steps", type=int, default=3)
+    parser.add_argument(
+        "--refinement_steps",
+        type=int,
+        default=1,
+        help="Final P2 local enhancement steps; DETRPose uses exactly one.",
+    )
     parser.add_argument("--human_decoder_layers", type=int, default=2)
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--pose_dropout", type=float, default=0.0)
@@ -379,7 +395,12 @@ def parse_args() -> argparse.Namespace:
         default="configs/schema_joint_priors.json",
         help="Schema prior JSON used by anatomical_dynamic and schema_prior modes.",
     )
-    parser.add_argument("--pose_roi_size", type=int, default=16)
+    parser.add_argument(
+        "--pose_roi_size",
+        type=int,
+        default=16,
+        help="Deprecated compatibility option; the DETRPose path does not build ROI memory.",
+    )
     parser.add_argument("--pose_feature_channels", type=int, default=256)
     parser.add_argument("--deformable_points", type=int, default=4)
     parser.add_argument("--deformable_min_radius_cells", type=float, default=2.0)
@@ -396,8 +417,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--disable_box_denoising",
+        dest="disable_box_denoising",
         action="store_true",
-        help="Disable training-only positive/negative box denoising queries.",
+        default=True,
+        help="Disable legacy BoxDN; this is the DETRPose default.",
+    )
+    parser.add_argument(
+        "--enable_box_denoising",
+        dest="disable_box_denoising",
+        action="store_false",
+        help="Explicitly re-enable legacy BoxDN for compatibility experiments.",
     )
     parser.add_argument("--max_dn_queries", type=int, default=96)
     parser.add_argument("--max_dn_groups", type=int, default=4)
@@ -408,8 +437,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable training-only box-conditioned OKS keypoint denoising.",
     )
-    parser.add_argument("--max_keypoint_dn_queries", type=int, default=16)
-    parser.add_argument("--max_keypoint_dn_groups", type=int, default=2)
+    # DETRPose passes dn_number=20 and creates one positive plus one negative
+    # skeleton per group. This code counts the resulting skeleton queries, so
+    # the equivalent common-case budget is 40 queries and 20 groups.
+    parser.add_argument("--max_keypoint_dn_queries", type=int, default=40)
+    parser.add_argument("--max_keypoint_dn_groups", type=int, default=20)
     parser.add_argument("--keypoint_dn_positive_ks_min", type=float, default=0.5)
     parser.add_argument("--keypoint_dn_positive_ks_max", type=float, default=1.0)
     parser.add_argument("--keypoint_dn_negative_ks_min", type=float, default=0.1)
@@ -433,7 +465,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable_person_confidence_head",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Enable the learned YOLO-style instance confidence head during normal "
             "pose training without freezing the rest of the model."
@@ -519,15 +552,15 @@ def parse_args() -> argparse.Namespace:
         dest="w_keypoint_confidence",
         type=float,
         default=0.1,
-        help="Weight for evaluator-aligned per-keypoint localization confidence.",
+        help="Weight for matched per-keypoint presence/visibility BCE.",
     )
     parser.add_argument(
         "--w_person_confidence",
         type=float,
-        default=0.0,
+        default=1.0,
         help=(
-            "Weight for evaluator-aligned instance OKS confidence. Generated boxes "
-            "that do not match a GT person are zero-quality negatives."
+            "Weight for the direct pose AP logit trained against detached OKS. "
+            "Unmatched generated queries are zero-quality negatives."
         ),
     )
     parser.add_argument(
@@ -557,6 +590,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--w_box_objectness", type=float, default=1.0)
+    parser.add_argument(
+        "--w_box_quality",
+        type=float,
+        default=1.0,
+        help="Weight for the direct person/bbox AP logit trained against detached IoU.",
+    )
     parser.add_argument("--w_box_l1", type=float, default=5.0)
     parser.add_argument("--w_box_giou", type=float, default=2.0)
     parser.add_argument("--w_box_relative", type=float, default=1.0)
@@ -577,17 +616,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--box_source",
         choices=["gt", "qwen_generate", "locate_generate", "person_queries"],
-        default="gt",
+        default="person_queries",
         help=(
-            "Box conditions for PoseHead: GT/generated boxes, or unified learned "
+            "Optional external box priors for a pose-set model; person_queries uses only "
             "person queries that detect every person before RefHuman selection."
         ),
     )
     parser.add_argument(
+        "--locate_proxy_probability",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability that vision-only person-query training injects jittered clean-GT "
+            "boxes as Locate-style external priors. The clean GT remains the loss target."
+        ),
+    )
+    parser.add_argument(
+        "--locate_proxy_center_noise",
+        type=float,
+        default=0.03,
+        help="Stddev of Stage1 Locate-proxy center noise, relative to GT box width/height.",
+    )
+    parser.add_argument(
+        "--locate_proxy_scale_noise",
+        type=float,
+        default=0.06,
+        help="Stddev of Stage1 Locate-proxy log-width/log-height noise.",
+    )
+    parser.add_argument(
         "--num_person_queries",
         type=int,
-        default=80,
-        help="Number of global detection/pose candidates for --box_source=person_queries.",
+        default=60,
+        help="Number of internal pose-set candidates; defaults to 60.",
+    )
+    parser.add_argument(
+        "--num_ref_queries",
+        type=int,
+        default=4,
+        help="RefHuman text-conditioned candidates reserved inside the pose groups.",
+    )
+    parser.add_argument(
+        "--multiscale_encoder_layers",
+        type=int,
+        default=2,
+        help="Number of trainable native-grid P2/P3/P4 deformable encoder layers.",
+    )
+    parser.add_argument(
+        "--multiscale_encoder_points",
+        type=int,
+        default=4,
+        help="Sampling points per level in each multi-scale encoder layer.",
     )
     parser.add_argument("--qwen_box_max_new_tokens", type=int, default=4096)
     parser.add_argument("--locate_box_max_new_tokens", type=int, default=512)
@@ -609,22 +687,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Control only the legacy hard-generation fallback used when joint soft-box "
-            "training is disabled; the default joint path covers every pose dataset."
+            "Generate LocateAnything boxes only for RefHuman; when disabled, generate "
+            "boxes for every pose dataset."
         ),
     )
     parser.add_argument("--w_locate_box_lm", type=float, default=0.0)
-    parser.add_argument("--w_locate_pbd", type=float, default=0.05)
-    parser.add_argument(
-        "--pose_box_grad_scale",
-        type=float,
-        default=0.05,
-        help=(
-            "Scale only the main PoseHead-loss gradient that flows through differentiable "
-            "Locate soft boxes; PoseHead still receives the full pose loss."
-        ),
-    )
-    parser.add_argument("--pbd_temperature", type=float, default=1.0)
     parser.add_argument("--locate_lm_loss_every", type=int, default=1)
     parser.add_argument("--locate_lm_max_instances", type=int, default=20)
     parser.add_argument("--disable_locate_grounding_aux", action="store_true")
@@ -648,6 +715,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm_max_answer_instances", type=int, default=10)
     parser.add_argument("--visualize_every", type=int, default=0, help="Save one training visualization every N optimizer steps. Use 0 to disable.")
     parser.add_argument("--visualize_max_instances", type=int, default=8)
+    parser.add_argument(
+        "--visualize_nms_iou_thresh",
+        type=float,
+        default=0.65,
+        help="Class-agnostic proposal-box NMS IoU used by raw training visualizations.",
+    )
+    parser.add_argument(
+        "--visualize_objectness_threshold",
+        type=float,
+        default=0.05,
+        help=(
+            "Final person-box score threshold after NMS. The score is "
+            "sigmoid(person_class) * sigmoid(box_quality); all-filtered ALL_POSE "
+            "samples intentionally display no prediction."
+        ),
+    )
+    parser.add_argument(
+        "--visualize_pose_threshold",
+        type=float,
+        default=0.05,
+        help=(
+            "Minimum sigmoid(person_class) * sigmoid(pose_quality) required "
+            "before drawing a predicted skeleton."
+        ),
+    )
     parser.add_argument(
         "--visualize_min_gt_area_ratio",
         type=float,
@@ -678,6 +770,14 @@ def parse_float_list(value: str | list[float] | tuple[float, ...]) -> tuple[floa
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     if "images" in batch:
         batch["images"] = batch["images"].to(device, non_blocking=True)
+    if torch.is_tensor(batch.get("cached_text_embeddings")):
+        batch["cached_text_embeddings"] = batch["cached_text_embeddings"].to(
+            device, non_blocking=True
+        )
+    if torch.is_tensor(batch.get("cached_text_embedding_mask")):
+        batch["cached_text_embedding_mask"] = batch[
+            "cached_text_embedding_mask"
+        ].to(device, non_blocking=True)
     batch["schema_ids"] = batch["schema_ids"].to(device, non_blocking=True)
     batch["task_ids"] = batch["task_ids"].to(device, non_blocking=True)
     return batch
@@ -1012,7 +1112,7 @@ def _locate_coord_token(value: float, upper: float) -> str:
     scaled = 0 if upper <= 0 else int(round(max(0.0, min(float(value), float(upper))) / float(upper) * 1000.0))
     # LocateAnything registers coordinate tokens as <0> ... <1000>, without
     # zero padding. Formatting <029> silently splits into ordinary text tokens
-    # and breaks both LM supervision and six-token PBD block extraction.
+    # and breaks native six-token box supervision.
     return "<" + str(max(0, min(scaled, 1000))) + ">"
 
 
@@ -1115,79 +1215,6 @@ def _context_scale_for_indices(
         index_tensor = torch.as_tensor(indices, dtype=torch.long, device=values.device)
         return values[index_tensor].clone().float()
     return torch.full((count,), float(values.flatten()[0].item()), dtype=torch.float32)
-
-
-def prepare_joint_pbd_conditioning(
-    batch: dict,
-    device: torch.device,
-    *,
-    max_instances: int,
-) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
-    """Align every pose dataset with batched differentiable Locate box blocks.
-
-    ALL_POSE keeps people in the exact spatial order used by the native LM
-    response; REF_POSE keeps only its referred person.  GT context boxes are
-    returned as a numerical fallback, then replaced inside the model by soft
-    boxes decoded from the same batched teacher-forcing LM forward.
-    """
-    selected_targets: list[dict[str, torch.Tensor]] = []
-    fallback_boxes: list[torch.Tensor] = []
-    flat_gt_boxes: list[torch.Tensor] = []
-    flat_context_scales: list[torch.Tensor] = []
-    box_counts: list[int] = []
-    limit = max(int(max_instances), 1)
-    for sample_idx, target in enumerate(batch["targets"]):
-        task_id = int(batch["task_ids"][sample_idx].detach().cpu().item())
-        boxes = target["boxes"]
-        if task_id == 1:
-            ref_target = int(target["ref_target"].detach().cpu().item())
-            indices = [ref_target] if 0 <= ref_target < int(boxes.shape[0]) else []
-        else:
-            indices = _spatially_sorted_instance_indices(
-                boxes,
-                list(range(int(boxes.shape[0]))),
-                limit,
-            )
-        selected = _select_target_instances(target, indices, task_id=task_id)
-        selected_targets.append(selected)
-        count = len(indices)
-        box_counts.append(count)
-        scales = _context_scale_for_indices(target, indices, count).to(
-            device=device,
-            dtype=torch.float32,
-        )
-        selected_gt = selected["boxes"].to(device=device, dtype=torch.float32)
-        fallback_boxes.append(expand_boxes_xyxy_per_box(selected_gt, scales))
-        if count > 0:
-            flat_gt_boxes.append(selected_gt)
-            flat_context_scales.append(scales)
-
-    max_boxes = max(box_counts + [1])
-    box_tensor = torch.zeros(
-        len(selected_targets), max_boxes, 4, device=device, dtype=torch.float32
-    )
-    box_mask = torch.zeros(
-        len(selected_targets), max_boxes, device=device, dtype=torch.bool
-    )
-    for sample_idx, boxes in enumerate(fallback_boxes):
-        count = int(boxes.shape[0])
-        if count > 0:
-            box_tensor[sample_idx, :count] = boxes
-            box_mask[sample_idx, :count] = True
-    metadata = {
-        "box_counts": torch.tensor(box_counts, device=device, dtype=torch.long),
-        "gt_boxes": (
-            torch.cat(flat_gt_boxes, dim=0)
-            if flat_gt_boxes
-            else box_tensor.new_zeros((0, 4))
-        ),
-        "context_scales": (
-            torch.cat(flat_context_scales, dim=0)
-            if flat_context_scales
-            else box_tensor.new_zeros((0,))
-        ),
-    }
-    return box_tensor, box_mask, selected_targets, metadata
 
 
 def prepare_box_conditioning(
@@ -1321,6 +1348,85 @@ def jitter_boxes_xyxy(
     wh = wh * random_scale.clamp(min=0.5)
     jittered = torch.cat([center - wh * 0.5, center + wh * 0.5], dim=-1)
     return jittered.clamp(0.0, 1.0)
+
+
+def jitter_locate_proxy_boxes_xyxy(
+    boxes: torch.Tensor,
+    *,
+    center_noise: float,
+    scale_noise: float,
+) -> torch.Tensor:
+    """Apply independent Gaussian center/log-size noise to clean GT boxes."""
+    if boxes.numel() == 0:
+        return boxes
+    boxes = boxes.float()
+    center = (boxes[:, :2] + boxes[:, 2:]) * 0.5
+    wh = (boxes[:, 2:] - boxes[:, :2]).clamp(min=1e-4)
+    center = center + torch.randn_like(center) * wh * max(float(center_noise), 0.0)
+    wh = wh * torch.exp(
+        torch.randn_like(wh) * max(float(scale_noise), 0.0)
+    )
+    wh = wh.clamp(min=1e-4, max=1.0)
+    jittered = torch.cat([center - 0.5 * wh, center + 0.5 * wh], dim=-1)
+    return jittered.clamp(0.0, 1.0)
+
+
+def prepare_locate_proxy_conditioning(
+    targets: list[dict[str, torch.Tensor]],
+    task_ids: torch.Tensor,
+    device: torch.device,
+    *,
+    max_instances: int,
+    center_noise: float,
+    scale_noise: float,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
+    """Build Stage1 external priors while retaining all clean pose targets."""
+    clean_targets = prepare_person_query_conditioning(
+        targets, task_ids, device, max_instances=max_instances
+    )[2]
+    selected_boxes: list[torch.Tensor] = []
+    for sample_idx, target in enumerate(targets):
+        clean_boxes = target["boxes"]
+        count = int(clean_boxes.shape[0])
+        task_id = int(task_ids[sample_idx].detach().cpu().item())
+        if task_id == 1:
+            ref_target = int(target["ref_target"].detach().cpu().item())
+            indices = [ref_target] if 0 <= ref_target < count else []
+        else:
+            indices = list(range(min(count, max(int(max_instances), 1))))
+        if indices:
+            index_tensor = torch.as_tensor(
+                indices, device=clean_boxes.device, dtype=torch.long
+            )
+            proxy = jitter_locate_proxy_boxes_xyxy(
+                clean_boxes[index_tensor],
+                center_noise=center_noise,
+                scale_noise=scale_noise,
+            )
+            context_scale = _context_scale_for_indices(target, indices, len(indices)).to(
+                device=proxy.device, dtype=proxy.dtype
+            )
+            proxy = expand_boxes_xyxy_per_box(proxy, context_scale)
+        else:
+            proxy = clean_boxes[:0].clone()
+        selected_boxes.append(proxy)
+        clean_targets[sample_idx]["locate_proxy_active"] = torch.tensor(
+            True, device=clean_boxes.device, dtype=torch.bool
+        )
+
+    max_boxes = max([int(boxes.shape[0]) for boxes in selected_boxes] + [1])
+    box_tensor = torch.zeros(
+        len(selected_boxes), max_boxes, 4, dtype=torch.float32, device=device
+    )
+    box_mask = torch.zeros(
+        len(selected_boxes), max_boxes, dtype=torch.bool, device=device
+    )
+    for sample_idx, boxes in enumerate(selected_boxes):
+        n = int(boxes.shape[0])
+        if n > 0:
+            box_tensor[sample_idx, :n] = boxes.to(device=device, dtype=torch.float32)
+            box_mask[sample_idx, :n] = True
+    return box_tensor, box_mask, clean_targets
 
 
 def prepare_box_denoising(
@@ -1509,8 +1615,8 @@ def prepare_keypoint_denoising(
     targets: list[dict[str, torch.Tensor]],
     device: torch.device,
     *,
-    max_queries: int = 16,
-    max_groups: int = 2,
+    max_queries: int = 40,
+    max_groups: int = 20,
     positive_ks_min: float = 0.5,
     positive_ks_max: float = 1.0,
     negative_ks_min: float = 0.1,
@@ -1932,6 +2038,111 @@ def align_target_to_predictions(
     return selected
 
 
+def hungarian_match_poses(
+    pred_keypoints: torch.Tensor,
+    pred_logits: torch.Tensor,
+    gt_keypoints: torch.Tensor,
+    gt_valid: torch.Tensor,
+    gt_areas: torch.Tensor,
+    pred_boxes: torch.Tensor | None = None,
+    gt_boxes: torch.Tensor | None = None,
+) -> list[tuple[int, int, float]]:
+    """Match pose groups by pose quality plus a modest proposal-box prior."""
+    if pred_keypoints.numel() == 0 or gt_keypoints.numel() == 0:
+        return []
+    pred_xy = pred_keypoints.detach().cpu().float()[..., :2]
+    gt_xy = gt_keypoints.detach().cpu().float()[..., :2]
+    valid = gt_valid.detach().cpu().bool()
+    areas = gt_areas.detach().cpu().float().clamp(min=1e-8)
+    logits = pred_logits.detach().cpu().float().reshape(-1)
+    delta = pred_xy[:, None] - gt_xy[None]
+    valid_f = valid[None].float()
+    valid_count = valid_f.sum(dim=-1).clamp(min=1.0)
+    image_l1 = (delta.abs().sum(dim=-1) * valid_f).sum(dim=-1) / valid_count
+    sigmas = UNION_SIGMAS.detach().cpu().float().view(1, 1, -1)
+    variance = (2.0 * sigmas).square().clamp(min=1e-8)
+    oks_per_joint = torch.exp(
+        -delta.square().sum(dim=-1)
+        / (2.0 * areas.view(1, -1, 1) * variance)
+    )
+    oks = (oks_per_joint * valid_f).sum(dim=-1) / valid_count
+    quality_cost = -logits.sigmoid()[:, None]
+    cost = 5.0 * image_l1 + 2.0 * (1.0 - oks) + 2.0 * quality_cost
+    if (
+        torch.is_tensor(pred_boxes)
+        and torch.is_tensor(gt_boxes)
+        and int(pred_boxes.shape[0]) == int(pred_xy.shape[0])
+        and int(gt_boxes.shape[0]) == int(gt_xy.shape[0])
+    ):
+        proposal_boxes = pred_boxes.detach().cpu().float().clamp(0.0, 1.0)
+        target_boxes = gt_boxes.detach().cpu().float().clamp(0.0, 1.0)
+        box_l1 = torch.cdist(proposal_boxes, target_boxes, p=1)
+
+        left_top = torch.maximum(
+            proposal_boxes[:, None, :2], target_boxes[None, :, :2]
+        )
+        right_bottom = torch.minimum(
+            proposal_boxes[:, None, 2:], target_boxes[None, :, 2:]
+        )
+        intersection_wh = (right_bottom - left_top).clamp(min=0.0)
+        intersection = intersection_wh[..., 0] * intersection_wh[..., 1]
+        proposal_area = (
+            (proposal_boxes[:, 2] - proposal_boxes[:, 0]).clamp(min=0.0)
+            * (proposal_boxes[:, 3] - proposal_boxes[:, 1]).clamp(min=0.0)
+        )
+        target_area = (
+            (target_boxes[:, 2] - target_boxes[:, 0]).clamp(min=0.0)
+            * (target_boxes[:, 3] - target_boxes[:, 1]).clamp(min=0.0)
+        )
+        union = proposal_area[:, None] + target_area[None, :] - intersection
+        iou = intersection / union.clamp(min=1e-8)
+        enclosing_left_top = torch.minimum(
+            proposal_boxes[:, None, :2], target_boxes[None, :, :2]
+        )
+        enclosing_right_bottom = torch.maximum(
+            proposal_boxes[:, None, 2:], target_boxes[None, :, 2:]
+        )
+        enclosing_wh = (enclosing_right_bottom - enclosing_left_top).clamp(min=0.0)
+        enclosing_area = enclosing_wh[..., 0] * enclosing_wh[..., 1]
+        giou = iou - (enclosing_area - union) / enclosing_area.clamp(min=1e-8)
+        # Pose remains the primary assignment signal.  Box geometry only
+        # stabilizes early proposal learning and resolves nearby-person ties.
+        cost = cost + box_l1 + (1.0 - giou)
+    # GT instances with no annotated joints cannot supervise a pose match.
+    invalid_gt = ~valid.any(dim=-1)
+    if invalid_gt.any():
+        cost[:, invalid_gt] = 1e6
+    if not bool(torch.isfinite(cost).all().item()):
+        return []
+    if _scipy_linear_sum_assignment is not None:
+        pred_indices, gt_indices = _scipy_linear_sum_assignment(cost.numpy())
+    else:
+        remaining_pred = set(range(int(cost.shape[0])))
+        remaining_gt = set(range(int(cost.shape[1])))
+        pred_indices, gt_indices = [], []
+        while remaining_pred and remaining_gt:
+            best = min(
+                (
+                    (float(cost[pred_idx, gt_idx]), pred_idx, gt_idx)
+                    for pred_idx in remaining_pred
+                    for gt_idx in remaining_gt
+                ),
+                key=lambda row: row[0],
+            )
+            _, pred_idx, gt_idx = best
+            pred_indices.append(pred_idx)
+            gt_indices.append(gt_idx)
+            remaining_pred.remove(pred_idx)
+            remaining_gt.remove(gt_idx)
+    matches: list[tuple[int, int, float]] = []
+    for pred_idx, gt_idx in zip(list(pred_indices), list(gt_indices)):
+        if not bool(valid[int(gt_idx)].any().item()):
+            continue
+        matches.append((int(pred_idx), int(gt_idx), float(oks[int(pred_idx), int(gt_idx)])))
+    matches.sort(key=lambda row: row[0])
+    return matches
+
+
 def align_targets_to_person_queries(
     outputs: dict[str, torch.Tensor],
     targets: list[dict[str, Any]],
@@ -1945,6 +2156,23 @@ def align_targets_to_person_queries(
     detector.  Unmatched queries remain explicit background negatives.
     """
     predicted = outputs["pred_boxes"].detach()
+    proposal_boxes = outputs.get("input_boxes")
+    if not torch.is_tensor(proposal_boxes):
+        proposal_boxes = predicted
+    else:
+        proposal_boxes = proposal_boxes.detach()
+    predicted_keypoints = outputs.get("pred_keypoints", outputs.get("keypoints"))
+    # Matching/top-Q uses auxiliary proposal objectness, never either public AP
+    # score. This keeps assignment stable while box and pose quality calibrate
+    # independently against their detached IoU/OKS targets.
+    predicted_logits = outputs.get(
+        "proposal_objectness_logits_aux",
+        outputs.get("person_class_logits", outputs.get("person_logits")),
+    )
+    pose_set_prediction = bool(
+        torch.is_tensor(outputs.get("pose_set_prediction"))
+        and bool(outputs["pose_set_prediction"].detach().item())
+    )
     query_mask = outputs.get("box_mask")
     aligned: list[dict[str, Any]] = []
     for batch_idx, target in enumerate(targets):
@@ -1958,11 +2186,66 @@ def align_targets_to_person_queries(
         sample_predictions = predicted[batch_idx, query_indices]
         gt_boxes = target.get("loss_boxes", target["boxes"])
         gt_indices = list(range(int(gt_boxes.shape[0])))
-        local_matches = hungarian_match_boxes(
-            sample_predictions,
-            gt_boxes,
-            iou_thresh=0.0,
-        )
+        if (
+            pose_set_prediction
+            and torch.is_tensor(predicted_keypoints)
+            and torch.is_tensor(predicted_logits)
+        ):
+            sample_logits = predicted_logits[batch_idx, query_indices]
+            loss_areas = target.get("loss_areas")
+            if not torch.is_tensor(loss_areas):
+                loss_areas = (
+                    (gt_boxes[:, 2] - gt_boxes[:, 0]).clamp(min=0.0)
+                    * (gt_boxes[:, 3] - gt_boxes[:, 1]).clamp(min=0.0)
+                )
+            local_matches = hungarian_match_poses(
+                predicted_keypoints[batch_idx, query_indices],
+                sample_logits,
+                target["keypoints"],
+                target["keypoint_valid"],
+                loss_areas,
+                pred_boxes=proposal_boxes[batch_idx, query_indices],
+                gt_boxes=target["boxes"],
+            )
+            # Some detection annotations contain a valid human box but no pose
+            # labels.  They cannot enter pose matching, yet should still train
+            # proposal objectness/L1/GIoU. Match them by box using only queries
+            # left over from the pose assignment.
+            box_only_gt = torch.nonzero(
+                ~target["keypoint_valid"].bool().any(dim=-1),
+                as_tuple=False,
+            ).flatten()
+            used_predictions = {pred_idx for pred_idx, _, _ in local_matches}
+            remaining_predictions = torch.tensor(
+                [
+                    pred_idx
+                    for pred_idx in range(int(query_indices.numel()))
+                    if pred_idx not in used_predictions
+                ],
+                device=proposal_boxes.device,
+                dtype=torch.long,
+            )
+            if box_only_gt.numel() > 0 and remaining_predictions.numel() > 0:
+                box_only_matches = hungarian_match_boxes(
+                    proposal_boxes[batch_idx, query_indices[remaining_predictions]],
+                    target["boxes"].to(device=proposal_boxes.device)[box_only_gt],
+                    iou_thresh=0.0,
+                )
+                local_matches.extend(
+                    (
+                        int(remaining_predictions[pred_idx].item()),
+                        int(box_only_gt[gt_idx].item()),
+                        iou,
+                    )
+                    for pred_idx, gt_idx, iou in box_only_matches
+                )
+                local_matches.sort(key=lambda row: row[0])
+        else:
+            local_matches = hungarian_match_boxes(
+                sample_predictions,
+                gt_boxes,
+                iou_thresh=0.0,
+            )
         matches = [
             (int(query_indices[pred_idx].item()), gt_idx, iou)
             for pred_idx, gt_idx, iou in local_matches
@@ -2294,11 +2577,6 @@ def _extract_ref_description_from_prompt(prompt: str) -> str:
 REFHUMAN_FALLBACK_MARKER = "<refhuman_all_person_fallback>"
 
 
-def build_refhuman_locate_prompt(ref_text: str) -> str:
-    ref_text = str(ref_text).strip() or "person"
-    return f'Locate the person that matches the following description: "{ref_text}".'
-
-
 def build_refhuman_fallback_prompt(ref_text: str) -> str:
     ref_text = str(ref_text).strip() or "person"
     return (
@@ -2318,7 +2596,7 @@ def build_locate_generation_prompts(batch: dict) -> list[str]:
                 ref_text = _extract_ref_description_from_prompt(str(source_prompt))
             prompts.append(build_refhuman_locate_prompt(ref_text))
         else:
-            prompts.append("Locate all the instances that match the following description: person.")
+            prompts.append(ALL_POSE_PROMPT)
     return prompts
 
 
@@ -2853,15 +3131,12 @@ class QwenPoseTrainingModel(torch.nn.Module):
         task_ids: torch.Tensor,
         qwen_inputs: dict[str, torch.Tensor] | None = None,
         qwen_lm_inputs: dict[str, torch.Tensor] | None = None,
-        pbd_box_counts: torch.Tensor | None = None,
-        pbd_gt_boxes: torch.Tensor | None = None,
-        pbd_context_scales: torch.Tensor | None = None,
-        pbd_temperature: float = 1.0,
-        pose_box_grad_scale: float = 0.05,
         run_pose: bool = True,
         target_boxes: torch.Tensor | None = None,
         target_box_mask: torch.Tensor | None = None,
         images: torch.Tensor | None = None,
+        cached_text_embed: torch.Tensor | None = None,
+        cached_text_mask: torch.Tensor | None = None,
         dn_boxes: torch.Tensor | None = None,
         dn_box_mask: torch.Tensor | None = None,
         dn_labels: torch.Tensor | None = None,
@@ -2881,8 +3156,6 @@ class QwenPoseTrainingModel(torch.nn.Module):
     ) -> dict[str, torch.Tensor]:
         extra = {}
         lm_loss = None
-        pbd_losses: dict[str, torch.Tensor] = {}
-        pbd_soft_boxes: torch.Tensor | None = None
         projected_vit_cache: list[torch.Tensor] | None = None
 
         # Stage 2 of the decoupled recipe trains only LocateAnything grounding.
@@ -2925,28 +3198,6 @@ class QwenPoseTrainingModel(torch.nn.Module):
                     target_labels,
                     reduction="mean",
                 )
-                if pbd_box_counts is not None:
-                    if pbd_gt_boxes is None:
-                        raise ValueError("Grounding-only PBD requires GT boxes.")
-                    pbd_logits, pbd_target_ids = extract_eagle_pbd_blocks_from_lm_logits(
-                        self.backbone_extractor,
-                        target_logits,
-                        shift_labels,
-                        valid_label_mask,
-                        pbd_box_counts,
-                    )
-                    pbd_losses, pbd_soft_boxes = compute_eagle_pbd_grounding_losses(
-                        self.backbone_extractor,
-                        pbd_logits,
-                        pbd_target_ids,
-                        pbd_gt_boxes,
-                        temperature=float(pbd_temperature),
-                    )
-                    outputs.update(pbd_losses)
-                    outputs["pbd_soft_boxes"] = pbd_soft_boxes
-                    outputs["pbd_box_count"] = pbd_soft_boxes.new_tensor(
-                        float(pbd_soft_boxes.shape[0])
-                    )
             else:
                 outputs["lm_loss"] = lm_hidden.sum() * 0.0
             return outputs
@@ -3041,27 +3292,6 @@ class QwenPoseTrainingModel(torch.nn.Module):
                                 target_labels,
                                 reduction="mean",
                             )
-                            if pbd_box_counts is not None:
-                                if pbd_gt_boxes is None or pbd_context_scales is None:
-                                    raise ValueError(
-                                        "Joint soft-box training requires PBD GT boxes and context scales."
-                                    )
-                                pbd_logits, pbd_target_ids = (
-                                    extract_eagle_pbd_blocks_from_lm_logits(
-                                        self.backbone_extractor,
-                                        target_logits,
-                                        shift_labels,
-                                        valid_label_mask,
-                                        pbd_box_counts,
-                                    )
-                                )
-                                pbd_losses, pbd_soft_boxes = compute_eagle_pbd_grounding_losses(
-                                    self.backbone_extractor,
-                                    pbd_logits,
-                                    pbd_target_ids,
-                                    pbd_gt_boxes,
-                                    temperature=float(pbd_temperature),
-                                )
                         else:
                             lm_loss = lm_hidden.new_zeros(())
                 else:
@@ -3073,52 +3303,12 @@ class QwenPoseTrainingModel(torch.nn.Module):
                 "external_feature_map": external_feature_map,
                 "external_text_embed": external_text_embed,
             }
-        pose_condition_box_mode = self.pose_condition_box_mode
-        if pbd_soft_boxes is not None:
-            if pbd_box_counts is None or pbd_context_scales is None:
-                raise RuntimeError("Decoded PBD soft boxes are missing batch packing metadata.")
-            counts = pbd_box_counts.to(device=pbd_soft_boxes.device, dtype=torch.long)
-            if int(counts.sum().item()) != int(pbd_soft_boxes.shape[0]):
-                raise RuntimeError(
-                    "PBD soft-box count does not match the per-sample box counts: "
-                    f"soft={int(pbd_soft_boxes.shape[0])}, counts={int(counts.sum().item())}."
-                )
-            scales = pbd_context_scales.to(
-                device=pbd_soft_boxes.device,
-                dtype=pbd_soft_boxes.dtype,
-            ).reshape(-1, 1)
-            center = (pbd_soft_boxes[:, :2] + pbd_soft_boxes[:, 2:]) * 0.5
-            wh = (pbd_soft_boxes[:, 2:] - pbd_soft_boxes[:, :2]).clamp(min=1e-4) * scales
-            expanded_boxes = torch.cat(
-                [center - 0.5 * wh, center + 0.5 * wh],
-                dim=-1,
-            ).clamp(0.0, 1.0)
-            grad_scale = float(pose_box_grad_scale)
-            expanded_boxes = expanded_boxes.detach() + grad_scale * (
-                expanded_boxes - expanded_boxes.detach()
-            )
-            max_boxes = max(int(counts.max().item()) if counts.numel() else 0, 1)
-            target_boxes = expanded_boxes.new_zeros(
-                (int(counts.numel()), max_boxes, 4)
-            )
-            target_box_mask = torch.zeros(
-                (int(counts.numel()), max_boxes),
-                device=expanded_boxes.device,
-                dtype=torch.bool,
-            )
-            offset = 0
-            for sample_idx, count_tensor in enumerate(counts):
-                count = int(count_tensor.item())
-                if count > 0:
-                    target_boxes[sample_idx, :count] = expanded_boxes[offset : offset + count]
-                    target_box_mask[sample_idx, :count] = True
-                    offset += count
-            pose_condition_box_mode = "input"
-
         outputs = self.pose_model(
             schema_ids=schema_ids,
             task_ids=task_ids,
             images=images,
+            cached_text_embed=cached_text_embed,
+            cached_text_mask=cached_text_mask,
             target_boxes=target_boxes,
             target_box_mask=target_box_mask,
             dn_boxes=dn_boxes,
@@ -3137,18 +3327,9 @@ class QwenPoseTrainingModel(torch.nn.Module):
             keypoint_dn_source_indices=keypoint_dn_source_indices,
             keypoint_dn_group_ids=keypoint_dn_group_ids,
             keypoint_dn_box_query_indices=keypoint_dn_box_query_indices,
-            pose_condition_box_mode=pose_condition_box_mode,
+            pose_condition_box_mode=self.pose_condition_box_mode,
             **extra,
         )
-        if pbd_soft_boxes is not None:
-            outputs["pbd_soft_boxes"] = pbd_soft_boxes
-            outputs["pbd_box_count"] = pbd_soft_boxes.new_tensor(
-                float(pbd_soft_boxes.shape[0])
-            )
-            outputs["pose_box_grad_scale"] = pbd_soft_boxes.new_tensor(
-                float(pose_box_grad_scale)
-            )
-            outputs.update(pbd_losses)
         if lm_loss is not None:
             outputs["lm_loss"] = lm_loss
         return outputs
@@ -3173,6 +3354,9 @@ class LocatePoseUnifiedConfig:
     keep_unmatched_predictions: bool = False
     box_jitter_scale: float = 0.0
     box_jitter_shift: float = 0.0
+    locate_proxy_probability: float = 0.0
+    locate_proxy_center_noise: float = 0.03
+    locate_proxy_scale_noise: float = 0.06
 
     @classmethod
     def from_args(
@@ -3210,6 +3394,15 @@ class LocatePoseUnifiedConfig:
             ),
             box_jitter_scale=float(getattr(args, "box_jitter_scale", 0.0)),
             box_jitter_shift=float(getattr(args, "box_jitter_shift", 0.0)),
+            locate_proxy_probability=float(
+                getattr(args, "locate_proxy_probability", 0.0)
+            ),
+            locate_proxy_center_noise=float(
+                getattr(args, "locate_proxy_center_noise", 0.03)
+            ),
+            locate_proxy_scale_noise=float(
+                getattr(args, "locate_proxy_scale_noise", 0.06)
+            ),
         )
 
 
@@ -3392,7 +3585,12 @@ class LocatePoseUnifiedRuntime:
         *,
         precomputed_locate_responses: list[str] | None = None,
     ) -> LocatePoseUnifiedResult:
-        if bool(self.module.pose_model.config.use_global_person_queries):
+        use_pose_set = bool(self.module.pose_model.config.use_global_person_queries)
+        needs_locate_prior = (
+            precomputed_locate_responses is not None
+            or bool(batch["task_ids"].eq(1).any().item())
+        )
+        if use_pose_set and not needs_locate_prior:
             batch_size = int(batch["schema_ids"].shape[0])
             placeholder_boxes = torch.zeros(
                 batch_size, 1, 4, device=self.device, dtype=torch.float32
@@ -3471,7 +3669,31 @@ class LocatePoseUnifiedRuntime:
         *,
         box_source: str,
     ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
+        pose_set_architecture = bool(
+            getattr(self.module.pose_model.config, "use_detrpose_architecture", False)
+        )
+
+        def all_pose_targets() -> list[dict[str, torch.Tensor]]:
+            return prepare_person_query_conditioning(
+                batch["targets"],
+                batch["task_ids"],
+                self.device,
+                max_instances=config.max_instances,
+            )[2]
+
         if box_source == "person_queries":
+            if (
+                config.locate_proxy_probability > 0.0
+                and random.random() < config.locate_proxy_probability
+            ):
+                return prepare_locate_proxy_conditioning(
+                    batch["targets"],
+                    batch["task_ids"],
+                    self.device,
+                    max_instances=config.max_instances,
+                    center_noise=config.locate_proxy_center_noise,
+                    scale_noise=config.locate_proxy_scale_noise,
+                )
             return prepare_person_query_conditioning(
                 batch["targets"],
                 batch["task_ids"],
@@ -3479,7 +3701,7 @@ class LocatePoseUnifiedRuntime:
                 max_instances=config.max_instances,
             )
         if box_source == "qwen_generate":
-            return prepare_qwen_generated_box_conditioning(
+            boxes, mask, selected_targets = prepare_qwen_generated_box_conditioning(
                 self.model,
                 self.processor,
                 batch,
@@ -3491,13 +3713,22 @@ class LocatePoseUnifiedRuntime:
                 min_pixels=config.qwen_min_pixels,
                 max_pixels=config.qwen_max_pixels,
             )
+            return boxes, mask, all_pose_targets() if pose_set_architecture else selected_targets
         if box_source == "locate_generate":
-            # The restored recipe closed the loop only for RefHuman. Regular
-            # pose datasets keep clean GT box conditioning for PoseHead.
+            # In the no-ROI pose-set graph, ordinary multi-person samples use
+            # only internal proposals. Locate boxes are an optional RefHuman
+            # prior, never a reason to fall back to GT boxes.
             if config.locate_generate_refhuman_only and not bool(
                 batch["task_ids"].eq(1).any().item()
             ):
-                return prepare_box_conditioning(
+                if pose_set_architecture:
+                    return prepare_person_query_conditioning(
+                        batch["targets"],
+                        batch["task_ids"],
+                        self.device,
+                        max_instances=config.max_instances,
+                    )
+                boxes, mask, selected_targets = prepare_box_conditioning(
                     batch["targets"],
                     batch["task_ids"],
                     self.device,
@@ -3505,6 +3736,7 @@ class LocatePoseUnifiedRuntime:
                     box_jitter_scale=config.box_jitter_scale,
                     box_jitter_shift=config.box_jitter_shift,
                 )
+                return boxes, mask, selected_targets
             responses = generate_locate_bbox_responses(
                 self.model,
                 self.processor,
@@ -3515,7 +3747,7 @@ class LocatePoseUnifiedRuntime:
                 generation_mode=config.locate_generation_mode,
                 image_token_limit=config.eagle_image_token_limit,
             )
-            return prepare_locate_generated_box_conditioning_from_responses(
+            boxes, mask, selected_targets = prepare_locate_generated_box_conditioning_from_responses(
                 responses,
                 batch,
                 self.device,
@@ -3525,7 +3757,8 @@ class LocatePoseUnifiedRuntime:
                 disable_pre_pose_nms=config.disable_pre_pose_nms,
                 gt_ref_fallback_on_failure=True,
             )
-        return prepare_box_conditioning(
+            return boxes, mask, all_pose_targets() if pose_set_architecture else selected_targets
+        boxes, mask, selected_targets = prepare_box_conditioning(
             batch["targets"],
             batch["task_ids"],
             self.device,
@@ -3533,6 +3766,7 @@ class LocatePoseUnifiedRuntime:
             box_jitter_scale=config.box_jitter_scale,
             box_jitter_shift=config.box_jitter_shift,
         )
+        return boxes, mask, all_pose_targets() if pose_set_architecture else selected_targets
 
     def eval_batch(
         self,
@@ -3574,46 +3808,59 @@ class LocatePoseUnifiedRuntime:
                 keep_unmatched_predictions=config.keep_unmatched_predictions,
             )
         elif box_source == "locate_generate":
-            if precomputed_locate_responses is not None:
-                responses = precomputed_locate_responses
-                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
-                    responses,
-                    batch,
+            no_external_locate = (
+                bool(getattr(self.module.pose_model.config, "use_detrpose_architecture", False))
+                and config.locate_generate_refhuman_only
+                and not bool(batch["task_ids"].eq(1).any().item())
+            )
+            if no_external_locate:
+                target_boxes, target_box_mask, pose_targets = prepare_person_query_conditioning(
+                    batch["targets"],
+                    batch["task_ids"],
                     self.device,
                     max_instances=config.max_instances,
-                    match_iou_thresh=config.box_match_iou_thresh,
-                    nms_iou_thresh=config.box_nms_iou_thresh,
-                    disable_pre_pose_nms=config.disable_pre_pose_nms,
-                )
-            elif config.use_single_pass_features:
-                responses, external_feature_map, external_text_embed = self.generate_locate_responses(batch, config)
-                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
-                    responses,
-                    batch,
-                    self.device,
-                    max_instances=config.max_instances,
-                    match_iou_thresh=config.box_match_iou_thresh,
-                    nms_iou_thresh=config.box_nms_iou_thresh,
-                    disable_pre_pose_nms=config.disable_pre_pose_nms,
                 )
             else:
-                responses, _, _ = self.generate_locate_responses(batch, config)
-                target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
-                    responses,
+                if precomputed_locate_responses is not None:
+                    responses = precomputed_locate_responses
+                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                        responses,
+                        batch,
+                        self.device,
+                        max_instances=config.max_instances,
+                        match_iou_thresh=config.box_match_iou_thresh,
+                        nms_iou_thresh=config.box_nms_iou_thresh,
+                        disable_pre_pose_nms=config.disable_pre_pose_nms,
+                    )
+                elif config.use_single_pass_features:
+                    responses, external_feature_map, external_text_embed = self.generate_locate_responses(batch, config)
+                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                        responses,
+                        batch,
+                        self.device,
+                        max_instances=config.max_instances,
+                        match_iou_thresh=config.box_match_iou_thresh,
+                        nms_iou_thresh=config.box_nms_iou_thresh,
+                        disable_pre_pose_nms=config.disable_pre_pose_nms,
+                    )
+                else:
+                    responses, _, _ = self.generate_locate_responses(batch, config)
+                    target_boxes, target_box_mask, pose_targets = prepare_locate_generated_box_conditioning_from_responses(
+                        responses,
+                        batch,
+                        self.device,
+                        max_instances=config.max_instances,
+                        match_iou_thresh=config.box_match_iou_thresh,
+                        nms_iou_thresh=config.box_nms_iou_thresh,
+                        disable_pre_pose_nms=config.disable_pre_pose_nms,
+                    )
+                locate_boxes_abs = locate_boxes_abs_from_responses(
+                    responses or [],
                     batch,
-                    self.device,
                     max_instances=config.max_instances,
-                    match_iou_thresh=config.box_match_iou_thresh,
                     nms_iou_thresh=config.box_nms_iou_thresh,
                     disable_pre_pose_nms=config.disable_pre_pose_nms,
                 )
-            locate_boxes_abs = locate_boxes_abs_from_responses(
-                responses or [],
-                batch,
-                max_instances=config.max_instances,
-                nms_iou_thresh=config.box_nms_iou_thresh,
-                disable_pre_pose_nms=config.disable_pre_pose_nms,
-            )
         else:
             target_boxes, target_box_mask, pose_targets = prepare_box_conditioning(
                 batch["targets"],
@@ -3623,6 +3870,13 @@ class LocatePoseUnifiedRuntime:
                 box_jitter_scale=config.box_jitter_scale,
                 box_jitter_shift=config.box_jitter_shift,
             )
+        if bool(getattr(self.module.pose_model.config, "use_detrpose_architecture", False)):
+            pose_targets = prepare_person_query_conditioning(
+                batch["targets"],
+                batch["task_ids"],
+                self.device,
+                max_instances=config.max_instances,
+            )[2]
         outputs, qwen_inputs = self.forward_pose(
             batch,
             target_boxes,
@@ -3631,7 +3885,10 @@ class LocatePoseUnifiedRuntime:
             external_feature_map=external_feature_map,
             external_text_embed=external_text_embed,
         )
-        if box_source == "person_queries":
+        if (
+            torch.is_tensor(outputs.get("pose_set_prediction"))
+            and bool(outputs["pose_set_prediction"].detach().item())
+        ):
             pose_targets = align_targets_to_person_queries(
                 outputs,
                 pose_targets,
@@ -4174,7 +4431,10 @@ def compute_pose_diagnostics(
             ).mean(dim=-1)
             box_error_sum = box_error_sum + (box_joint_error * valid_f).sum()
 
-            pose_boxes = outputs["pose_boxes"][sample_idx, queries]
+            # Diagnose whether final keypoints fall outside the independently
+            # regressed person box.  The old keypoint envelope made this metric
+            # tautologically zero and hid box/pose disagreement.
+            pose_boxes = outputs["pred_boxes"][sample_idx, queries]
             pose_wh = (pose_boxes[:, 2:] - pose_boxes[:, :2]).clamp(min=1e-4)
             relative_gt = (
                 gt - pose_boxes[:, None, :2]
@@ -4342,11 +4602,11 @@ def _weighted_loss_items(
     )
     add(
         "pose",
-        "conf",
+        "vis",
         "loss_keypoint_confidence",
         confidence_weight,
     )
-    add("pose", "pconf", "loss_person_confidence", weights.person_confidence)
+    add("pose", "pscore", "loss_person_confidence", weights.person_confidence)
     add("ref", "match", "loss_ref_match", weights.ref_match)
     for decoder_idx, decoder_weight in enumerate(
         parse_float_list(weights.decoder_coords), start=1
@@ -4362,6 +4622,7 @@ def _weighted_loss_items(
     for refine_idx, refine_weight in enumerate(parse_float_list(weights.refine_coords), start=1):
         add("pose", f"ref{refine_idx}", f"loss_coord_refine_{refine_idx}", refine_weight)
     add("box", "obj", "loss_box_objectness", weights.box_objectness)
+    add("box", "quality", "loss_box_quality", weights.box_quality)
     add("box", "l1", "loss_box_l1", weights.box_l1)
     add("box", "giou", "loss_box_giou", weights.box_giou)
     add("box", "rel", "loss_box_relative", weights.box_relative)
@@ -4446,6 +4707,7 @@ def format_loss_weights(weights: LossWeights) -> str:
         f"coord_aux(decoder={coord_decoder},coarse={_format_loss_weight(weights.coarse_coord)},"
         f"deform={_format_loss_weight(weights.deform_coord)},refine={coord_refine}) "
         f"box(obj={_format_loss_weight(weights.box_objectness)},"
+        f"quality={_format_loss_weight(weights.box_quality)},"
         f"l1={_format_loss_weight(weights.box_l1)},"
         f"giou={_format_loss_weight(weights.box_giou)},"
         f"relative={_format_loss_weight(weights.box_relative)},"
@@ -4556,10 +4818,19 @@ DEFAULT_POSE_EDGE_INDICES = sorted(
 )
 
 
-def _draw_box(draw: ImageDraw.ImageDraw, box: torch.Tensor, width: int, height: int, color: tuple[int, int, int], label: str) -> None:
+def _draw_box(
+    draw: ImageDraw.ImageDraw,
+    box: torch.Tensor,
+    width: int,
+    height: int,
+    color: tuple[int, int, int],
+    label: str,
+    *,
+    line_width: int = 3,
+) -> None:
     x1, y1, x2, y2 = box.tolist()
     xy = [x1 * width, y1 * height, x2 * width, y2 * height]
-    draw.rectangle(xy, outline=color, width=3)
+    draw.rectangle(xy, outline=color, width=max(int(line_width), 1))
     draw.text((xy[0] + 2, max(xy[1] - 14, 0)), label, fill=color)
 
 
@@ -4636,6 +4907,11 @@ def save_pose_visualization(
     max_instances: int = 8,
     score_threshold: float = 0.05,
     draw_all_schema_keypoints: bool = False,
+    prediction_row: dict[str, Any] | None = None,
+    ref_pose_quality_alpha: float = 0.25,
+    proposal_nms_iou_thresh: float = 0.65,
+    proposal_objectness_threshold: float = 0.05,
+    proposal_pose_threshold: float = 0.05,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     vision_images = batch.get("vision_images")
@@ -4654,18 +4930,55 @@ def save_pose_visualization(
     draw = ImageDraw.Draw(canvas)
     width, height = canvas.size
 
-    # Keep training visualizations deliberately minimal. ``boxes`` is the box
-    # regression head output; input Locate/GT boxes and the expanded ROI boxes
-    # remain available in tensors/metrics but are not drawn over the result.
-    boxes = outputs["boxes"][sample_idx].detach().float().cpu()
+    keypoints = outputs["keypoints"][sample_idx].detach().float().cpu()
+    num_queries = int(keypoints.shape[0])
+    canonical_boxes = outputs.get("pred_boxes", outputs.get("boxes"))
+    if not torch.is_tensor(canonical_boxes):
+        raise ValueError("Visualization requires canonical pred_boxes.")
+    boxes = canonical_boxes[sample_idx, :num_queries].detach().float().cpu()
     box_mask = outputs.get("box_mask")
     valid_boxes = (
-        box_mask[sample_idx].detach().cpu().bool()
+        box_mask[sample_idx, :num_queries].detach().cpu().bool()
         if box_mask is not None
         else torch.ones(boxes.shape[0], dtype=torch.bool)
     )
-    scores = outputs["person_logits"][sample_idx].detach().sigmoid().float().cpu()
-    keypoints = outputs["keypoints"][sample_idx].detach().float().cpu()
+    person_class_logits = outputs.get("person_class_logits")
+    if not torch.is_tensor(person_class_logits):
+        person_class_logits = outputs["person_logits"]
+    person_scores = person_class_logits[
+        sample_idx, :num_queries
+    ].detach().sigmoid().float().cpu()
+    pred_box_logits = outputs.get("pred_box_logits")
+    box_quality_logits = outputs.get("box_quality_logits")
+    box_quality_scores = (
+        box_quality_logits[sample_idx, :num_queries].detach().sigmoid().float().cpu()
+        if torch.is_tensor(box_quality_logits)
+        else torch.ones_like(person_scores)
+    )
+    pose_quality_logits = outputs.get("pose_quality_logits")
+    pose_quality_scores = (
+        pose_quality_logits[sample_idx, :num_queries].detach().sigmoid().float().cpu()
+        if torch.is_tensor(pose_quality_logits)
+        else torch.ones_like(person_scores)
+    )
+    box_scores = (
+        pred_box_logits[sample_idx, :num_queries].detach().sigmoid().float().cpu()
+        if torch.is_tensor(pred_box_logits)
+        else person_scores * box_quality_scores
+    )
+    pred_pose_logits = outputs.get("pred_pose_logits")
+    pose_scores = (
+        pred_pose_logits[sample_idx, :num_queries].detach().sigmoid().float().cpu()
+        if torch.is_tensor(pred_pose_logits)
+        else person_scores * pose_quality_scores
+    )
+    ref_logits = outputs.get("ref_logits")
+    sample_ref_logits = (
+        ref_logits[sample_idx, :num_queries].detach().float().cpu()
+        if torch.is_tensor(ref_logits)
+        else person_scores.new_zeros(person_scores.shape)
+    )
+    ref_scores = sample_ref_logits.sigmoid()
     schema_valid = outputs["keypoint_valid_mask"][sample_idx].detach().cpu().bool()
 
     target = batch["targets"][sample_idx]
@@ -4718,75 +5031,219 @@ def save_pose_visualization(
         else None
     )
 
+    is_refhuman = task_name == "REF_POSE" or bool(ref_description)
     valid_indices = torch.nonzero(valid_boxes, as_tuple=False).flatten()
-    if valid_indices.numel() > 0:
-        ranked = valid_indices[torch.argsort(scores[valid_indices], descending=True)]
-    else:
-        ranked = torch.empty(0, dtype=torch.long)
+    proposal_source_ids = outputs.get("proposal_source_ids")
+    sample_source_ids = (
+        proposal_source_ids[sample_idx, :num_queries].detach().cpu().long()
+        if torch.is_tensor(proposal_source_ids)
+        else torch.zeros(num_queries, dtype=torch.long)
+    )
+    input_boxes_tensor = outputs.get("input_boxes")
+    input_boxes = (
+        input_boxes_tensor[sample_idx, :num_queries].detach().float().cpu()
+        if torch.is_tensor(input_boxes_tensor)
+        else boxes
+    )
 
-    # Training-time person quality is intentionally low while pose coordinates
-    # are still inaccurate. Do not let the prediction score threshold hide the
-    # matched GT as well: matched queries are always selected and visualized,
-    # followed by the highest-scoring unmatched predictions.
-    if matched_gt_indices is not None:
-        matched_mask = torch.zeros_like(valid_boxes)
-        matched_count = min(
-            int(matched_gt_indices.numel()),
-            int(matched_mask.numel()),
+    ref_probabilities = torch.zeros_like(ref_scores)
+    if valid_indices.numel() > 0:
+        ref_probabilities[valid_indices] = torch.softmax(
+            sample_ref_logits[valid_indices], dim=0
         )
-        matched_mask[:matched_count] = matched_gt_indices[:matched_count].ge(0)
-    else:
-        matched_mask = torch.arange(boxes.shape[0]) < int(gt_boxes.shape[0])
-    matched_indices = torch.nonzero(valid_boxes & matched_mask, as_tuple=False).flatten()
-    if matched_indices.numel() > 0:
-        matched_areas = (
-            (gt_boxes[matched_indices, 2] - gt_boxes[matched_indices, 0]).clamp_min(0.0)
-            * (gt_boxes[matched_indices, 3] - gt_boxes[matched_indices, 1]).clamp_min(0.0)
+    quality_alpha = max(float(ref_pose_quality_alpha), 0.0)
+    ref_final_scores = ref_probabilities * pose_scores.clamp_min(1e-8).pow(
+        quality_alpha
+    )
+
+    selected_boxes: list[int] = []
+    selected_poses: list[int] = []
+    box_nms_survivor_count = 0
+    pose_nms_survivor_count = 0
+    if prediction_row is not None:
+        serialized = []
+        for prediction in prediction_row.get("predictions", []):
+            query_idx = int(prediction.get("query", -1))
+            if 0 <= query_idx < num_queries and bool(valid_boxes[query_idx]):
+                serialized.append(query_idx)
+        if is_refhuman and serialized:
+            best = max(serialized, key=lambda idx: float(ref_final_scores[idx]))
+            selected_boxes = [best]
+            selected_poses = [best]
+        else:
+            box_ranked = sorted(
+                serialized, key=lambda idx: float(box_scores[idx]), reverse=True
+            )
+            pose_ranked = sorted(
+                serialized, key=lambda idx: float(pose_scores[idx]), reverse=True
+            )
+            selected_boxes = [
+                idx for idx in box_ranked
+                if float(box_scores[idx]) >= float(proposal_objectness_threshold)
+            ][: max(int(max_instances), 0)]
+            selected_poses = [
+                idx for idx in pose_ranked
+                if float(pose_scores[idx]) >= float(proposal_pose_threshold)
+            ][: max(int(max_instances), 0)]
+    elif is_refhuman and valid_indices.numel() > 0:
+        best = int(valid_indices[torch.argmax(ref_final_scores[valid_indices])].item())
+        selected_boxes = [best]
+        selected_poses = [best]
+        box_nms_survivor_count = 1
+        pose_nms_survivor_count = 1
+    elif valid_indices.numel() > 0:
+        box_nms_local = nms_box_indices_xyxy(
+            boxes[valid_indices],
+            box_scores[valid_indices],
+            iou_thresh=float(proposal_nms_iou_thresh),
+            max_boxes=max(int(valid_indices.numel()), 1),
         )
-        matched_indices = matched_indices[
-            torch.argsort(matched_areas, descending=True)
+        pose_nms_local = nms_box_indices_xyxy(
+            boxes[valid_indices],
+            pose_scores[valid_indices],
+            iou_thresh=float(proposal_nms_iou_thresh),
+            max_boxes=max(int(valid_indices.numel()), 1),
+        )
+        box_nms_indices = valid_indices[
+            torch.as_tensor(box_nms_local, dtype=torch.long)
+        ] if box_nms_local else valid_indices[:0]
+        pose_nms_indices = valid_indices[
+            torch.as_tensor(pose_nms_local, dtype=torch.long)
+        ] if pose_nms_local else valid_indices[:0]
+        box_nms_survivor_count = int(box_nms_indices.numel())
+        pose_nms_survivor_count = int(pose_nms_indices.numel())
+        selected_boxes = [
+            int(idx) for idx in box_nms_indices[
+                box_scores[box_nms_indices] >= float(proposal_objectness_threshold)
+            ][: max(int(max_instances), 0)].tolist()
+        ]
+        selected_poses = [
+            int(idx) for idx in pose_nms_indices[
+                pose_scores[pose_nms_indices] >= float(proposal_pose_threshold)
+            ][: max(int(max_instances), 0)].tolist()
         ]
 
-    selected: list[int] = []
-    selected_set: set[int] = set()
-    for idx in torch.cat((matched_indices, ranked)).tolist():
-        idx = int(idx)
-        if idx in selected_set:
-            continue
-        selected.append(idx)
-        selected_set.add(idx)
-        if len(selected) >= max(int(max_instances), 0):
-            break
+    selected_union = list(dict.fromkeys(selected_boxes + selected_poses))
 
-    for selection_rank, idx in enumerate(selected):
-        has_gt = bool(matched_mask[idx].item())
-        if has_gt:
-            _draw_box(draw, gt_boxes[idx], width, height, (50, 200, 80), f"GT {idx}")
-            _draw_pose(draw, gt_keypoints[idx], gt_draw_valid[idx], width, height, (50, 200, 80), edge_indices)
+    # Draw GT independently from predictions. Aligned training/eval targets
+    # store GT at the matched query slot; raw inference targets store ordinary
+    # instance rows. RefHuman highlights only the referred person in green and
+    # keeps at most five distractor boxes in unobtrusive gray.
+    gt_entries: list[tuple[int, int, int | None]] = []
+    if matched_gt_indices is not None:
+        for query_idx in torch.nonzero(matched_gt_indices.ge(0), as_tuple=False).flatten().tolist():
+            if query_idx >= int(gt_boxes.shape[0]):
+                continue
+            gt_entries.append((query_idx, int(matched_gt_indices[query_idx].item()), query_idx))
+    else:
+        gt_entries = [(gt_idx, gt_idx, None) for gt_idx in range(int(gt_boxes.shape[0]))]
 
-        # Always show predictions paired with GT, and keep at least the top
-        # prediction visible for samples without a matched target. The score
-        # threshold only suppresses additional unmatched low-confidence boxes.
-        if not has_gt and scores[idx] < score_threshold and selection_rank > 0:
+    ref_value = target.get("ref_target", -1)
+    ref_target = int(ref_value.detach().cpu().item()) if torch.is_tensor(ref_value) else int(ref_value)
+    distractors_drawn = 0
+    for target_idx, original_gt_idx, query_idx in gt_entries:
+        referred = is_refhuman and (
+            (query_idx is not None and query_idx == ref_target)
+            or (query_idx is None and original_gt_idx == ref_target)
+        )
+        if is_refhuman and not referred:
+            if distractors_drawn >= 5:
+                continue
+            _draw_box(
+                draw,
+                gt_boxes[target_idx],
+                width,
+                height,
+                (145, 145, 145),
+                f"other GT {original_gt_idx}",
+                line_width=2,
+            )
+            distractors_drawn += 1
             continue
+        color = (50, 200, 80)
+        label = f"REF GT {original_gt_idx}" if is_refhuman else f"GT {original_gt_idx}"
+        _draw_box(draw, gt_boxes[target_idx], width, height, color, label)
+        _draw_pose(
+            draw,
+            gt_keypoints[target_idx],
+            gt_draw_valid[target_idx],
+            width,
+            height,
+            color,
+            edge_indices,
+        )
+
+    # External source 1 is either a Stage1 noisy-GT Locate proxy or a real
+    # LocateAnything box. Draw the input prior separately from the refined blue
+    # prediction so visualizations cannot be mistaken for direct GT copying.
+    selected_external_inputs = [
+        idx for idx in selected_union if int(sample_source_ids[idx].item()) == 1
+    ]
+    for idx in selected_external_inputs:
+        _draw_box(
+            draw,
+            input_boxes[idx],
+            width,
+            height,
+            (255, 165, 40),
+            f"Locate input Q{idx}",
+            line_width=2,
+        )
+
+    for idx in selected_boxes:
+        if is_refhuman:
+            label = (
+                f"Q{idx}{' ext-refined' if int(sample_source_ids[idx]) == 1 else ''} "
+                f"ref={float(ref_final_scores[idx]):.2f} "
+                f"box={float(box_scores[idx]):.2f} pose={float(pose_scores[idx]):.2f}"
+            )
+        else:
+            label = (
+                f"Q{idx}{' ext-refined' if int(sample_source_ids[idx]) == 1 else ''} "
+                f"box={float(box_scores[idx]):.2f} "
+                f"pose={float(pose_scores[idx]):.2f}"
+            )
         _draw_box(
             draw,
             boxes[idx],
             width,
             height,
             (80, 180, 255),
-            f"Pred {idx} score={float(scores[idx]):.2f}",
+            label,
         )
+
+    for idx in selected_poses:
         predicted_valid = (
             schema_valid
             if draw_all_schema_keypoints
             else schema_valid & (keypoints[idx, :, 2] >= score_threshold)
         )
-        _draw_pose(draw, keypoints[idx], predicted_valid, width, height, (240, 70, 70), edge_indices)
+        if not predicted_valid.any():
+            # Visibility is not the pose AP score. Keep a high-ranked pose
+            # inspectable even while its separate visibility head is immature.
+            predicted_valid = schema_valid
+        _draw_pose(
+            draw,
+            keypoints[idx],
+            predicted_valid,
+            width,
+            height,
+            (240, 70, 70),
+            edge_indices,
+        )
+        visible_indices = torch.nonzero(predicted_valid, as_tuple=False).flatten()
+        if visible_indices.numel() > 0:
+            label_joint = int(visible_indices[0].item())
+            label_x = int(float(keypoints[idx, label_joint, 0]) * width) + 3
+            label_y = int(float(keypoints[idx, label_joint, 1]) * height) + 3
+            draw.text(
+                (label_x, label_y),
+                f"P Q{idx}={float(pose_scores[idx]):.2f}",
+                fill=(255, 120, 120),
+            )
 
     header_width = min(width, 1100)
-    is_refhuman = task_name == "REF_POSE" or bool(ref_description)
-    header_height = 64 if is_refhuman else 44
+    header_height = 84 if is_refhuman else 64
     draw.rectangle([0, 0, header_width, header_height], fill=(0, 0, 0))
     draw.text(
         (4, 4),
@@ -4795,7 +5252,11 @@ def save_pose_visualization(
     )
     draw.text(
         (4, 24),
-        "green=GT box/pose | blue=predicted box | red=predicted pose",
+        (
+            "green=REF GT | gray=other GT | orange=Locate input | blue=refined box | red=pose"
+            if is_refhuman
+            else "green=GT | orange=Locate input | blue=pred/refined box | red=pose"
+        ),
         fill=(255, 255, 255),
     )
     if is_refhuman:
@@ -4806,6 +5267,32 @@ def save_pose_visualization(
         if len(description) > max_chars:
             description = description[: max(max_chars - 3, 1)].rstrip() + "..."
         draw.text((4, 44), f"ref: {description}", fill=(255, 230, 120))
+    status_y = 64 if is_refhuman else 44
+    best_box_score = (
+        float(box_scores[valid_indices].max().item())
+        if valid_indices.numel() > 0
+        else 0.0
+    )
+    best_pose_score = (
+        float(pose_scores[valid_indices].max().item())
+        if valid_indices.numel() > 0
+        else 0.0
+    )
+    if prediction_row is None:
+        status = (
+            f"box={len(selected_boxes)}(nms={box_nms_survivor_count},best={best_box_score:.3f}) "
+            f"pose={len(selected_poses)}(nms={pose_nms_survivor_count},best={best_pose_score:.3f})"
+        )
+        if not is_refhuman:
+            status += (
+                f" thresholds={float(proposal_objectness_threshold):.3f}/"
+                f"{float(proposal_pose_threshold):.3f}"
+            )
+    else:
+        status = (
+            f"serialized box={len(selected_boxes)} pose={len(selected_poses)}"
+        )
+    draw.text((4, status_y), status, fill=(180, 220, 255))
     canvas.save(output_path)
 
 
@@ -5675,8 +6162,23 @@ def main() -> None:
         raise ValueError("--letterbox_fill must be in [0, 255].")
     if not 0.0 <= args.visualize_min_gt_area_ratio <= 1.0:
         raise ValueError("--visualize_min_gt_area_ratio must be in [0, 1].")
+    if not 0.0 <= args.visualize_nms_iou_thresh <= 1.0:
+        raise ValueError("--visualize_nms_iou_thresh must be in [0, 1].")
+    if not 0.0 <= args.visualize_objectness_threshold <= 1.0:
+        raise ValueError("--visualize_objectness_threshold must be in [0, 1].")
+    if not 0.0 <= args.visualize_pose_threshold <= 1.0:
+        raise ValueError("--visualize_pose_threshold must be in [0, 1].")
+    if not 0.0 <= args.locate_proxy_probability <= 1.0:
+        raise ValueError("--locate_proxy_probability must be in [0, 1].")
+    if args.locate_proxy_center_noise < 0.0 or args.locate_proxy_scale_noise < 0.0:
+        raise ValueError("Locate proxy noise scales must be non-negative.")
+    if args.locate_proxy_probability > 0.0 and args.box_source != "person_queries":
+        raise ValueError(
+            "--locate_proxy_probability is only valid with --box_source=person_queries."
+        )
     if min(
         args.w_box_objectness,
+        args.w_box_quality,
         args.w_box_l1,
         args.w_box_giou,
         args.w_box_relative,
@@ -5693,10 +6195,6 @@ def main() -> None:
         raise ValueError("--w_ref_match must be non-negative.")
     if args.w_locate_box_lm < 0.0:
         raise ValueError("--w_locate_box_lm must be non-negative.")
-    if args.w_locate_pbd < 0.0 or args.pose_box_grad_scale < 0.0:
-        raise ValueError("--w_locate_pbd/--pose_box_grad_scale must be non-negative.")
-    if args.pbd_temperature <= 0.0:
-        raise ValueError("--pbd_temperature must be positive.")
     if args.locate_box_max_new_tokens <= 0:
         raise ValueError("--locate_box_max_new_tokens must be positive.")
     if args.locate_lm_loss_every <= 0:
@@ -5741,8 +6239,10 @@ def main() -> None:
             raise ValueError("Grounding-only training requires trainable LocateAnything LLM adapters.")
         if args.locate_feature_source != "raw_visual":
             raise ValueError("Grounding-only training requires --locate_feature_source=raw_visual.")
-        if args.w_locate_box_lm <= 0.0 and args.w_locate_pbd <= 0.0:
-            raise ValueError("Grounding-only training requires a positive LM or PBD loss weight.")
+        if args.disable_locate_grounding_aux:
+            raise ValueError("Grounding-only training cannot disable Locate grounding supervision.")
+        if args.w_locate_box_lm <= 0.0:
+            raise ValueError("Grounding-only training requires a positive LM loss weight.")
     if args.prune_locate_generation and args.backbone != "eagle":
         raise ValueError("--prune_locate_generation is only supported by LocateAnything/eagle.")
     if args.box_source == "locate_generate" and args.backbone != "eagle":
@@ -5827,10 +6327,10 @@ def main() -> None:
     #    ALL_POSE from pose datasets and REF_POSE from RefHuman.
     # ------------------------------------------------------------------
     dataset_names = [name.strip().lower() for name in args.datasets.replace("/", ",").split(",") if name.strip()]
-    if args.locate_feature_source == "vision_only" and "refhuman" in dataset_names:
+    if args.locate_feature_source == "vision_only" and args.refhuman_text_embedding_cache is None:
         raise ValueError(
-            "--locate_feature_source=vision_only cannot train RefHuman text conditioning. "
-            "Use pose-only datasets in Stage 1 and add RefHuman in raw_visual Stage 3."
+            "vision-only Stage1 requires --prompt_embedding_cache for every task prompt. "
+            "Run scripts/cache_refhuman_text_embeddings.py first."
         )
     if args.pose_augment and args.locate_feature_source != "vision_only":
         raise ValueError(
@@ -5887,6 +6387,8 @@ def main() -> None:
         record_cache_dir=args.record_cache_dir,
         disable_record_cache=args.disable_record_cache,
         show_progress=not args.disable_progress,
+        refhuman_text_embedding_cache=args.refhuman_text_embedding_cache,
+        require_cached_refhuman_text=args.locate_feature_source == "vision_only",
     )
     use_homogeneous_batches = (
         args.mixing_strategy == "interleave"
@@ -6122,6 +6624,11 @@ def main() -> None:
                 "The initialization checkpoint predates native-grid Locate pose features. "
                 "Train a new Stage1 checkpoint, then use it for Stage2."
             )
+        if saved_pose_config.get("use_detrpose_architecture") is not True:
+            raise ValueError(
+                "The initialization checkpoint uses the retired ROI pose graph. "
+                "The no-ROI DETRPose architecture requires a fresh Stage1 checkpoint."
+            )
         if (
             "enable_keypoint_denoising" not in saved_pose_config
             and not args.disable_keypoint_denoising
@@ -6169,9 +6676,7 @@ def main() -> None:
             deformable_scale_prior_temperature=float(
                 saved_pose_config.get("deformable_scale_prior_temperature", 1.5)
             ),
-            enable_box_denoising=bool(
-                saved_pose_config.get("enable_box_denoising", not args.disable_box_denoising)
-            ),
+            enable_box_denoising=False,
             enable_keypoint_denoising=bool(
                 saved_pose_config.get(
                     "enable_keypoint_denoising", not args.disable_keypoint_denoising
@@ -6191,12 +6696,24 @@ def main() -> None:
                 saved_pose_config.get("enable_person_confidence_head", True)
             ),
             person_confidence_rescue=False,
-            use_global_person_queries=bool(
-                saved_pose_config.get("use_global_person_queries", False)
-            ),
+            use_global_person_queries=True,
             num_person_queries=int(
                 saved_pose_config.get("num_person_queries", args.num_person_queries)
             ),
+            num_ref_queries=int(
+                saved_pose_config.get("num_ref_queries", args.num_ref_queries)
+            ),
+            multiscale_encoder_layers=int(
+                saved_pose_config.get(
+                    "multiscale_encoder_layers", args.multiscale_encoder_layers
+                )
+            ),
+            multiscale_encoder_points=int(
+                saved_pose_config.get(
+                    "multiscale_encoder_points", args.multiscale_encoder_points
+                )
+            ),
+            use_detrpose_architecture=True,
             pose_coordinate_init=saved_coordinate_init,
             schema_joint_priors_path=str(
                 saved_pose_config.get(
@@ -6229,15 +6746,19 @@ def main() -> None:
             deformable_scale_prior_strength=0.5,
             deformable_scale_prior_center_cells=6.0,
             deformable_scale_prior_temperature=1.5,
-            enable_box_denoising=not args.disable_box_denoising,
+            enable_box_denoising=False,
             enable_keypoint_denoising=not args.disable_keypoint_denoising,
             ref_text_scale=args.ref_text_scale,
             enable_ref_visual_modulation=not args.disable_ref_visual_modulation,
             legacy_checkpoint_compat=False,
-            enable_person_confidence_head=bool(args.enable_person_confidence_head),
+            enable_person_confidence_head=True,
             person_confidence_rescue=False,
-            use_global_person_queries=args.box_source == "person_queries",
+            use_global_person_queries=True,
             num_person_queries=args.num_person_queries,
+            num_ref_queries=args.num_ref_queries,
+            multiscale_encoder_layers=args.multiscale_encoder_layers,
+            multiscale_encoder_points=args.multiscale_encoder_points,
+            use_detrpose_architecture=True,
             pose_coordinate_init=args.pose_coordinate_init,
             schema_joint_priors_path=args.schema_joint_priors_path,
             dynamic_reference_offset_scale=args.dynamic_reference_offset_scale,
@@ -6248,13 +6769,8 @@ def main() -> None:
             "decoder layer: "
             f"layers={model_config.pose_decoder_layers}, weights={decoder_coord_weights}."
         )
-    requested_person_queries = args.box_source == "person_queries"
-    if bool(model_config.use_global_person_queries) != requested_person_queries:
-        raise ValueError(
-            "Initialization checkpoint and --box_source disagree about global person queries: "
-            f"checkpoint={model_config.use_global_person_queries}, box_source={args.box_source}."
-        )
-    if requested_person_queries and int(model_config.num_person_queries) != int(args.num_person_queries):
+    requested_person_queries = True
+    if int(model_config.num_person_queries) != int(args.num_person_queries):
         raise ValueError(
             "--num_person_queries must match the initialization checkpoint: "
             f"checkpoint={model_config.num_person_queries}, requested={args.num_person_queries}."
@@ -6558,6 +7074,7 @@ def main() -> None:
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
         box_objectness=args.w_box_objectness,
+        box_quality=args.w_box_quality,
         box_l1=args.w_box_l1,
         box_giou=args.w_box_giou,
         box_relative=args.w_box_relative,
@@ -6577,13 +7094,8 @@ def main() -> None:
         print(f"Training duration: {duration}")
         print(format_loss_weights(weights))
         print(
-            "Locate auxiliary loss weights: "
+            "Locate grounding loss: "
             f"box_lm={args.w_locate_box_lm}, "
-            f"pbd_outer={args.w_locate_pbd}, "
-            "pbd_inner(frame=0.5,coord=1,l1=5,giou=2,order=1), "
-            f"joint_pose_box_grad_scale={args.pose_box_grad_scale}, "
-            "joint_soft_box_scope=all_pose_datasets, "
-            f"pbd_temperature={args.pbd_temperature}, "
             f"lm_every_micro_steps={args.locate_lm_loss_every}"
         )
         print(
@@ -6596,6 +7108,9 @@ def main() -> None:
             f"visualize_every={args.visualize_every}, "
             f"visualize_max_instances={args.visualize_max_instances}, "
             f"visualize_min_gt_area_ratio={args.visualize_min_gt_area_ratio}, "
+            f"visualize_nms_iou={args.visualize_nms_iou_thresh}, "
+            f"visualize_objectness_threshold={args.visualize_objectness_threshold}, "
+            f"visualize_pose_threshold={args.visualize_pose_threshold}, "
             f"batch_trace={not args.disable_batch_trace}"
         )
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
@@ -6790,10 +7305,8 @@ def main() -> None:
                 torch.cuda.reset_peak_memory_stats(device)
             qwen_inputs = None
             qwen_lm_inputs = None
-            pbd_supervision: dict[str, object] | None = None
             trace_qwen_inputs = None
             use_lm_loss = False
-            joint_soft_box_enabled = False
             pose_targets = batch.get("targets", [])
             prep_time = None
             forward_time = None
@@ -6806,44 +7319,11 @@ def main() -> None:
                 sync_cuda_for_timing(args.sync_timing, device)
                 prep_started = time.perf_counter()
                 batch = move_batch_to_device(batch, device)
-                joint_soft_box_enabled = bool(
-                    backbone_name == "eagle"
-                    and args.box_source == "locate_generate"
-                    and not args.freeze_eagle
-                    and not args.disable_locate_grounding_aux
-                    and (
-                        args.w_locate_pbd > 0.0
-                        or args.pose_box_grad_scale > 0.0
-                    )
+                target_boxes, target_box_mask, pose_targets = unified_runtime.prepare_training_conditioning(
+                    batch,
+                    unified_config,
+                    box_source=args.box_source,
                 )
-                if args.locate_grounding_only:
-                    (
-                        target_boxes,
-                        target_box_mask,
-                        pose_targets,
-                        pbd_supervision,
-                    ) = prepare_joint_pbd_conditioning(
-                        batch,
-                        device,
-                        max_instances=args.locate_lm_max_instances,
-                    )
-                elif joint_soft_box_enabled:
-                    (
-                        target_boxes,
-                        target_box_mask,
-                        pose_targets,
-                        pbd_supervision,
-                    ) = prepare_joint_pbd_conditioning(
-                        batch,
-                        device,
-                        max_instances=args.locate_lm_max_instances,
-                    )
-                else:
-                    target_boxes, target_box_mask, pose_targets = unified_runtime.prepare_training_conditioning(
-                        batch,
-                        unified_config,
-                        box_source=args.box_source,
-                    )
                 dn_batch: dict[str, torch.Tensor] = {}
                 box_dn_batch: dict[str, torch.Tensor] | None = None
                 if not args.locate_grounding_only and not args.disable_box_denoising:
@@ -6861,7 +7341,6 @@ def main() -> None:
                 if (
                     not args.locate_grounding_only
                     and not args.disable_keypoint_denoising
-                    and box_dn_batch is not None
                 ):
                     keypoint_dn_batch = prepare_keypoint_denoising(
                         pose_targets,
@@ -6874,10 +7353,11 @@ def main() -> None:
                         negative_ks_max=args.keypoint_dn_negative_ks_max,
                         image_size=args.image_size,
                     )
-                    keypoint_dn_batch = pair_keypoint_denoising_with_box_denoising(
-                        box_dn_batch,
-                        keypoint_dn_batch,
-                    )
+                    if not bool(model_config.use_detrpose_architecture):
+                        keypoint_dn_batch = pair_keypoint_denoising_with_box_denoising(
+                            box_dn_batch,
+                            keypoint_dn_batch,
+                        )
                     if keypoint_dn_batch is not None:
                         dn_batch.update(keypoint_dn_batch)
                 if backbone_processor is None:
@@ -6900,11 +7380,7 @@ def main() -> None:
                         and args.locate_lm_loss_every > 0
                         and micro_step % args.locate_lm_loss_every == 0
                     )
-                    if (
-                        args.locate_grounding_only
-                        or use_lm_loss
-                        or joint_soft_box_enabled
-                    ):
+                    if args.locate_grounding_only or use_lm_loss:
                         locate_responses = build_locate_grounding_responses(
                             batch,
                             max_instances=args.locate_lm_max_instances,
@@ -6964,27 +7440,17 @@ def main() -> None:
                         task_ids=batch["task_ids"],
                         qwen_inputs=qwen_inputs,
                         qwen_lm_inputs=qwen_lm_inputs,
-                        pbd_box_counts=(
-                            None
-                            if pbd_supervision is None
-                            else pbd_supervision["box_counts"]
-                        ),
-                        pbd_gt_boxes=(
-                            None
-                            if pbd_supervision is None
-                            else pbd_supervision["gt_boxes"]
-                        ),
-                        pbd_context_scales=(
-                            None
-                            if pbd_supervision is None
-                            else pbd_supervision["context_scales"]
-                        ),
-                        pbd_temperature=float(args.pbd_temperature),
-                        pose_box_grad_scale=float(args.pose_box_grad_scale),
                         run_pose=not args.locate_grounding_only,
                         target_boxes=target_boxes,
                         target_box_mask=target_box_mask,
                         images=batch.get("images"),
+                        cached_text_embed=(
+                            batch.get("cached_text_embeddings")
+                            if torch.is_tensor(batch.get("cached_text_embeddings"))
+                            and int(batch["cached_text_embeddings"].shape[-1]) > 0
+                            else None
+                        ),
+                        cached_text_mask=batch.get("cached_text_embedding_mask"),
                         **dn_batch,
                     )
                     outputs_finite, bad_output_names = synchronized_finite_check(
@@ -6996,7 +7462,11 @@ def main() -> None:
                         raise FloatingPointError(
                             f"Non-finite model output before loss at step={global_step} micro={micro_step}: {local_detail}"
                         )
-                    if not args.locate_grounding_only and args.box_source == "person_queries":
+                    if (
+                        not args.locate_grounding_only
+                        and torch.is_tensor(outputs.get("pose_set_prediction"))
+                        and bool(outputs["pose_set_prediction"].detach().item())
+                    ):
                         pose_targets = align_targets_to_person_queries(
                             outputs,
                             pose_targets,
@@ -7044,6 +7514,16 @@ def main() -> None:
                             loss_dict["locate_direct_grounding_failure_rate"] = torch.stack(
                                 direct_failure_flags
                             ).mean().to(device=loss.device)
+                        proxy_flags = [
+                            target["locate_proxy_active"].float()
+                            for target in pose_targets
+                            if torch.is_tensor(target.get("locate_proxy_active"))
+                        ]
+                        loss_dict["locate_proxy_rate"] = (
+                            torch.stack(proxy_flags).mean().to(device=loss.device)
+                            if proxy_flags
+                            else torch.zeros((), device=loss.device)
+                        )
                     if "lm_loss" in outputs:
                         lm_loss = outputs["lm_loss"].float()
                         lm_weight = (
@@ -7063,39 +7543,6 @@ def main() -> None:
                                 f"weight={lm_weight:g} "
                                 f"contribution={float((lm_weight * lm_loss).detach()):.6f}",
                             )
-                    if "pbd_frame_loss" in outputs:
-                        pbd_ground_loss = (
-                            0.5 * outputs["pbd_frame_loss"].float()
-                            + outputs["pbd_coord_loss"].float()
-                            + 5.0 * outputs["pbd_l1_loss"].float()
-                            + 2.0 * outputs["pbd_giou_loss"].float()
-                            + outputs["pbd_order_loss"].float()
-                        )
-                        pbd_weight = float(args.w_locate_pbd)
-                        loss = loss + pbd_weight * pbd_ground_loss
-                        loss_dict.update(
-                            {
-                                "loss_pbd_ground": pbd_ground_loss,
-                                "loss_pbd_frame": outputs["pbd_frame_loss"].float(),
-                                "loss_pbd_coord": outputs["pbd_coord_loss"].float(),
-                                "loss_pbd_l1": outputs["pbd_l1_loss"].float(),
-                                "loss_pbd_giou": outputs["pbd_giou_loss"].float(),
-                                "loss_pbd_order": outputs["pbd_order_loss"].float(),
-                                "loss_pbd_weight": torch.as_tensor(pbd_weight, device=loss.device),
-                                "pbd_temperature": torch.as_tensor(
-                                    float(args.pbd_temperature),
-                                    device=loss.device,
-                                ),
-                                "pbd_box_count": outputs.get(
-                                    "pbd_box_count",
-                                    torch.zeros((), device=loss.device),
-                                ).float(),
-                                "pose_box_grad_scale": torch.as_tensor(
-                                    float(args.pose_box_grad_scale),
-                                    device=loss.device,
-                                ),
-                            }
-                        )
                     loss_dict["loss_total"] = loss
 
                 # --- Synchronized loss spike detection ---
@@ -7433,6 +7880,9 @@ def main() -> None:
                                 sample_idx=vis_sample_idx,
                                 max_instances=args.visualize_max_instances,
                                 draw_all_schema_keypoints=True,
+                                proposal_nms_iou_thresh=args.visualize_nms_iou_thresh,
+                                proposal_objectness_threshold=args.visualize_objectness_threshold,
+                                proposal_pose_threshold=args.visualize_pose_threshold,
                             )
                             progress_write(progress_bar, f"saved_visualization={vis_path}")
                         except Exception as vis_exc:

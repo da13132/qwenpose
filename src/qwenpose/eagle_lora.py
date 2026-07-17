@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from PIL import Image
 
 from .qwen_lora import QwenFeatureRefiner, _dtype_from_name
@@ -385,12 +386,7 @@ def load_eagle_vision_only_with_lora(config: EagleLoRAConfig):
     )
     setattr(processor, "_qwenpose_vision_only", True)
     if config.gradient_checkpointing:
-        enable_fn = getattr(get_eagle_base_model(model).vision_model, "gradient_checkpointing_enable", None)
-        if enable_fn is not None:
-            try:
-                enable_fn(gradient_checkpointing_kwargs={"use_reentrant": False})
-            except TypeError:
-                enable_fn()
+        _enable_moonvit_gradient_checkpointing(model)
     return model, processor
 
 
@@ -443,7 +439,12 @@ def load_eagle_with_lora(config: EagleLoRAConfig):
             attn_implementation=text_attn_impl,
         )
     _set_eagle_vision_attention(model, vision_attn_impl)
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        use_fast=False,
+        fix_mistral_regex=True,
+    )
 
     # Freeze all base parameters
     for param in model.parameters():
@@ -480,15 +481,31 @@ def load_eagle_with_lora(config: EagleLoRAConfig):
     return model, processor
 
 
+def _enable_moonvit_gradient_checkpointing(model: nn.Module) -> None:
+    """Enable project-local block checkpointing for MoonViT.
+
+    LocateAnything's remote-code MoonVitPretrainedModel does not declare the
+    Transformers gradient-checkpointing contract. The extractor therefore
+    checkpoints encoder blocks explicitly instead of calling the unsupported
+    ``gradient_checkpointing_enable`` method.
+    """
+    base = get_eagle_base_model(model)
+    vision_model = getattr(base, "vision_model", None)
+    if vision_model is not None:
+        setattr(vision_model, "_qwenpose_gradient_checkpointing", True)
+
+
 def _enable_gradient_checkpointing(model: nn.Module) -> None:
     base = get_eagle_base_model(model)
-    for candidate in (model, base):
+    _enable_moonvit_gradient_checkpointing(model)
+    for candidate in (model, base, getattr(base, "language_model", None)):
+        if candidate is None:
+            continue
         cfg = getattr(candidate, "config", None)
         if cfg is not None and hasattr(cfg, "use_cache"):
             cfg.use_cache = False
-    enable_fn = getattr(model, "gradient_checkpointing_enable", None)
-    if enable_fn is None:
-        enable_fn = getattr(base, "gradient_checkpointing_enable", None)
+    language_model = getattr(base, "language_model", None)
+    enable_fn = getattr(language_model, "gradient_checkpointing_enable", None)
     if enable_fn is not None:
         try:
             enable_fn(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -736,195 +753,6 @@ def build_eagle_lm_inputs(
     return full_inputs
 
 
-def tokenize_eagle_pbd_targets(
-    processor,
-    responses: list[str],
-    device: torch.device,
-) -> torch.Tensor:
-    """Tokenize native Locate box blocks and require one six-token PBD unit."""
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is None:
-        raise ValueError("LocateAnything tokenizer is required for PBD supervision.")
-    rows: list[list[int]] = []
-    for response in responses:
-        encoded = tokenizer(
-            str(response),
-            add_special_tokens=False,
-            return_attention_mask=False,
-        )
-        ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
-        if ids and isinstance(ids[0], list):
-            ids = ids[0]
-        token_ids = [int(token_id) for token_id in ids]
-        if len(token_ids) != 6:
-            decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
-            raise RuntimeError(
-                "Locate PBD target must tokenize to exactly six tokens; "
-                f"got {len(token_ids)} for {decoded!r}."
-            )
-        rows.append(token_ids)
-    if not rows:
-        return torch.zeros((0, 6), device=device, dtype=torch.long)
-    return torch.tensor(rows, device=device, dtype=torch.long)
-
-
-def extract_eagle_pbd_blocks_from_lm_logits(
-    extractor: "EagleFeatureExtractor",
-    target_logits: torch.Tensor,
-    shift_labels: torch.Tensor,
-    valid_label_mask: torch.Tensor,
-    expected_box_counts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract every native six-token box block from batched LM supervision.
-
-    ``target_logits`` follows the row-major boolean indexing order of
-    ``shift_labels[valid_label_mask]``.  Keeping the blocks in response order
-    lets ALL_POSE supervise every spatially sorted person while REF_POSE keeps
-    its single referred person.  The returned logits stay attached to the LM
-    graph, so a downstream differentiable box/pose loss can update Locate LoRA.
-    """
-    if target_logits.ndim != 2:
-        raise ValueError(f"Expected flattened LM logits [N,V], got {tuple(target_logits.shape)}")
-    if shift_labels.shape != valid_label_mask.shape:
-        raise ValueError("Shifted LM labels and valid-label mask must have identical shapes.")
-    if int(expected_box_counts.numel()) != int(shift_labels.shape[0]):
-        raise ValueError("PBD box counts must contain one value per LM batch row.")
-
-    base = get_eagle_base_model(extractor.eagle_model)
-    box_start = int(base.token_ids["box_start_token_id"])
-    box_end = int(base.token_ids["box_end_token_id"])
-    coord_start = int(base.token_ids["coord_start_token_id"])
-    coord_end = int(base.token_ids["coord_end_token_id"])
-    flat_ranks = (
-        valid_label_mask.to(dtype=torch.long).reshape(-1).cumsum(dim=0) - 1
-    ).view_as(valid_label_mask)
-    logit_blocks: list[torch.Tensor] = []
-    target_blocks: list[torch.Tensor] = []
-
-    for row in range(int(shift_labels.shape[0])):
-        active_positions = torch.nonzero(valid_label_mask[row], as_tuple=False).flatten()
-        active_ids = shift_labels[row, active_positions]
-        row_blocks = 0
-        cursor = 0
-        while cursor + 5 < int(active_ids.numel()):
-            candidate = active_ids[cursor : cursor + 6]
-            is_box = bool(
-                candidate[0].eq(box_start).item()
-                and candidate[5].eq(box_end).item()
-                and candidate[1:5].ge(coord_start).all().item()
-                and candidate[1:5].le(coord_end).all().item()
-            )
-            if not is_box:
-                cursor += 1
-                continue
-            positions = active_positions[cursor : cursor + 6]
-            ranks = flat_ranks[row, positions]
-            logit_blocks.append(target_logits.index_select(0, ranks))
-            target_blocks.append(candidate)
-            row_blocks += 1
-            cursor += 6
-        expected = int(expected_box_counts[row].detach().cpu().item())
-        if row_blocks != expected:
-            raise RuntimeError(
-                "Locate LM/PBD box-block mismatch: "
-                f"row={row}, expected={expected}, extracted={row_blocks}."
-            )
-
-    total_expected = int(expected_box_counts.sum().detach().cpu().item())
-    if len(logit_blocks) != total_expected:
-        raise RuntimeError(
-            f"Expected {total_expected} batched PBD boxes, extracted {len(logit_blocks)}."
-        )
-    if not logit_blocks:
-        return (
-            target_logits.new_zeros((0, 6, int(target_logits.shape[-1]))),
-            shift_labels.new_zeros((0, 6)),
-        )
-    return torch.stack(logit_blocks, dim=0), torch.stack(target_blocks, dim=0)
-
-
-def _aligned_generalized_box_iou_loss(
-    boxes1: torch.Tensor,
-    boxes2: torch.Tensor,
-) -> torch.Tensor:
-    """Mean aligned GIoU loss for normalized xyxy boxes."""
-    left_top = torch.maximum(boxes1[:, :2], boxes2[:, :2])
-    right_bottom = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
-    intersection_wh = (right_bottom - left_top).clamp(min=0.0)
-    intersection = intersection_wh[:, 0] * intersection_wh[:, 1]
-    area1_wh = (boxes1[:, 2:] - boxes1[:, :2]).clamp(min=0.0)
-    area2_wh = (boxes2[:, 2:] - boxes2[:, :2]).clamp(min=0.0)
-    area1 = area1_wh[:, 0] * area1_wh[:, 1]
-    area2 = area2_wh[:, 0] * area2_wh[:, 1]
-    union = (area1 + area2 - intersection).clamp(min=1e-8)
-    iou = intersection / union
-    enclosing_left_top = torch.minimum(boxes1[:, :2], boxes2[:, :2])
-    enclosing_right_bottom = torch.maximum(boxes1[:, 2:], boxes2[:, 2:])
-    enclosing_wh = (enclosing_right_bottom - enclosing_left_top).clamp(min=0.0)
-    enclosing = (enclosing_wh[:, 0] * enclosing_wh[:, 1]).clamp(min=1e-8)
-    giou = iou - (enclosing - union) / enclosing
-    return (1.0 - giou).mean()
-
-
-def compute_eagle_pbd_grounding_losses(
-    extractor: "EagleFeatureExtractor",
-    pbd_logits: torch.Tensor,
-    target_ids: torch.Tensor,
-    gt_boxes: torch.Tensor,
-    temperature: float = 1.0,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-    """Supervise the exact six-position PBD path and return its soft legal boxes."""
-    if target_ids.shape != pbd_logits.shape[:2]:
-        raise ValueError(
-            f"PBD target shape {tuple(target_ids.shape)} does not match logits {tuple(pbd_logits.shape)}"
-        )
-    if gt_boxes.shape != (int(pbd_logits.shape[0]), 4):
-        raise ValueError(f"Expected PBD GT boxes [B,4], got {tuple(gt_boxes.shape)}")
-    if int(pbd_logits.shape[0]) == 0:
-        anchor = pbd_logits.sum() * 0.0
-        return {
-            "pbd_frame_loss": anchor,
-            "pbd_coord_loss": anchor,
-            "pbd_l1_loss": anchor,
-            "pbd_giou_loss": anchor,
-            "pbd_order_loss": anchor,
-        }, gt_boxes.to(device=pbd_logits.device, dtype=pbd_logits.dtype).reshape(0, 4)
-    base = get_eagle_base_model(extractor.eagle_model)
-    box_start = int(base.token_ids["box_start_token_id"])
-    box_end = int(base.token_ids["box_end_token_id"])
-    if not bool(target_ids[:, 0].eq(box_start).all().item()):
-        raise RuntimeError("PBD target position 0 is not LocateAnything's box-start token.")
-    if not bool(target_ids[:, 5].eq(box_end).all().item()):
-        raise RuntimeError("PBD target position 5 is not LocateAnything's box-end token.")
-    frame_loss = 0.5 * (
-        F.cross_entropy(pbd_logits[:, 0, :], target_ids[:, 0])
-        + F.cross_entropy(pbd_logits[:, 5, :], target_ids[:, 5])
-    )
-    coord_loss = F.cross_entropy(
-        pbd_logits[:, 1:5, :].reshape(-1, pbd_logits.shape[-1]),
-        target_ids[:, 1:5].reshape(-1),
-    )
-    raw_boxes, legal_boxes = extractor.decode_pbd_soft_boxes(
-        pbd_logits,
-        temperature=temperature,
-    )
-    gt_boxes = gt_boxes.to(device=legal_boxes.device, dtype=legal_boxes.dtype).clamp(0.0, 1.0)
-    l1_loss = F.smooth_l1_loss(raw_boxes, gt_boxes)
-    giou_loss = _aligned_generalized_box_iou_loss(legal_boxes, gt_boxes)
-    x1, y1, x2, y2 = raw_boxes.unbind(dim=-1)
-    order_loss = (
-        F.relu(x1 - x2 + 0.01)
-        + F.relu(y1 - y2 + 0.01)
-    ).mean()
-    return {
-        "pbd_frame_loss": frame_loss,
-        "pbd_coord_loss": coord_loss,
-        "pbd_l1_loss": l1_loss,
-        "pbd_giou_loss": giou_loss,
-        "pbd_order_loss": order_loss,
-    }, legal_boxes
-
-
 class EagleFeatureExtractor(nn.Module):
     """Extract dense visual features and pooled text features from LocateAnything-3B.
 
@@ -1069,7 +897,46 @@ class EagleFeatureExtractor(nn.Module):
 
         if hasattr(vision_model, "patch_embed") and hasattr(vision_model, "encoder"):
             hidden_states = vision_model.patch_embed(pixel_values, image_grid_hws)
-            hidden_states = vision_model.encoder(hidden_states, image_grid_hws)
+            encoder = vision_model.encoder
+            use_checkpointing = bool(
+                getattr(vision_model, "_qwenpose_gradient_checkpointing", False)
+                and vision_model.training
+                and torch.is_grad_enabled()
+                and hasattr(encoder, "blocks")
+                and hasattr(encoder, "rope_2d")
+                and hasattr(encoder, "final_layernorm")
+            )
+            if use_checkpointing:
+                rope_freqs_cis = encoder.rope_2d.get_freqs_cis(
+                    grid_hws=image_grid_hws
+                )
+                lengths = torch.cat(
+                    (
+                        torch.zeros(
+                            1,
+                            device=hidden_states.device,
+                            dtype=image_grid_hws.dtype,
+                        ),
+                        image_grid_hws[:, 0] * image_grid_hws[:, 1],
+                    )
+                )
+                cu_seqlens = lengths.cumsum(dim=0, dtype=torch.int32)
+                for block in encoder.blocks:
+                    def run_block(states: torch.Tensor, block=block) -> torch.Tensor:
+                        return block(
+                            states,
+                            cu_seqlens,
+                            rope_freqs_cis=rope_freqs_cis,
+                        )
+
+                    hidden_states = torch_checkpoint(
+                        run_block,
+                        hidden_states,
+                        use_reentrant=False,
+                    )
+                hidden_states = encoder.final_layernorm(hidden_states)
+            else:
+                hidden_states = encoder(hidden_states, image_grid_hws)
             offset = 0
             for raw_h, raw_w in grid_rows:
                 raw_h = int(raw_h)
@@ -1206,104 +1073,6 @@ class EagleFeatureExtractor(nn.Module):
         if was_training:
             lm.train()
         return lm_outputs.last_hidden_state
-
-    def forward_pbd_logits(
-        self,
-        eagle_inputs: dict[str, torch.Tensor],
-        n_future_tokens: int = 6,
-        projected_visual_tokens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run LocateAnything's first differentiable MTP/PBD decoding step."""
-        if int(n_future_tokens) != 6:
-            raise ValueError("LocateAnything box PBD requires exactly six future tokens.")
-        base, input_ids, attention_mask, pixel_values, image_grid_hws = self._prepare_locate_inputs(
-            eagle_inputs
-        )
-        if input_ids is None:
-            raise ValueError("Differentiable Locate PBD requires multimodal input_ids.")
-        if int(input_ids.shape[0]) != 1:
-            raise ValueError("Differentiable Locate PBD currently requires one sample per input dict.")
-        if eagle_generation_is_pruned(self.eagle_model):
-            raise RuntimeError("Differentiable Locate PBD requires the unpruned lm_head.")
-        expected_image_tokens = int(input_ids.eq(int(base.image_token_index)).sum().item())
-        if (
-            projected_visual_tokens is None
-            or int(projected_visual_tokens.reshape(-1, projected_visual_tokens.shape[-1]).shape[0])
-            != expected_image_tokens
-        ):
-            _, _, projected_visual_tokens = self.run_vision_tokens(pixel_values, image_grid_hws)
-        mask_token_id = int(base.token_ids["default_mask_token_id"])
-        mask_tokens = torch.full(
-            (1, n_future_tokens - 1),
-            mask_token_id,
-            device=input_ids.device,
-            dtype=input_ids.dtype,
-        )
-        mtp_input_ids = torch.cat(
-            [input_ids, input_ids[:, -1:], mask_tokens],
-            dim=1,
-        )
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        mtp_attention_mask = torch.cat(
-            [
-                attention_mask,
-                torch.ones(
-                    (1, n_future_tokens),
-                    device=attention_mask.device,
-                    dtype=attention_mask.dtype,
-                ),
-            ],
-            dim=1,
-        )
-        position_ids = torch.arange(
-            mtp_input_ids.shape[1],
-            device=mtp_input_ids.device,
-            dtype=torch.long,
-        ).unsqueeze(0)
-        position_ids[:, -n_future_tokens:] -= 1
-        hidden = self.run_language_hidden(
-            mtp_input_ids,
-            mtp_attention_mask,
-            projected_visual_tokens,
-            position_ids=position_ids,
-        )
-        return base.language_model.lm_head(hidden[:, -n_future_tokens:, :]).float()
-
-    def decode_pbd_soft_boxes(
-        self,
-        pbd_logits: torch.Tensor,
-        temperature: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode PBD coordinate logits into raw and legal differentiable xyxy boxes."""
-        if pbd_logits.ndim != 3 or int(pbd_logits.shape[1]) != 6:
-            raise ValueError(f"Expected [B,6,V] PBD logits, got {tuple(pbd_logits.shape)}")
-        if float(temperature) <= 0.0:
-            raise ValueError("PBD temperature must be positive.")
-        base = get_eagle_base_model(self.eagle_model)
-        coord_start = int(base.token_ids["coord_start_token_id"])
-        coord_end = int(base.token_ids["coord_end_token_id"])
-        coord_logits = pbd_logits[:, 1:5, coord_start : coord_end + 1]
-        coord_probs = torch.softmax(coord_logits / float(temperature), dim=-1)
-        coord_values = torch.linspace(
-            0.0,
-            1.0,
-            coord_end - coord_start + 1,
-            device=coord_probs.device,
-            dtype=coord_probs.dtype,
-        )
-        raw_boxes = (coord_probs * coord_values.view(1, 1, -1)).sum(dim=-1)
-        x1, y1, x2, y2 = raw_boxes.unbind(dim=-1)
-        legal_boxes = torch.stack(
-            [
-                torch.minimum(x1, x2),
-                torch.minimum(y1, y2),
-                torch.maximum(x1, x2),
-                torch.maximum(y1, y2),
-            ],
-            dim=-1,
-        ).clamp(0.0, 1.0)
-        return raw_boxes, legal_boxes
 
     def run_language_prefill(
         self,

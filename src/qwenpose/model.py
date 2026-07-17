@@ -488,12 +488,115 @@ class JointDeformableKeypointAttention(nn.Module):
                 return
 
 
+class MultiScaleDeformableEncoderLayer(nn.Module):
+    """Learn cross-scale context on native P2/P3/P4 grids.
+
+    Each level keeps its own native grid. Tokens at every valid grid location
+    use deformable sampling over all feature levels, followed by a local FFN.
+    This avoids fixed-size resizing or top-down FPN fusion while making the
+    multi-scale memory itself trainable before the pose decoder consumes it.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_levels: int,
+        num_points: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        c = int(hidden_dim)
+        self.attention = JointDeformableKeypointAttention(
+            c,
+            feature_dim=c,
+            num_scales=int(num_levels),
+            num_points=int(num_points),
+            offset_scale=0.20,
+            min_radius_cells=1.0,
+            scale_prior_strength=0.0,
+        )
+        # Pose decoder residuals start at zero for migration stability, but the
+        # newly introduced feature encoder must learn cross-scale routing from
+        # optimizer step one. Give its final context projection a small nonzero
+        # initialization so offsets, weights and P4 all receive immediate grads.
+        for child in reversed(list(self.attention.context_proj.modules())):
+            if isinstance(child, nn.Linear):
+                nn.init.xavier_uniform_(child.weight, gain=0.1)
+                if child.bias is not None:
+                    nn.init.zeros_(child.bias)
+                break
+        self.norm1 = nn.LayerNorm(c)
+        self.norm2 = nn.LayerNorm(c)
+        self.ffn = nn.Sequential(
+            nn.Linear(c, c * 4),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(c * 4, c),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    @staticmethod
+    def _reference_grid(
+        batch_size: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        y, x = torch.meshgrid(
+            (torch.arange(height, device=device, dtype=torch.float32) + 0.5)
+            / max(float(height), 1.0),
+            (torch.arange(width, device=device, dtype=torch.float32) + 0.5)
+            / max(float(width), 1.0),
+            indexing="ij",
+        )
+        return torch.stack([x, y], dim=-1).reshape(1, height * width, 1, 2).expand(
+            batch_size, -1, -1, -1
+        ).to(dtype=dtype)
+
+    def forward(
+        self,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        valid_masks: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        outputs: list[torch.Tensor] = []
+        for level_idx, feature in enumerate(feature_maps):
+            b, c, h, w = feature.shape
+            tokens = feature.flatten(2).transpose(1, 2)
+            normalized = self.norm1(tokens)
+            reference = self._reference_grid(b, h, w, feature.device, feature.dtype)
+            level_shape = spatial_shapes[level_idx]
+            person_scale = torch.stack(
+                [
+                    2.0 / level_shape[:, 1].clamp(min=1).to(dtype=feature.dtype),
+                    2.0 / level_shape[:, 0].clamp(min=1).to(dtype=feature.dtype),
+                ],
+                dim=-1,
+            )[:, None].expand(-1, h * w, -1)
+            updated = self.attention(
+                normalized[:, :, None, :],
+                reference,
+                person_scale,
+                feature_maps,
+                spatial_shapes,
+            )[:, :, 0]
+            tokens = tokens + self.dropout(updated - normalized)
+            tokens = tokens + self.dropout(self.ffn(self.norm2(tokens)))
+            valid = valid_masks[level_idx].flatten(1)[..., None].to(dtype=tokens.dtype)
+            outputs.append(
+                (tokens * valid).transpose(1, 2).reshape(b, c, h, w)
+            )
+        return outputs
+
+
 class GroupedPoseDecoderLayer(nn.Module):
-    """GroupPose-style person/joint decoder layer with ROI cross-attention.
+    """GroupPose person/joint interaction without ROI memory.
 
     Tokens are grouped as one explicit instance token followed by active joint
-    tokens. The layer alternates within-person interaction, same-role
-    cross-person interaction, per-person ROI cross-attention and an FFN.
+    tokens. The layer performs within-person interaction and same-role
+    cross-person interaction. Whole-image P2/P3/P4 deformable attention is
+    applied immediately after this layer by the pose decoder.
     """
 
     def __init__(
@@ -513,6 +616,9 @@ class GroupedPoseDecoderLayer(nn.Module):
         self.same_role_attention = nn.MultiheadAttention(
             c, self.num_heads, dropout=float(dropout), batch_first=True
         )
+        # Legacy-only ROI cross attention. The DETRPose path never supplies ROI
+        # memory, but keeping this branch preserves explicit old-graph tests and
+        # allows old state dictionaries to be inspected without silent remaps.
         self.cross_norm = nn.LayerNorm(c)
         self.roi_cross_attention = nn.MultiheadAttention(
             c, self.num_heads, dropout=float(dropout), batch_first=True
@@ -536,10 +642,22 @@ class GroupedPoseDecoderLayer(nn.Module):
         tokens: torch.Tensor,
         role_position: torch.Tensor,
         token_valid: torch.Tensor,
-        roi_memory: torch.Tensor,
-        same_role_attention_mask: torch.Tensor | None,
+        roi_memory_or_attention_mask: torch.Tensor | None = None,
+        same_role_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, num_people, num_roles, c = tokens.shape
+        roi_memory: torch.Tensor | None = None
+        candidate = roi_memory_or_attention_mask
+        if candidate is not None:
+            is_attention_mask = (
+                candidate.ndim in {2, 3}
+                and int(candidate.shape[-2]) == num_people
+                and int(candidate.shape[-1]) == num_people
+            )
+            if same_role_attention_mask is None and is_attention_mask:
+                same_role_attention_mask = candidate
+            elif not is_attention_mask:
+                roi_memory = candidate
         if num_people == 0:
             return tokens
 
@@ -583,17 +701,18 @@ class GroupedPoseDecoderLayer(nn.Module):
         )
         tokens = tokens + self.residual_dropout(same_update) * valid_f
 
-        normalized = self.cross_norm(tokens)
-        cross_query = (normalized + role_position).reshape(
-            b * num_people, num_roles, c
-        )
-        cross_update = self.roi_cross_attention(
-            cross_query,
-            roi_memory,
-            roi_memory,
-            need_weights=False,
-        )[0].view(b, num_people, num_roles, c)
-        tokens = tokens + self.residual_dropout(cross_update) * valid_f
+        if roi_memory is not None:
+            normalized = self.cross_norm(tokens)
+            cross_query = (normalized + role_position).reshape(
+                b * num_people, num_roles, c
+            )
+            cross_update = self.roi_cross_attention(
+                cross_query,
+                roi_memory,
+                roi_memory,
+                need_weights=False,
+            )[0].view(b, num_people, num_roles, c)
+            tokens = tokens + self.residual_dropout(cross_update) * valid_f
 
         ffn_update = self.ffn(self.ffn_norm(tokens))
         return (tokens + self.residual_dropout(ffn_update) * valid_f) * valid_f
@@ -824,21 +943,21 @@ class QwenPoseConfig:
     external_dim: int = 2560
     high_res_external_dim: int = 0
     pose_decoder_layers: int = 3
-    refinement_steps: int = 3
+    refinement_steps: int = 1
     decoder_heads: int = 8
     dropout: float = 0.0
     box_condition_scale: float = 1.25
-    pose_roi_size: int = 16
+    pose_roi_size: int = 16  # Deprecated; DETRPose path never builds ROI memory.
     use_refinement: bool = True
     pose_feature_channels: int = 256
     use_native_spatial_features: bool = True
-    human_decoder_layers: int = 2
+    human_decoder_layers: int = 2  # Deprecated compatibility field.
     deformable_points: int = 4
     deformable_min_radius_cells: float = 2.0
     deformable_scale_prior_strength: float = 0.5
     deformable_scale_prior_center_cells: float = 6.0
     deformable_scale_prior_temperature: float = 1.5
-    enable_box_denoising: bool = True
+    enable_box_denoising: bool = False
     enable_keypoint_denoising: bool = True
     ref_text_scale: float = 0.2
     enable_ref_visual_modulation: bool = True
@@ -848,8 +967,12 @@ class QwenPoseConfig:
     # In the unified detector/grounder path, learned person queries replace
     # externally generated coordinate strings.  One forward pass predicts all
     # people; RefHuman then selects one of those people with ``ref_match_head``.
-    use_global_person_queries: bool = False
-    num_person_queries: int = 80
+    use_global_person_queries: bool = True
+    num_person_queries: int = 60
+    num_ref_queries: int = 4
+    multiscale_encoder_layers: int = 2
+    multiscale_encoder_points: int = 4
+    use_detrpose_architecture: bool = True
     # The default starts from a schema-aligned anatomical reference and predicts
     # an instance-conditioned residual before iterative decoder refinement.
     pose_coordinate_init: str = "anatomical_dynamic"
@@ -883,13 +1006,27 @@ class QwenPoseModel(nn.Module):
                 "legacy_checkpoint_compat is not supported by the Locate-only pose feature. "
                 "Train a new Stage1 checkpoint for this architecture."
             )
-        self.num_feature_levels = 2 if int(config.high_res_external_dim) > 0 else 1
+        self.base_feature_levels = 2 if int(config.high_res_external_dim) > 0 else 1
+        self.num_feature_levels = (
+            self.base_feature_levels + 1
+            if bool(config.use_detrpose_architecture)
+            else self.base_feature_levels
+        )
         self.high_res_feature_proj = (
             nn.Conv2d(int(config.high_res_external_dim), pose_feature_dim, 1)
-            if self.num_feature_levels == 2
+            if self.base_feature_levels == 2
             else None
         )
         self.external_feature_proj = nn.Conv2d(config.external_dim, pose_feature_dim, 1)
+        self.p4_feature_proj = (
+            nn.Sequential(
+                nn.Conv2d(pose_feature_dim, pose_feature_dim, 3, stride=2, padding=1),
+                nn.GroupNorm(_group_count(pose_feature_dim), pose_feature_dim),
+                nn.GELU(),
+            )
+            if bool(config.use_detrpose_architecture)
+            else None
+        )
         self.feature_level_embeddings = nn.Parameter(
             torch.zeros(self.num_feature_levels, pose_feature_dim)
         )
@@ -930,6 +1067,58 @@ class QwenPoseModel(nn.Module):
             nn.Linear(c, c),
         )
         self.human_query_norm = nn.LayerNorm(c)
+        self.multiscale_encoder = nn.ModuleList(
+            [
+                MultiScaleDeformableEncoderLayer(
+                    pose_feature_dim,
+                    num_levels=self.num_feature_levels,
+                    num_points=config.multiscale_encoder_points,
+                    dropout=float(config.dropout),
+                )
+                for _ in range(max(int(config.multiscale_encoder_layers), 1))
+            ]
+        )
+        self.proposal_objectness_heads = nn.ModuleList(
+            [nn.Conv2d(pose_feature_dim, 1, 1) for _ in range(self.num_feature_levels)]
+        )
+        self.proposal_offset_heads = nn.ModuleList(
+            [nn.Conv2d(pose_feature_dim, 2, 1) for _ in range(self.num_feature_levels)]
+        )
+        self.proposal_scale_heads = nn.ModuleList(
+            [nn.Conv2d(pose_feature_dim, 2, 1) for _ in range(self.num_feature_levels)]
+        )
+        self.proposal_token_proj = nn.Sequential(
+            nn.LayerNorm(pose_feature_dim),
+            nn.Linear(pose_feature_dim, c),
+            nn.GELU(),
+            nn.Linear(c, c),
+        )
+        self.proposal_text_proj = nn.Sequential(
+            nn.LayerNorm(c),
+            nn.Linear(c, pose_feature_dim),
+        )
+        self.proposal_source_embed = nn.Embedding(3, c)
+        nn.init.normal_(self.proposal_source_embed.weight, mean=0.0, std=0.02)
+        self.external_box_token_proj = nn.Sequential(
+            nn.LayerNorm(pose_feature_dim),
+            nn.Linear(pose_feature_dim, c),
+            nn.GELU(),
+            nn.Linear(c, c),
+        )
+        # Locate/Stage1-proxy boxes are spatial priors, not immutable outputs.
+        # A zero-initialized residual head starts by copying the input box and
+        # learns to correct realistic grounding noise toward the clean human GT.
+        self.external_box_refine_head = MLP(c, c, 4, depth=3)
+        self._zero_init_last_linear(self.external_box_refine_head)
+        for objectness_head in self.proposal_objectness_heads:
+            nn.init.zeros_(objectness_head.weight)
+            nn.init.zeros_(objectness_head.bias)
+        for offset_head in self.proposal_offset_heads:
+            nn.init.zeros_(offset_head.weight)
+            nn.init.zeros_(offset_head.bias)
+        for scale_head in self.proposal_scale_heads:
+            nn.init.zeros_(scale_head.weight)
+            nn.init.constant_(scale_head.bias, -3.0)
         self.person_query_embed: nn.Embedding | None = None
         self.person_query_reference_logits: nn.Parameter | None = None
         if config.use_global_person_queries:
@@ -1114,12 +1303,30 @@ class QwenPoseModel(nn.Module):
         self.coarse_xy_head = MLP(c, c, 2, depth=3)
         self.pose_xy_head = MLP(c, c, 2, depth=3)
         self.pose_vis_head = None
-        self.pose_confidence_head = MLP(c, c, 1, depth=3)
-        self.person_confidence_head = (
-            MLP(c, c, 1, depth=3)
-            if (config.enable_person_confidence_head or config.person_confidence_rescue)
-            else None
+        # Keep joint presence/visibility separate from the instance score used
+        # by COCO keypoint AP.  The third keypoint channel is useful for drawing
+        # and downstream consumers, but it must never gate the pose AP score.
+        self.keypoint_visibility_head = MLP(c, c, 1, depth=3)
+
+        # The two public AP logits are direct, quality-aware person scores.  In
+        # particular, neither is multiplied by proposal objectness at inference.
+        # Pose-LQE adds local evidence sampled at the final joint coordinates to
+        # an instance-token base score; the box head similarly reads a small ROI
+        # from the independently regressed box.
+        self.pose_score_base_head = MLP(c, c, 1, depth=3)
+        self.pose_lqe_feature_proj = nn.Sequential(
+            nn.LayerNorm(pose_feature_dim * self.num_feature_levels),
+            nn.Linear(pose_feature_dim * self.num_feature_levels, c),
+            nn.GELU(),
         )
+        self.pose_lqe_joint_head = MLP(c * 2, c, 1, depth=2)
+        self.pose_lqe_residual_head = MLP(c + 3, c, 1, depth=3)
+        self.box_lqe_feature_proj = nn.Sequential(
+            nn.LayerNorm(pose_feature_dim),
+            nn.Linear(pose_feature_dim, c),
+            nn.GELU(),
+        )
+        self.box_score_head = MLP(c * 3, c, 1, depth=3)
         if config.use_refinement:
             self.local_proj = nn.Conv2d(pose_feature_dim, c, 1)
             joint_context_layer = nn.TransformerEncoderLayer(
@@ -1158,13 +1365,45 @@ class QwenPoseModel(nn.Module):
             self.refine_step_scales = None
         self._zero_init_last_linear(self.coarse_xy_head)
         self._zero_init_last_linear(self.pose_xy_head)
-        # v now means localization confidence, not physical visibility. A zero
-        # final layer gives an unbiased 0.5 probability before the new target is
-        # learned, while allowing the migrated hidden layers to be reused.
-        if self.pose_confidence_head is not None:
-            self._zero_init_last_linear(self.pose_confidence_head)
-        if self.person_confidence_head is not None:
-            self._zero_init_last_linear(self.person_confidence_head)
+        self._zero_init_last_linear(self.keypoint_visibility_head)
+        self._zero_init_last_linear(self.pose_score_base_head)
+        self._zero_init_last_linear(self.pose_lqe_residual_head)
+        self._zero_init_last_linear(self.box_score_head)
+        foreground_prior_bias = -math.log((1.0 - 0.01) / 0.01)
+        for score_head in (self.pose_score_base_head, self.box_score_head):
+            final_layer = score_head.net[-1]
+            if not isinstance(final_layer, nn.Linear):
+                raise TypeError("Direct AP score heads must end with Linear layers.")
+            if final_layer.bias is not None:
+                nn.init.constant_(final_layer.bias, foreground_prior_bias)
+
+        if bool(config.use_detrpose_architecture):
+            # Retain legacy modules only for old state-dict compatibility. They
+            # are outside the new graph and must not enter optimizer/DDP buckets.
+            legacy_modules: list[nn.Module] = [
+                self.human_query_norm,
+                self.human_decoder_layers,
+                self.human_deformable_attention,
+                self.human_box_heads,
+                self.human_objectness_heads,
+                self.roi_memory_proj,
+                self.roi_memory_norm,
+                self.roi_pool_proj,
+                self.deformable_joint_attention,
+                self.coarse_xy_head,
+                self.pose_xy_head,
+                self.ref_visual_modulators,
+            ]
+            for decoder_layer in self.pose_group_decoder_layers:
+                legacy_modules.extend(
+                    [decoder_layer.cross_norm, decoder_layer.roi_cross_attention]
+                )
+            for module in legacy_modules:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+            self.ref_visual_gates.requires_grad_(False)
+            if self.person_query_reference_logits is not None:
+                self.person_query_reference_logits.requires_grad_(False)
 
     def build_locate_pose_features(
         self,
@@ -1176,7 +1415,7 @@ class QwenPoseModel(nn.Module):
         int,
         int,
     ]:
-        """Project true P2/P3 native grids independently before dynamic padding."""
+        """Build trainable native-grid P2/P3/P4 memory without resizing or ROI."""
 
         def as_spatial_batch(value: torch.Tensor | SpatialFeatureBatch) -> SpatialFeatureBatch:
             if isinstance(value, SpatialFeatureBatch):
@@ -1190,7 +1429,7 @@ class QwenPoseModel(nn.Module):
             return SpatialFeatureBatch(value, shapes)
 
         if isinstance(external_feature_map, MultiScaleSpatialFeatureBatch):
-            if self.num_feature_levels != 2 or self.high_res_feature_proj is None:
+            if self.base_feature_levels != 2 or self.high_res_feature_proj is None:
                 raise ValueError(
                     "Received Locate P2/P3 features but PoseHead was not configured "
                     "with high_res_external_dim."
@@ -1199,17 +1438,13 @@ class QwenPoseModel(nn.Module):
                 raise ValueError("Locate multi-scale input must contain exactly P2 and P3.")
             raw_levels = list(external_feature_map.levels)
             projections = [self.high_res_feature_proj, self.external_feature_proj]
-            roi_level_idx = 1
-            local_level_idx = 0
         else:
-            if self.num_feature_levels != 1:
+            if self.base_feature_levels != 1:
                 raise ValueError(
                     "PoseHead expects true Locate P2/P3 features but received one feature level."
                 )
             raw_levels = [as_spatial_batch(external_feature_map)]
             projections = [self.external_feature_proj]
-            roi_level_idx = 0
-            local_level_idx = 0
 
         projected_levels: list[torch.Tensor] = []
         spatial_shapes: list[torch.Tensor] = []
@@ -1233,13 +1468,959 @@ class QwenPoseModel(nn.Module):
             projected_levels.append(projected_batch.tensor)
             spatial_shapes.append(projected_batch.spatial_shapes)
             valid_masks.append(projected_batch.valid_mask())
-        return (
-            projected_levels,
+        if self.p4_feature_proj is not None:
+            p3_batch = SpatialFeatureBatch(projected_levels[-1], spatial_shapes[-1])
+            p4_maps: list[torch.Tensor] = []
+            for batch_idx, (height, width) in enumerate(
+                p3_batch.spatial_shapes.detach().cpu().tolist()
+            ):
+                native = p3_batch.tensor[
+                    batch_idx : batch_idx + 1, :, : int(height), : int(width)
+                ]
+                p4 = self.p4_feature_proj(native).squeeze(0)
+                p4 = p4 + self.feature_level_embeddings[-1].to(
+                    device=p4.device, dtype=p4.dtype
+                ).view(-1, 1, 1)
+                p4_maps.append(p4)
+            p4_batch = SpatialFeatureBatch.from_maps(p4_maps)
+            projected_levels.append(p4_batch.tensor)
+            spatial_shapes.append(p4_batch.spatial_shapes)
+            valid_masks.append(p4_batch.valid_mask())
+
+        if len(projected_levels) != self.num_feature_levels:
+            raise RuntimeError(
+                f"Expected {self.num_feature_levels} pose feature levels, got {len(projected_levels)}."
+            )
+        for encoder_layer in self.multiscale_encoder:
+            projected_levels = encoder_layer(projected_levels, spatial_shapes, valid_masks)
+        return projected_levels, spatial_shapes, valid_masks, min(1, len(projected_levels) - 1), 0
+
+    @staticmethod
+    def _sample_feature_at_points(
+        feature_map: torch.Tensor,
+        points: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+    ) -> torch.Tensor:
+        b, channels, height, width = feature_map.shape
+        grid = _padded_grid_from_normalized_points(
+            points.to(device=feature_map.device, dtype=feature_map.dtype),
             spatial_shapes,
-            valid_masks,
-            roi_level_idx,
-            local_level_idx,
+            height,
+            width,
+        ).view(b, -1, 1, 2)
+        sampled = F.grid_sample(feature_map, grid, align_corners=False)
+        return sampled.squeeze(-1).transpose(1, 2)
+
+    def _build_internal_pose_proposals(
+        self,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        valid_masks: list[torch.Tensor],
+        text_embed: torch.Tensor,
+        task_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select fixed-count person groups from dense P2/P3/P4 predictions."""
+        candidate_tokens: list[torch.Tensor] = []
+        candidate_scores: list[torch.Tensor] = []
+        candidate_text_scores: list[torch.Tensor] = []
+        candidate_centers: list[torch.Tensor] = []
+        candidate_scales: list[torch.Tensor] = []
+        text_feature = F.normalize(
+            self.proposal_text_proj(text_embed).float(), dim=-1
         )
+        for level_idx, feature in enumerate(feature_maps):
+            b, channels, height, width = feature.shape
+            valid = valid_masks[level_idx]
+            objectness = self.proposal_objectness_heads[level_idx](feature).flatten(1)
+            offsets = torch.tanh(
+                self.proposal_offset_heads[level_idx](feature).float()
+            ).permute(0, 2, 3, 1).reshape(b, height * width, 2)
+            scales = self.proposal_scale_heads[level_idx](feature).float().permute(
+                0, 2, 3, 1
+            ).reshape(b, height * width, 2)
+            y, x = torch.meshgrid(
+                torch.arange(height, device=feature.device, dtype=torch.float32),
+                torch.arange(width, device=feature.device, dtype=torch.float32),
+                indexing="ij",
+            )
+            base = torch.stack([x + 0.5, y + 0.5], dim=-1).reshape(1, -1, 2)
+            native_wh = torch.stack(
+                [spatial_shapes[level_idx][:, 1], spatial_shapes[level_idx][:, 0]],
+                dim=-1,
+            ).to(device=feature.device, dtype=torch.float32)[:, None]
+            centers = (base + 0.5 * offsets) / native_wh.clamp(min=1.0)
+            minimum_scale = (2.0 / native_wh.clamp(min=1.0)).clamp(0.02, 0.5)
+            # A hard maximum would completely block scale-head gradients on
+            # coarse levels. Interpolate continuously from the native-grid
+            # minimum to 0.95 so P2/P3/P4 all learn person extent immediately.
+            person_scale = minimum_scale + (0.95 - minimum_scale) * scales.sigmoid()
+            flat_tokens = feature.flatten(2).transpose(1, 2)
+            normalized_tokens = F.normalize(flat_tokens.float(), dim=-1)
+            text_scores = torch.einsum(
+                "bnc,bc->bn", normalized_tokens, text_feature
+            )
+            # Conv heads start at zero. Break score ties by native normalized
+            # coordinates rather than padded flat indices so batching cannot
+            # change proposal order for an otherwise identical image.
+            tie_break = -1e-6 * (
+                centers[..., 1] * 2.0
+                + centers[..., 0]
+                + float(level_idx) * 4.0
+            )
+            objectness = objectness + tie_break.to(dtype=objectness.dtype)
+            text_scores = text_scores + tie_break
+            valid_flat = valid.flatten(1)
+            invalid_value = torch.finfo(objectness.dtype).min
+            candidate_scores.append(objectness.masked_fill(~valid_flat, invalid_value))
+            candidate_text_scores.append(
+                text_scores.to(dtype=objectness.dtype).masked_fill(~valid_flat, invalid_value)
+            )
+            candidate_tokens.append(flat_tokens)
+            candidate_centers.append(centers.to(dtype=feature.dtype))
+            candidate_scales.append(person_scale.to(dtype=feature.dtype))
+
+        all_tokens = torch.cat(candidate_tokens, dim=1)
+        all_scores = torch.cat(candidate_scores, dim=1)
+        all_text_scores = torch.cat(candidate_text_scores, dim=1)
+        all_centers = torch.cat(candidate_centers, dim=1)
+        all_scales = torch.cat(candidate_scales, dim=1)
+        b = int(all_tokens.shape[0])
+        query_count = max(int(self.config.num_person_queries), 1)
+        ref_count = min(max(int(self.config.num_ref_queries), 0), query_count)
+        level_lengths = [int(tokens.shape[1]) for tokens in candidate_tokens]
+        level_offsets: list[int] = []
+        running_offset = 0
+        for level_length in level_lengths:
+            level_offsets.append(running_offset)
+            running_offset += level_length
+
+        def allocate_level_counts(total: int) -> list[int]:
+            """Reserve candidates across P2/P3/P4 instead of letting P2 dominate."""
+            total = max(int(total), 0)
+            level_count = len(level_lengths)
+            if level_count == 1:
+                return [total]
+            if level_count == 2:
+                weights = [0.6, 0.4]
+            else:
+                weights = [0.5, 0.3, 0.2] + [0.0] * (level_count - 3)
+            weight_sum = max(sum(weights), 1e-8)
+            raw = [total * weight / weight_sum for weight in weights]
+            counts = [int(value) for value in raw]
+            remainder = total - sum(counts)
+            order = sorted(
+                range(level_count),
+                key=lambda idx: (raw[idx] - counts[idx], -idx),
+                reverse=True,
+            )
+            for idx in order[:remainder]:
+                counts[idx] += 1
+            if total >= level_count:
+                for idx in range(level_count):
+                    if counts[idx] > 0:
+                        continue
+                    donor = max(range(level_count), key=lambda item: counts[item])
+                    if counts[donor] > 1:
+                        counts[donor] -= 1
+                        counts[idx] += 1
+            return counts
+
+        def padded_topk(values: torch.Tensor, count: int) -> torch.Tensor:
+            count = max(int(count), 0)
+            if count == 0:
+                return torch.zeros(0, device=values.device, dtype=torch.long)
+            invalid_floor = torch.finfo(values.dtype).min * 0.5
+            valid_indices = torch.nonzero(
+                torch.isfinite(values) & values.gt(invalid_floor), as_tuple=False
+            ).flatten()
+            available = int(valid_indices.numel())
+            if available <= 0:
+                return torch.zeros(count, device=values.device, dtype=torch.long)
+            local = torch.topk(
+                values[valid_indices], k=min(count, available), dim=0
+            ).indices
+            selected = valid_indices[local]
+            if int(selected.numel()) < count:
+                repeat = selected[
+                    torch.arange(
+                        count - int(selected.numel()), device=values.device
+                    ).remainder(max(int(selected.numel()), 1))
+                ]
+                selected = torch.cat([selected, repeat], dim=0)
+            return selected
+
+        def levelwise_topk(values: torch.Tensor, count: int) -> torch.Tensor:
+            selected: list[torch.Tensor] = []
+            for level_idx, level_count in enumerate(allocate_level_counts(count)):
+                if level_count <= 0:
+                    continue
+                start = level_offsets[level_idx]
+                end = start + level_lengths[level_idx]
+                selected.append(padded_topk(values[start:end], level_count) + start)
+            if not selected:
+                return torch.zeros(0, device=values.device, dtype=torch.long)
+            return torch.cat(selected, dim=0)
+
+        selected_indices: list[torch.Tensor] = []
+        selected_ref_masks: list[torch.Tensor] = []
+        for batch_idx in range(b):
+            is_ref = int(task_ids[batch_idx].detach().item()) == 1 and ref_count > 0
+            if is_ref:
+                text_idx = levelwise_topk(all_text_scores[batch_idx], ref_count)
+                generic_count = query_count - ref_count
+                generic_idx = levelwise_topk(all_scores[batch_idx], generic_count)
+                selected_indices.append(torch.cat([text_idx, generic_idx], dim=0))
+                selected_ref_masks.append(
+                    torch.cat(
+                        [
+                            torch.ones(ref_count, device=feature_maps[0].device, dtype=torch.bool),
+                            torch.zeros(generic_count, device=feature_maps[0].device, dtype=torch.bool),
+                        ],
+                        dim=0,
+                    )
+                )
+            else:
+                selected_indices.append(
+                    levelwise_topk(all_scores[batch_idx], query_count)
+                )
+                selected_ref_masks.append(
+                    torch.zeros(query_count, device=feature_maps[0].device, dtype=torch.bool)
+                )
+        indices = torch.stack(selected_indices, dim=0)
+        ref_query_mask = torch.stack(selected_ref_masks, dim=0)
+        gather_c = indices[..., None].expand(-1, -1, all_tokens.shape[-1])
+        gather_xy = indices[..., None].expand(-1, -1, 2)
+        tokens = torch.gather(all_tokens, 1, gather_c)
+        centers = torch.gather(all_centers, 1, gather_xy).clamp(0.0, 1.0)
+        scales = torch.gather(all_scales, 1, gather_xy).clamp(0.02, 0.95)
+        scores = torch.gather(all_scores, 1, indices)
+        selected_text_scores = torch.gather(all_text_scores, 1, indices)
+        boxes = torch.cat([centers - 0.5 * scales, centers + 0.5 * scales], dim=-1).clamp(
+            0.0, 1.0
+        )
+        tokens = self.proposal_token_proj(tokens.to(dtype=next(self.proposal_token_proj.parameters()).dtype))
+        tokens = tokens + self.proposal_source_embed.weight[0].to(
+            device=tokens.device, dtype=tokens.dtype
+        )
+        return boxes, tokens, scores, ref_query_mask, selected_text_scores
+
+    def _merge_external_box_proposals(
+        self,
+        internal_boxes: torch.Tensor,
+        internal_tokens: torch.Tensor,
+        internal_scores: torch.Tensor,
+        internal_ref_mask: torch.Tensor,
+        internal_text_scores: torch.Tensor,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        task_ids: torch.Tensor,
+        external_boxes: torch.Tensor | None,
+        external_mask: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Use Locate boxes as optional query priors, never as visual boundaries."""
+        b, query_count = internal_boxes.shape[:2]
+        device = internal_boxes.device
+        proposal_mask = torch.ones(b, query_count, device=device, dtype=torch.bool)
+        source_ids = torch.zeros(b, query_count, device=device, dtype=torch.long)
+        if external_boxes is None or external_mask is None:
+            return (
+                internal_boxes,
+                internal_tokens,
+                internal_scores,
+                internal_ref_mask,
+                internal_text_scores,
+                source_ids,
+            )
+        external_boxes = external_boxes.to(device=device, dtype=internal_boxes.dtype).clamp(0.0, 1.0)
+        external_mask = external_mask.to(device=device).bool()
+        boxes = internal_boxes.clone()
+        tokens = internal_tokens.clone()
+        scores = internal_scores.clone()
+        ref_mask = internal_ref_mask.clone()
+        text_scores = internal_text_scores.clone()
+        centers_all = (external_boxes[..., :2] + external_boxes[..., 2:]) * 0.5
+        sampled = self._sample_feature_at_points(
+            feature_maps[min(1, len(feature_maps) - 1)],
+            centers_all,
+            spatial_shapes[min(1, len(spatial_shapes) - 1)],
+        )
+        external_tokens = self.external_box_token_proj(
+            sampled.to(dtype=next(self.external_box_token_proj.parameters()).dtype)
+        ) + self.proposal_source_embed.weight[1].to(
+            device=device, dtype=internal_tokens.dtype
+        )
+        for batch_idx in range(b):
+            valid = torch.nonzero(external_mask[batch_idx], as_tuple=False).flatten()
+            max_external = 1 if int(task_ids[batch_idx].detach().item()) == 1 else query_count
+            valid = valid[:max_external]
+            count = min(int(valid.numel()), query_count)
+            if count <= 0:
+                continue
+            boxes[batch_idx, :count] = external_boxes[batch_idx, valid[:count]]
+            tokens[batch_idx, :count] = external_tokens[batch_idx, valid[:count]]
+            scores[batch_idx, :count] = 5.0
+            source_ids[batch_idx, :count] = 1
+            text_scores[batch_idx, :count] = 0.0
+            if int(task_ids[batch_idx].detach().item()) == 1:
+                ref_mask[batch_idx, : max(count, min(int(self.config.num_ref_queries), query_count))] = True
+        return boxes, tokens, scores, ref_mask, text_scores, source_ids
+
+    def _run_detrpose_pose_branch(
+        self,
+        *,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        local_level_idx: int,
+        text_embed: torch.Tensor,
+        schema_ids: torch.Tensor,
+        task_ids: torch.Tensor,
+        proposal_boxes: torch.Tensor,
+        proposal_tokens: torch.Tensor,
+        proposal_mask: torch.Tensor,
+        ref_query_mask: torch.Tensor,
+        initial_keypoints: torch.Tensor | None = None,
+        initial_keypoint_valid: torch.Tensor | None = None,
+        initial_query_mask: torch.Tensor | None = None,
+        dn_labels: torch.Tensor | None = None,
+        dn_group_ids: torch.Tensor | None = None,
+    ) -> dict[str, object]:
+        """Decode pose groups directly against whole-image P2/P3/P4 memory."""
+        feature_map = feature_maps[min(1, len(feature_maps) - 1)]
+        b, num_people = int(proposal_boxes.shape[0]), int(proposal_boxes.shape[1])
+        c = int(self.config.hidden_dim)
+        proposal_mask = proposal_mask.to(device=feature_map.device).bool()
+        # The person box is a spatial prior, not the coordinate system of the
+        # final keypoints.  Stop pose/ref gradients at this boundary so slow box
+        # regression cannot drag the direct image-coordinate pose head.
+        boxes = proposal_boxes.detach().to(
+            device=feature_map.device, dtype=feature_map.dtype
+        ).clamp(0.0, 1.0)
+        box_wh = (boxes[..., 2:] - boxes[..., :2]).clamp(min=0.02)
+        box_center = ((boxes[..., :2] + boxes[..., 2:]) * 0.5).clamp(0.0, 1.0)
+        box_embed = self.box_query_proj(box_fourier_pe(boxes, c))
+        global_visual = _masked_spatial_mean(
+            feature_map, spatial_shapes[min(1, len(spatial_shapes) - 1)]
+        )
+        image_embed = self.human_context_proj(
+            global_visual.to(dtype=next(self.human_context_proj.parameters()).dtype)
+        )
+        text_condition = (
+            float(self.config.ref_text_scale)
+            * ref_query_mask[..., None].to(dtype=text_embed.dtype)
+            * text_embed[:, None, :]
+        )
+        instance = self.instance_query_norm(
+            proposal_tokens.to(dtype=box_embed.dtype)
+            + box_embed
+            + image_embed[:, None, :]
+            + text_condition
+        )
+
+        schema_joint_indices = self.schema_joint_indices[schema_ids]
+        schema_joint_valid = self.schema_joint_valid[schema_ids]
+        active_k = max(int(schema_joint_valid.sum(dim=1).max().item()), 1)
+        schema_joint_indices = schema_joint_indices[:, :active_k]
+        schema_joint_valid = schema_joint_valid[:, :active_k]
+        schema_scatter_map = self._build_schema_scatter_map(
+            schema_joint_indices,
+            schema_joint_valid,
+            union_dim=len(UNION_KEYPOINTS),
+            dtype=feature_map.dtype,
+        )
+        joint_base = self.joint_embed(schema_joint_indices).view(b, 1, active_k, c)
+        task = self.task_embed(task_ids).view(b, 1, 1, c)
+        joint_type = self.pose_token_type_embed.weight[1].view(1, 1, 1, c)
+        joint_text = (
+            float(self.config.ref_text_scale)
+            * ref_query_mask[:, :, None, None].to(dtype=text_embed.dtype)
+            * text_embed[:, None, None, :]
+        )
+        pose_tokens = self.pose_query_norm(
+            instance[:, :, None, :]
+            + joint_base
+            + task
+            + box_embed[:, :, None, :]
+            + joint_text
+            + joint_type
+        )
+        instance_type = self.pose_token_type_embed.weight[0].view(1, 1, c)
+        instance_token = self.pose_instance_token_norm(instance + instance_type)
+
+        schema_prior_active: torch.Tensor | None = None
+        if self.schema_joint_priors is not None:
+            schema_prior_all = self.schema_joint_priors.to(
+                device=feature_map.device, dtype=feature_map.dtype
+            )[schema_ids]
+            schema_prior_active = torch.gather(
+                schema_prior_all,
+                dim=1,
+                index=schema_joint_indices[..., None].expand(-1, -1, 2),
+            )
+        if self.config.pose_coordinate_init == "anatomical_dynamic":
+            if schema_prior_active is None or self.reference_offset_head is None:
+                raise RuntimeError("Dynamic anatomical references require priors and offset head.")
+            expanded_joint = joint_base.expand(-1, num_people, -1, -1)
+            expanded_instance = instance[:, :, None, :].expand(-1, -1, active_k, -1)
+            offset = self.reference_offset_head(
+                torch.cat([expanded_instance, expanded_joint], dim=-1).to(
+                    dtype=next(self.reference_offset_head.parameters()).dtype
+                )
+            ).float()
+            relative = torch.sigmoid(
+                torch.logit(schema_prior_active.float().clamp(1e-4, 1.0 - 1e-4))[:, None]
+                + float(self.config.dynamic_reference_offset_scale) * torch.tanh(offset)
+            ).to(dtype=feature_map.dtype)
+        elif self.config.pose_coordinate_init == "schema_prior":
+            if schema_prior_active is None:
+                raise RuntimeError("Schema-prior mode requires priors.")
+            relative = schema_prior_active[:, None].expand(-1, num_people, -1, -1)
+        elif self.config.pose_coordinate_init == "learned_spread":
+            if self.joint_reference_logits is None:
+                raise RuntimeError("Learned-spread mode requires joint reference logits.")
+            union_reference = self.joint_reference_logits.sigmoid().to(
+                device=feature_map.device, dtype=feature_map.dtype
+            )
+            relative_active = torch.gather(
+                union_reference[None].expand(b, -1, -1),
+                dim=1,
+                index=schema_joint_indices[..., None].expand(-1, -1, 2),
+            )
+            relative = relative_active[:, None].expand(-1, num_people, -1, -1)
+        else:
+            relative = boxes.new_full((b, num_people, active_k, 2), 0.5)
+        current_reference_xy = (
+            boxes[..., None, :2] + relative * box_wh[..., None, :]
+        ).clamp(1e-4, 1.0 - 1e-4)
+
+        active_initial_query_mask: torch.Tensor | None = None
+        if initial_keypoints is not None:
+            active_initial_query_mask = (
+                proposal_mask
+                if initial_query_mask is None
+                else initial_query_mask.to(device=feature_map.device).bool() & proposal_mask
+            )
+            gather_index = schema_joint_indices[:, None, :, None].expand(
+                b, num_people, active_k, 2
+            )
+            initial_active = torch.gather(
+                initial_keypoints.to(device=feature_map.device, dtype=feature_map.dtype),
+                dim=2,
+                index=gather_index,
+            ).clamp(1e-4, 1.0 - 1e-4)
+            if initial_keypoint_valid is not None:
+                valid_active = torch.gather(
+                    initial_keypoint_valid.to(device=feature_map.device).bool(),
+                    dim=2,
+                    index=schema_joint_indices[:, None, :].expand(
+                        b, num_people, active_k
+                    ),
+                )
+                initial_active = torch.where(
+                    valid_active[..., None], initial_active, current_reference_xy
+                )
+            current_reference_xy = torch.where(
+                active_initial_query_mask[..., None, None],
+                initial_active,
+                current_reference_xy,
+            )
+            if dn_labels is not None and self.keypoint_dn_type_embed is not None:
+                dn_type = self.keypoint_dn_type_embed(
+                    dn_labels.to(device=feature_map.device, dtype=torch.long).clamp(0, 1)
+                )[:, :, None, :]
+                pose_tokens = pose_tokens + dn_type * active_initial_query_mask[
+                    ..., None, None
+                ].to(dtype=dn_type.dtype)
+
+        pose_valid = (
+            schema_joint_valid[:, None, :].expand(b, num_people, active_k)
+            & proposal_mask[:, :, None]
+        )
+        group_tokens = torch.cat([instance_token[:, :, None, :], pose_tokens], dim=2)
+        group_valid = torch.cat([proposal_mask[:, :, None], pose_valid], dim=2)
+        same_role_attention_mask = self._build_group_pose_attention_mask(
+            box_mask=proposal_mask,
+            dn_query_mask=active_initial_query_mask,
+            dn_group_ids=dn_group_ids,
+            num_roles=active_k + 1,
+        )
+
+        decoder_reference_xy_steps: list[torch.Tensor] = []
+        person_center = box_center
+        person_scale = box_wh
+        for decoder_idx, (
+            decoder_layer,
+            decoder_deformable,
+            decoder_coordinate_head,
+        ) in enumerate(
+            zip(
+                self.pose_group_decoder_layers,
+                self.pose_decoder_deformable_attention,
+                self.pose_decoder_coordinate_heads,
+            )
+        ):
+            role_reference = torch.cat(
+                [person_center[:, :, None, :], current_reference_xy.detach()], dim=2
+            )
+            role_position = point_fourier_pe(role_reference, c)
+            group_tokens = decoder_layer(
+                group_tokens,
+                role_position,
+                group_valid,
+                same_role_attention_mask,
+            )
+            pose_tokens = decoder_deformable(
+                group_tokens[:, :, 1:],
+                current_reference_xy,
+                person_scale,
+                feature_maps,
+                spatial_shapes,
+            )
+            reference_delta = decoder_coordinate_head(pose_tokens).float()
+            current_reference_xy = torch.sigmoid(
+                torch.logit(current_reference_xy.float().clamp(1e-4, 1.0 - 1e-4))
+                + reference_delta
+            ).to(dtype=feature_map.dtype)
+            decoder_reference_xy_steps.append(current_reference_xy)
+            valid_xy = pose_valid[..., None]
+            safe_min = torch.where(
+                valid_xy, current_reference_xy, torch.ones_like(current_reference_xy)
+            ).amin(dim=2)
+            safe_max = torch.where(
+                valid_xy, current_reference_xy, torch.zeros_like(current_reference_xy)
+            ).amax(dim=2)
+            estimated_center = (safe_min + safe_max) * 0.5
+            estimated_scale = ((safe_max - safe_min) * 1.35).clamp(0.02, 0.95)
+            has_pose = pose_valid.any(dim=2)
+            person_center = torch.where(has_pose[..., None], estimated_center, person_center).detach()
+            person_scale = torch.where(has_pose[..., None], estimated_scale, person_scale).detach()
+            group_tokens = torch.cat([group_tokens[:, :, :1], pose_tokens], dim=2)
+
+        coarse_keypoint_xy = current_reference_xy
+        keypoint_xy = current_reference_xy
+        refine_keypoint_xy_steps: list[torch.Tensor] = []
+        if (
+            self.refine_heads is not None
+            and self.refine_token_fusers is not None
+            and self.refine_patch_weight_heads is not None
+            and self.joint_context is not None
+            and self.local_proj is not None
+        ):
+            local_feature_map = self.local_proj(feature_maps[local_level_idx])
+            local_shapes = spatial_shapes[local_level_idx]
+            context_mask = ~pose_valid.reshape(b * num_people, active_k)
+            context_mask = context_mask.masked_fill(
+                context_mask.all(dim=1, keepdim=True), False
+            )
+            # The DETRPose path intentionally keeps a single final P2 enhancement.
+            refine_head = self.refine_heads[0]
+            token_fuser = self.refine_token_fusers[0]
+            patch_weight_head = self.refine_patch_weight_heads[0]
+            pose_tokens = self.joint_context(
+                pose_tokens.reshape(b * num_people, active_k, c),
+                src_key_padding_mask=context_mask,
+            ).reshape(b, num_people, active_k, c)
+            patch_logits = patch_weight_head(
+                pose_tokens.to(dtype=patch_weight_head.weight.dtype)
+            )
+            local = self._sample_local_patch_features(
+                local_feature_map,
+                keypoint_xy.detach(),
+                person_scale.detach(),
+                patch_logits,
+                local_shapes,
+                patch_size=3,
+                radius_scale=0.03,
+                min_radius_cells=1.0,
+            )
+            point_pe = point_fourier_pe(keypoint_xy.detach(), c)
+            refine_input = torch.cat([pose_tokens, local, point_pe], dim=-1)
+            delta = torch.tanh(refine_head(refine_input)).float()
+            scale = self.refine_step_scales[0].sigmoid().float()
+            keypoint_xy = torch.sigmoid(
+                torch.logit(keypoint_xy.float().clamp(1e-4, 1.0 - 1e-4))
+                + delta * scale
+            ).to(dtype=feature_map.dtype)
+            refine_keypoint_xy_steps.append(keypoint_xy)
+            pose_tokens = pose_tokens + token_fuser(refine_input)
+
+        schema_visibility_logits = self.keypoint_visibility_head(pose_tokens)
+        keypoint_visibility = schema_visibility_logits.sigmoid()
+        valid_f = pose_valid.to(dtype=pose_tokens.dtype).unsqueeze(-1)
+        pooled_pose = (pose_tokens * valid_f).sum(dim=2) / valid_f.sum(dim=2).clamp(min=1.0)
+        final_instance = self.pose_instance_token_norm(
+            group_tokens[:, :, 0] + pooled_pose
+        )
+        pred_pose_logits, pose_lqe_joint_logits = self._predict_pose_score_logits(
+            pose_tokens=pose_tokens,
+            instance_tokens=final_instance,
+            keypoint_xy=keypoint_xy,
+            pose_valid=pose_valid,
+            feature_maps=feature_maps,
+            spatial_shapes=spatial_shapes,
+        )
+
+        valid_xy = pose_valid[..., None]
+        pose_min = torch.where(valid_xy, keypoint_xy, torch.ones_like(keypoint_xy)).amin(dim=2)
+        pose_max = torch.where(valid_xy, keypoint_xy, torch.zeros_like(keypoint_xy)).amax(dim=2)
+        final_boxes = torch.cat(
+            [pose_min - 0.05 * (pose_max - pose_min), pose_max + 0.05 * (pose_max - pose_min)],
+            dim=-1,
+        ).clamp(0.0, 1.0)
+        final_boxes = torch.where(
+            pose_valid.any(dim=2)[..., None], final_boxes, boxes
+        )
+
+        aux_visibility = keypoint_visibility.detach()
+        keypoints = self._scatter_schema_keypoints(
+            torch.cat([keypoint_xy, keypoint_visibility], dim=-1), schema_scatter_map
+        )
+        coarse_keypoints = self._scatter_schema_keypoints(
+            torch.cat([coarse_keypoint_xy, aux_visibility], dim=-1), schema_scatter_map
+        )
+        decoder_keypoints = [
+            self._scatter_schema_keypoints(
+                torch.cat([xy, aux_visibility], dim=-1), schema_scatter_map
+            )
+            for xy in decoder_reference_xy_steps
+        ]
+        refine_keypoints = [
+            self._scatter_schema_keypoints(
+                torch.cat([xy, aux_visibility], dim=-1), schema_scatter_map
+            )
+            for xy in refine_keypoint_xy_steps
+        ]
+        return {
+            "pose_boxes": final_boxes,
+            "instance_emb": final_instance,
+            "pred_pose_logits": pred_pose_logits,
+            "pose_lqe_joint_logits": self._scatter_schema_keypoints(
+                pose_lqe_joint_logits.unsqueeze(-1), schema_scatter_map
+            ).squeeze(-1),
+            "keypoints": keypoints,
+            "keypoint_valid_mask": schema_scatter_map.bool().any(dim=1),
+            "pred_keypoint_visibility_logits": self._scatter_schema_keypoints(
+                schema_visibility_logits, schema_scatter_map
+            ).squeeze(-1),
+            "decoder_keypoints": decoder_keypoints,
+            "coarse_keypoints": coarse_keypoints,
+            "deform_keypoints": coarse_keypoints,
+            "refine_keypoints": refine_keypoints,
+            "schema_joint_indices": schema_joint_indices,
+            "schema_joint_valid": schema_joint_valid,
+        }
+
+    def _forward_detrpose(
+        self,
+        *,
+        schema_ids: torch.Tensor,
+        task_ids: torch.Tensor,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        valid_masks: list[torch.Tensor],
+        local_level_idx: int,
+        text_embed: torch.Tensor,
+        external_boxes: torch.Tensor | None,
+        external_box_mask: torch.Tensor | None,
+        keypoint_dn_noisy_keypoints: torch.Tensor | None,
+        keypoint_dn_mask: torch.Tensor | None,
+        keypoint_dn_labels: torch.Tensor | None,
+        keypoint_dn_target_keypoints: torch.Tensor | None,
+        keypoint_dn_target_valid: torch.Tensor | None,
+        keypoint_dn_target_boxes: torch.Tensor | None,
+        keypoint_dn_target_areas: torch.Tensor | None,
+        keypoint_dn_source_indices: torch.Tensor | None,
+        keypoint_dn_group_ids: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        internal = self._build_internal_pose_proposals(
+            feature_maps, spatial_shapes, valid_masks, text_embed, task_ids
+        )
+        (
+            proposal_boxes,
+            proposal_tokens,
+            proposal_scores,
+            ref_query_mask,
+            proposal_text_scores,
+            source_ids,
+        ) = self._merge_external_box_proposals(
+            internal[0],
+            internal[1],
+            internal[2],
+            internal[3],
+            internal[4],
+            feature_maps,
+            spatial_shapes,
+            task_ids,
+            external_boxes,
+            external_box_mask,
+        )
+        b, main_count = proposal_boxes.shape[:2]
+        proposal_mask = torch.ones(
+            b, main_count, device=proposal_boxes.device, dtype=torch.bool
+        )
+        if self.person_query_embed is not None:
+            proposal_tokens = proposal_tokens + self.person_query_embed.weight[
+                :main_count
+            ].to(device=proposal_tokens.device, dtype=proposal_tokens.dtype)[None]
+
+        pose_dn_count = 0
+        combined_boxes = proposal_boxes
+        combined_tokens = proposal_tokens
+        combined_mask = proposal_mask
+        combined_ref_mask = ref_query_mask
+        combined_initial_keypoints: torch.Tensor | None = None
+        combined_initial_valid: torch.Tensor | None = None
+        combined_initial_query_mask: torch.Tensor | None = None
+        combined_labels: torch.Tensor | None = None
+        combined_groups: torch.Tensor | None = None
+        pose_dn_mask: torch.Tensor | None = None
+        if (
+            self.training
+            and self.config.enable_keypoint_denoising
+            and keypoint_dn_noisy_keypoints is not None
+            and keypoint_dn_mask is not None
+            and keypoint_dn_labels is not None
+            and keypoint_dn_target_valid is not None
+            and int(keypoint_dn_noisy_keypoints.shape[1]) > 0
+        ):
+            pose_dn_count = int(keypoint_dn_noisy_keypoints.shape[1])
+            pose_dn_mask = keypoint_dn_mask.to(device=proposal_boxes.device).bool()
+            if keypoint_dn_target_boxes is not None:
+                dn_boxes = keypoint_dn_target_boxes.to(
+                    device=proposal_boxes.device, dtype=proposal_boxes.dtype
+                ).clamp(0.0, 1.0)
+            else:
+                noisy_xy = keypoint_dn_noisy_keypoints[..., :2].to(
+                    device=proposal_boxes.device, dtype=proposal_boxes.dtype
+                )
+                dn_min = noisy_xy.amin(dim=2)
+                dn_max = noisy_xy.amax(dim=2)
+                dn_boxes = torch.cat([dn_min, dn_max], dim=-1).clamp(0.0, 1.0)
+            dn_centers = (dn_boxes[..., :2] + dn_boxes[..., 2:]) * 0.5
+            dn_sampled = self._sample_feature_at_points(
+                feature_maps[min(1, len(feature_maps) - 1)],
+                dn_centers,
+                spatial_shapes[min(1, len(spatial_shapes) - 1)],
+            )
+            dn_tokens = self.external_box_token_proj(
+                dn_sampled.to(dtype=next(self.external_box_token_proj.parameters()).dtype)
+            ) + self.proposal_source_embed.weight[2].to(
+                device=proposal_boxes.device, dtype=proposal_tokens.dtype
+            )
+            combined_boxes = torch.cat([proposal_boxes, dn_boxes], dim=1)
+            combined_tokens = torch.cat([proposal_tokens, dn_tokens], dim=1)
+            combined_mask = torch.cat([proposal_mask, pose_dn_mask], dim=1)
+            combined_ref_mask = torch.cat(
+                [ref_query_mask, torch.zeros_like(pose_dn_mask)], dim=1
+            )
+            union_count = int(keypoint_dn_noisy_keypoints.shape[2])
+            combined_initial_keypoints = torch.cat(
+                [
+                    keypoint_dn_noisy_keypoints.new_zeros(
+                        b, main_count, union_count, 2
+                    ),
+                    keypoint_dn_noisy_keypoints,
+                ],
+                dim=1,
+            )
+            combined_initial_valid = torch.cat(
+                [
+                    torch.zeros(
+                        b, main_count, union_count,
+                        device=proposal_boxes.device, dtype=torch.bool
+                    ),
+                    keypoint_dn_target_valid.to(device=proposal_boxes.device).bool(),
+                ],
+                dim=1,
+            )
+            combined_initial_query_mask = torch.cat(
+                [torch.zeros_like(proposal_mask), pose_dn_mask], dim=1
+            )
+            combined_labels = torch.cat(
+                [
+                    torch.zeros(b, main_count, device=proposal_boxes.device),
+                    keypoint_dn_labels.to(device=proposal_boxes.device),
+                ],
+                dim=1,
+            )
+            dn_groups = (
+                keypoint_dn_group_ids.to(device=proposal_boxes.device, dtype=torch.long)
+                if keypoint_dn_group_ids is not None
+                else torch.arange(pose_dn_count, device=proposal_boxes.device)[None].expand(b, -1)
+            )
+            combined_groups = torch.cat(
+                [
+                    torch.full(
+                        (b, main_count), -1,
+                        device=proposal_boxes.device, dtype=torch.long
+                    ),
+                    dn_groups,
+                ],
+                dim=1,
+            )
+
+        decoded = self._run_detrpose_pose_branch(
+            feature_maps=feature_maps,
+            spatial_shapes=spatial_shapes,
+            local_level_idx=local_level_idx,
+            text_embed=text_embed,
+            schema_ids=schema_ids,
+            task_ids=task_ids,
+            proposal_boxes=combined_boxes,
+            proposal_tokens=combined_tokens,
+            proposal_mask=combined_mask,
+            ref_query_mask=combined_ref_mask,
+            initial_keypoints=combined_initial_keypoints,
+            initial_keypoint_valid=combined_initial_valid,
+            initial_query_mask=combined_initial_query_mask,
+            dn_labels=combined_labels,
+            dn_group_ids=combined_groups,
+        )
+
+        def main_slice(value: torch.Tensor) -> torch.Tensor:
+            return value[:, :main_count]
+
+        pred_pose_logits = main_slice(decoded["pred_pose_logits"])
+        proposal_objectness_logits = proposal_scores
+        instance = main_slice(decoded["instance_emb"])
+        external_box_deltas = self.external_box_refine_head(instance).to(
+            dtype=proposal_boxes.dtype
+        )
+        externally_refined_boxes = refine_boxes_xyxy(
+            proposal_boxes, external_box_deltas
+        )
+        external_source_mask = source_ids.eq(1)
+        pred_boxes = torch.where(
+            external_source_mask[..., None],
+            externally_refined_boxes,
+            proposal_boxes,
+        )
+        refinement_fallback_mask = torch.zeros_like(external_source_mask)
+        if not self.training:
+            safe_boxes, ref_fallback = apply_refhuman_box_refinement_safety(
+                pred_boxes,
+                proposal_boxes,
+                external_source_mask,
+                task_ids,
+            )
+            pred_boxes = torch.where(
+                external_source_mask[..., None], safe_boxes, pred_boxes
+            )
+            refinement_fallback_mask = ref_fallback
+        pred_box_logits = self._predict_box_score_logits(
+            proposal_tokens=proposal_tokens,
+            instance_tokens=instance,
+            pred_boxes=pred_boxes,
+            feature_maps=feature_maps,
+            spatial_shapes=spatial_shapes,
+            local_level_idx=local_level_idx,
+        )
+        ref_candidate = self.ref_candidate_proj(instance)
+        ref_text = self.ref_text_match_proj(text_embed).unsqueeze(1).expand_as(ref_candidate)
+        ref_logits = self.ref_match_head(
+            torch.cat([ref_candidate, ref_text, ref_candidate * ref_text], dim=-1)
+        ).squeeze(-1)
+        # Keep text-conditioned proposal selection differentiable. The selected
+        # dense visual/text similarity contributes only to the reserved RefHuman
+        # candidates; Locate-box candidates use the decoded instance score alone.
+        ref_logits = ref_logits + proposal_text_scores.to(dtype=ref_logits.dtype) * (
+            ref_query_mask & source_ids.eq(0)
+        ).to(dtype=ref_logits.dtype)
+        ref_logits = torch.where(
+            task_ids.eq(1).to(device=ref_logits.device)[:, None],
+            ref_logits,
+            torch.full_like(ref_logits, -10.0),
+        )
+        outputs: dict[str, torch.Tensor] = {
+            "pose_set_prediction": torch.tensor(True, device=proposal_boxes.device),
+            "pred_logits": pred_box_logits.unsqueeze(-1),
+            # Canonical box output is always the independently regressed human
+            # proposal.  It is never reconstructed from the final keypoints.
+            "pred_boxes": pred_boxes,
+            "pred_keypoints": main_slice(decoded["keypoints"]),
+            "pred_box_logits": pred_box_logits,
+            "pred_pose_logits": pred_pose_logits,
+            "pred_keypoint_visibility_logits": main_slice(
+                decoded["pred_keypoint_visibility_logits"]
+            ),
+            # Proposal objectness is an auxiliary matching/top-Q signal only.
+            "proposal_objectness_logits_aux": proposal_objectness_logits,
+            "box_objectness_logits": proposal_objectness_logits,
+            # Compatibility aliases retain tensor availability but now carry
+            # the direct AP logits rather than factors that consumers multiply.
+            "person_class_logits": pred_box_logits,
+            "person_logits": pred_box_logits,
+            "box_quality_logits": pred_box_logits,
+            "pose_quality_logits": pred_pose_logits,
+            "decoded_pose_quality_logits": pred_pose_logits,
+            "aux_box_outputs": [],
+            "pose_score_head_available": True,
+            "person_confidence_head_available": True,
+            "person_confidence_rescue": True,
+            "input_boxes": proposal_boxes,
+            "boxes": pred_boxes,
+            # Compatibility alias only.  Consumers must use ``pred_boxes`` for
+            # detection and this envelope only for diagnostics.
+            "pose_boxes": main_slice(decoded["pose_boxes"]),
+            "debug_keypoint_envelope": main_slice(decoded["pose_boxes"]),
+            "box_mask": proposal_mask,
+            "proposal_source_ids": source_ids,
+            "ref_query_mask": ref_query_mask,
+            "ref_box_refinement_fallback_mask": refinement_fallback_mask,
+            "external_box_refinement_deltas": external_box_deltas,
+            "keypoints": main_slice(decoded["keypoints"]),
+            "keypoint_valid_mask": decoded["keypoint_valid_mask"],
+            "keypoint_confidence_logits": main_slice(
+                decoded["pred_keypoint_visibility_logits"]
+            ),
+            "pose_lqe_joint_logits": main_slice(decoded["pose_lqe_joint_logits"]),
+            "decoder_keypoints": [main_slice(value) for value in decoded["decoder_keypoints"]],
+            "coarse_keypoints": main_slice(decoded["coarse_keypoints"]),
+            "deform_keypoints": main_slice(decoded["deform_keypoints"]),
+            "refine_keypoints": [main_slice(value) for value in decoded["refine_keypoints"]],
+            "ref_logits": ref_logits,
+            "ref_candidate_embed": ref_candidate,
+            "ref_text_embed": ref_text[:, 0],
+            "instance_emb": instance,
+            "schema_joint_indices": decoded["schema_joint_indices"],
+            "schema_joint_valid": decoded["schema_joint_valid"],
+        }
+        if self.training and self.keypoint_dn_type_embed is not None:
+            outputs["keypoint_dn_graph_anchor"] = self.keypoint_dn_type_embed.weight.sum() * 0.0
+        if pose_dn_count > 0 and pose_dn_mask is not None:
+            start, end = main_count, main_count + pose_dn_count
+            outputs.update(
+                {
+                    "keypoint_dn_keypoints": decoded["keypoints"][:, start:end],
+                    "keypoint_dn_decoder_keypoints": [
+                        value[:, start:end] for value in decoded["decoder_keypoints"]
+                    ],
+                    "keypoint_dn_coarse_keypoints": decoded["coarse_keypoints"][:, start:end],
+                    "keypoint_dn_deform_keypoints": decoded["deform_keypoints"][:, start:end],
+                    "keypoint_dn_refine_keypoints": [
+                        value[:, start:end] for value in decoded["refine_keypoints"]
+                    ],
+                    "keypoint_dn_confidence_logits": decoded[
+                        "pred_keypoint_visibility_logits"
+                    ][:, start:end],
+                    "keypoint_dn_pose_quality_logits": decoded["pred_pose_logits"][:, start:end],
+                    "keypoint_dn_mask": pose_dn_mask,
+                    "keypoint_dn_labels": keypoint_dn_labels,
+                    "keypoint_dn_target_keypoints": keypoint_dn_target_keypoints,
+                    "keypoint_dn_target_valid": keypoint_dn_target_valid,
+                    "keypoint_dn_target_boxes": keypoint_dn_target_boxes,
+                    "keypoint_dn_target_areas": keypoint_dn_target_areas,
+                    "keypoint_dn_source_indices": keypoint_dn_source_indices,
+                    "keypoint_dn_group_ids": keypoint_dn_group_ids,
+                }
+            )
+        return outputs
 
     def forward(
         self,
@@ -1248,6 +2429,8 @@ class QwenPoseModel(nn.Module):
         images: torch.Tensor | None = None,
         external_feature_map: torch.Tensor | SpatialFeatureBatch | MultiScaleSpatialFeatureBatch | None = None,
         external_text_embed: torch.Tensor | None = None,
+        cached_text_embed: torch.Tensor | None = None,
+        cached_text_mask: torch.Tensor | None = None,
         target_boxes: torch.Tensor | None = None,
         target_box_mask: torch.Tensor | None = None,
         dn_boxes: torch.Tensor | None = None,
@@ -1268,20 +2451,75 @@ class QwenPoseModel(nn.Module):
         keypoint_dn_box_query_indices: torch.Tensor | None = None,
         pose_condition_box_mode: str = "refined_detached",
     ) -> dict[str, torch.Tensor]:
-        if external_feature_map is None or external_text_embed is None:
-            raise ValueError(
-                "QwenPoseModel requires backbone external_feature_map and external_text_embed."
+        if external_feature_map is None:
+            raise ValueError("QwenPoseModel requires backbone external_feature_map.")
+        batch_size = int(external_feature_map.shape[0])
+        feature_device = external_feature_map.device
+        if external_text_embed is None:
+            external_text_embed = torch.zeros(
+                batch_size,
+                int(self.config.external_dim),
+                device=feature_device,
+                dtype=external_feature_map.dtype,
+            )
+        if cached_text_embed is not None:
+            cached = cached_text_embed.to(
+                device=feature_device, dtype=external_text_embed.dtype
+            )
+            if cached.shape != external_text_embed.shape:
+                raise ValueError(
+                    "cached text embedding shape must match backbone text embedding: "
+                    f"cached={tuple(cached.shape)} backbone={tuple(external_text_embed.shape)}."
+                )
+            mask = (
+                torch.ones(batch_size, device=feature_device, dtype=torch.bool)
+                if cached_text_mask is None
+                else cached_text_mask.to(device=feature_device).bool().view(batch_size)
+            )
+            external_text_embed = torch.where(
+                mask[:, None], cached, external_text_embed
             )
         if pose_condition_box_mode not in {"refined_detached", "input"}:
             raise ValueError(
                 "pose_condition_box_mode must be 'refined_detached' or 'input', "
                 f"got {pose_condition_box_mode!r}."
             )
+        if bool(self.config.use_detrpose_architecture):
+            (
+                feature_maps,
+                spatial_shapes,
+                spatial_valid_masks,
+                _,
+                local_level_idx,
+            ) = self.build_locate_pose_features(external_feature_map)
+            text_dtype = next(self.external_text_proj.parameters()).dtype
+            text_embed = self.external_text_proj(
+                external_text_embed.to(dtype=text_dtype)
+            )
+            return self._forward_detrpose(
+                schema_ids=schema_ids,
+                task_ids=task_ids,
+                feature_maps=feature_maps,
+                spatial_shapes=spatial_shapes,
+                valid_masks=spatial_valid_masks,
+                local_level_idx=local_level_idx,
+                text_embed=text_embed,
+                external_boxes=target_boxes,
+                external_box_mask=target_box_mask,
+                keypoint_dn_noisy_keypoints=keypoint_dn_noisy_keypoints,
+                keypoint_dn_mask=keypoint_dn_mask,
+                keypoint_dn_labels=keypoint_dn_labels,
+                keypoint_dn_target_keypoints=keypoint_dn_target_keypoints,
+                keypoint_dn_target_valid=keypoint_dn_target_valid,
+                keypoint_dn_target_boxes=keypoint_dn_target_boxes,
+                keypoint_dn_target_areas=keypoint_dn_target_areas,
+                keypoint_dn_source_indices=keypoint_dn_source_indices,
+                keypoint_dn_group_ids=keypoint_dn_group_ids,
+            )
+
         use_person_queries = bool(self.config.use_global_person_queries)
         if not use_person_queries and (target_boxes is None or target_box_mask is None):
             raise ValueError("QwenPoseModel requires external box conditions when person queries are disabled.")
-        feature_device = external_feature_map.device
-        batch_size = int(external_feature_map.shape[0])
         if use_person_queries:
             if self.person_query_reference_logits is None or self.person_query_embed is None:
                 raise RuntimeError("Global person-query mode was enabled without person-query parameters.")
@@ -1640,6 +2878,9 @@ class QwenPoseModel(nn.Module):
             "pose_quality_logits": query_slice(
                 combined_pose["pose_quality_logits"], 0, main_count
             ),
+            "pred_pose_logits": query_slice(
+                combined_pose["pred_pose_logits"], 0, main_count
+            ),
             "keypoints": query_slice(combined_pose["keypoints"], 0, main_count),
             "keypoint_valid_mask": combined_pose["keypoint_valid_mask"],
             "keypoint_confidence_logits": query_slice(
@@ -1664,32 +2905,50 @@ class QwenPoseModel(nn.Module):
         }
         boxes = main_pose["pose_boxes"]
         instance = main_pose["instance_emb"]
-        pose_quality_logits = main_pose["pose_quality_logits"]
-        objectness_prob = box_objectness_logits.sigmoid()
-        pose_quality_prob = pose_quality_logits.sigmoid()
-        combined_prob = (objectness_prob * pose_quality_prob).clamp(1e-5, 1.0 - 1e-5)
-        person_logits = torch.where(
+        pred_pose_logits = main_pose["pred_pose_logits"]
+        proposal_objectness_logits = torch.where(
             box_mask,
-            torch.logit(combined_prob),
-            torch.full_like(combined_prob, -10.0),
+            box_objectness_logits,
+            torch.full_like(box_objectness_logits, -10.0),
         )
-        person_confidence_head_available = self.person_confidence_head is not None
+        pred_box_logits = self._predict_box_score_logits(
+            proposal_tokens=main_human_tokens,
+            instance_tokens=instance,
+            pred_boxes=refined_boxes,
+            feature_maps=feature_maps,
+            spatial_shapes=spatial_shapes,
+            local_level_idx=local_level_idx,
+        )
+        pred_box_logits = torch.where(
+            box_mask,
+            pred_box_logits,
+            torch.full_like(pred_box_logits, -10.0),
+        )
         outputs = {
             # Canonical DETR/GroupPose-style names.
-            "pred_logits": person_logits.unsqueeze(-1),
+            "pred_logits": pred_box_logits.unsqueeze(-1),
             "pred_boxes": refined_boxes,
             "pred_keypoints": main_pose["keypoints"],
-            # Explicit detection/pose quality decomposition.
-            "box_objectness_logits": box_objectness_logits,
-            "pose_quality_logits": pose_quality_logits,
+            "pred_box_logits": pred_box_logits,
+            "pred_pose_logits": pred_pose_logits,
+            "pred_keypoint_visibility_logits": main_pose[
+                "keypoint_confidence_logits"
+            ],
+            "proposal_objectness_logits_aux": proposal_objectness_logits,
+            "person_class_logits": pred_box_logits,
+            "box_objectness_logits": proposal_objectness_logits,
+            "box_quality_logits": pred_box_logits,
+            "pose_quality_logits": pred_pose_logits,
             "aux_box_outputs": aux_box_outputs[:-1],
             # Backwards-compatible project names.
-            "person_logits": person_logits,
-            "person_confidence_head_available": person_confidence_head_available,
-            "person_confidence_rescue": person_confidence_head_available,
+            "person_logits": pred_box_logits,
+            "pose_score_head_available": True,
+            "person_confidence_head_available": True,
+            "person_confidence_rescue": True,
             "input_boxes": input_boxes,
             "boxes": refined_boxes,
             "pose_boxes": boxes,
+            "debug_keypoint_envelope": boxes,
             "box_mask": box_mask,
             "ref_box_refinement_fallback_mask": refinement_fallback_mask,
             "keypoints": main_pose["keypoints"],
@@ -2183,56 +3442,62 @@ class QwenPoseModel(nn.Module):
                 refine_keypoint_xy_steps.append(keypoint_xy)
                 pose_tokens = pose_tokens + token_fuser(refine_input)
 
-        assert self.pose_confidence_head is not None
-        schema_confidence_logits = self.pose_confidence_head(pose_tokens)
-        keypoint_confidence = schema_confidence_logits.sigmoid()
-        if self.person_confidence_head is not None:
-            valid_f = pose_valid.to(dtype=pose_tokens.dtype).unsqueeze(-1)
-            pooled_pose_tokens = (pose_tokens * valid_f).sum(dim=2) / valid_f.sum(
-                dim=2
-            ).clamp(min=1.0)
-            confidence_dtype = next(self.person_confidence_head.parameters()).dtype
-            pose_quality_logits = self.person_confidence_head(
-                pooled_pose_tokens.to(dtype=confidence_dtype)
-            ).squeeze(-1).to(dtype=boxes.dtype)
-        else:
-            pose_quality_logits = boxes.new_zeros((b, num_boxes))
+        schema_visibility_logits = self.keypoint_visibility_head(pose_tokens)
+        keypoint_visibility = schema_visibility_logits.sigmoid()
+        valid_f = pose_valid.to(dtype=pose_tokens.dtype).unsqueeze(-1)
+        pooled_pose_tokens = (pose_tokens * valid_f).sum(dim=2) / valid_f.sum(
+            dim=2
+        ).clamp(min=1.0)
+        final_instance = self.pose_instance_token_norm(instance + pooled_pose_tokens)
+        pred_pose_logits, pose_lqe_joint_logits = self._predict_pose_score_logits(
+            pose_tokens=pose_tokens,
+            instance_tokens=final_instance,
+            keypoint_xy=keypoint_xy,
+            pose_valid=pose_valid,
+            feature_maps=feature_maps,
+            spatial_shapes=spatial_shapes,
+        )
 
-        aux_confidence = keypoint_confidence.detach()
+        aux_visibility = keypoint_visibility.detach()
         coarse_keypoints = self._scatter_schema_keypoints(
-            torch.cat([coarse_reference_xy, aux_confidence], dim=-1),
+            torch.cat([coarse_reference_xy, aux_visibility], dim=-1),
             schema_scatter_map,
         )
         deform_keypoints = self._scatter_schema_keypoints(
-            torch.cat([deform_keypoint_xy, aux_confidence], dim=-1),
+            torch.cat([deform_keypoint_xy, aux_visibility], dim=-1),
             schema_scatter_map,
         )
         keypoints = self._scatter_schema_keypoints(
-            torch.cat([keypoint_xy, keypoint_confidence], dim=-1),
+            torch.cat([keypoint_xy, keypoint_visibility], dim=-1),
             schema_scatter_map,
         )
-        keypoint_confidence_logits = self._scatter_schema_keypoints(
-            schema_confidence_logits, schema_scatter_map
+        keypoint_visibility_logits = self._scatter_schema_keypoints(
+            schema_visibility_logits, schema_scatter_map
         ).squeeze(-1)
         decoder_keypoints = [
             self._scatter_schema_keypoints(
-                torch.cat([xy, aux_confidence], dim=-1), schema_scatter_map
+                torch.cat([xy, aux_visibility], dim=-1), schema_scatter_map
             )
             for xy in decoder_reference_xy_steps
         ]
         refine_keypoints = [
             self._scatter_schema_keypoints(
-                torch.cat([xy, aux_confidence], dim=-1), schema_scatter_map
+                torch.cat([xy, aux_visibility], dim=-1), schema_scatter_map
             )
             for xy in refine_keypoint_xy_steps
         ]
         return {
             "pose_boxes": boxes,
-            "instance_emb": instance,
-            "pose_quality_logits": pose_quality_logits,
+            "instance_emb": final_instance,
+            "pred_pose_logits": pred_pose_logits,
+            "pose_quality_logits": pred_pose_logits,
             "keypoints": keypoints,
             "keypoint_valid_mask": schema_scatter_map.bool().any(dim=1),
-            "keypoint_confidence_logits": keypoint_confidence_logits,
+            "pred_keypoint_visibility_logits": keypoint_visibility_logits,
+            "keypoint_confidence_logits": keypoint_visibility_logits,
+            "pose_lqe_joint_logits": self._scatter_schema_keypoints(
+                pose_lqe_joint_logits.unsqueeze(-1), schema_scatter_map
+            ).squeeze(-1),
             "decoder_keypoints": decoder_keypoints,
             "coarse_keypoints": coarse_keypoints,
             "deform_keypoints": deform_keypoints,
@@ -2465,6 +3730,100 @@ class QwenPoseModel(nn.Module):
         flat_features = feature_map.index_select(0, batch_indices)
         sampled = F.grid_sample(flat_features, flat_grid, align_corners=False)
         return sampled.view(b, num_boxes, c, roi_size, roi_size)
+
+    def _predict_pose_score_logits(
+        self,
+        *,
+        pose_tokens: torch.Tensor,
+        instance_tokens: torch.Tensor,
+        keypoint_xy: torch.Tensor,
+        pose_valid: torch.Tensor,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict a direct OKS-aware pose logit with local quality evidence."""
+        b, q, k, _ = pose_tokens.shape
+        sample_points = keypoint_xy.detach().reshape(b, q * k, 2)
+        sampled_levels = []
+        for feature_map, shapes in zip(feature_maps, spatial_shapes):
+            sampled = self._sample_feature_at_points(
+                feature_map, sample_points, shapes
+            ).reshape(b, q, k, -1)
+            sampled_levels.append(sampled)
+        local_features = torch.cat(sampled_levels, dim=-1)
+        local_dtype = next(self.pose_lqe_feature_proj.parameters()).dtype
+        local_tokens = self.pose_lqe_feature_proj(
+            local_features.to(dtype=local_dtype)
+        ).to(dtype=pose_tokens.dtype)
+        joint_dtype = next(self.pose_lqe_joint_head.parameters()).dtype
+        joint_lqe_logits = self.pose_lqe_joint_head(
+            torch.cat([pose_tokens, local_tokens], dim=-1).to(dtype=joint_dtype)
+        ).squeeze(-1).to(dtype=pose_tokens.dtype)
+
+        valid = pose_valid.to(device=joint_lqe_logits.device).bool()
+        joint_scores = joint_lqe_logits.float().sigmoid()
+        valid_f = valid.float()
+        mean_score = (joint_scores * valid_f).sum(dim=-1) / valid_f.sum(
+            dim=-1
+        ).clamp(min=1.0)
+        topk_count = max(k // 2, 1)
+        top_values = torch.where(
+            valid, joint_scores, torch.full_like(joint_scores, -1.0)
+        ).topk(topk_count, dim=-1).values
+        top_valid = top_values.ge(0.0)
+        top_mean = torch.where(top_valid, top_values, torch.zeros_like(top_values)).sum(
+            dim=-1
+        ) / top_valid.float().sum(dim=-1).clamp(min=1.0)
+        max_score = torch.where(
+            valid, joint_scores, torch.zeros_like(joint_scores)
+        ).amax(dim=-1)
+        statistics = torch.stack([mean_score, top_mean, max_score], dim=-1).to(
+            dtype=instance_tokens.dtype
+        )
+
+        score_dtype = next(self.pose_score_base_head.parameters()).dtype
+        base_logits = self.pose_score_base_head(
+            instance_tokens.to(dtype=score_dtype)
+        ).squeeze(-1)
+        residual_logits = self.pose_lqe_residual_head(
+            torch.cat(
+                [instance_tokens.to(dtype=score_dtype), statistics.to(dtype=score_dtype)],
+                dim=-1,
+            )
+        ).squeeze(-1)
+        return (
+            (base_logits + residual_logits).to(dtype=pose_tokens.dtype),
+            joint_lqe_logits,
+        )
+
+    def _predict_box_score_logits(
+        self,
+        *,
+        proposal_tokens: torch.Tensor,
+        instance_tokens: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        feature_maps: list[torch.Tensor],
+        spatial_shapes: list[torch.Tensor],
+        local_level_idx: int,
+    ) -> torch.Tensor:
+        """Predict the direct person/bbox AP logit from token and ROI evidence."""
+        local_roi = self._sample_box_feature_maps(
+            feature_maps[local_level_idx],
+            pred_boxes.detach(),
+            3,
+            spatial_shapes[local_level_idx],
+        ).mean(dim=(-2, -1))
+        local_dtype = next(self.box_lqe_feature_proj.parameters()).dtype
+        local_token = self.box_lqe_feature_proj(
+            local_roi.to(dtype=local_dtype)
+        ).to(dtype=proposal_tokens.dtype)
+        score_dtype = next(self.box_score_head.parameters()).dtype
+        score_input = torch.cat(
+            [proposal_tokens, instance_tokens, local_token], dim=-1
+        ).to(dtype=score_dtype)
+        return self.box_score_head(score_input).squeeze(-1).to(
+            dtype=pred_boxes.dtype
+        )
 
     @staticmethod
     def _zero_init_last_linear(module: nn.Module) -> None:

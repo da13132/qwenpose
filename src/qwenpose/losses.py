@@ -61,8 +61,9 @@ class LossWeights:
     # coarse/deform/refine weights below.
     coord: float = 0.0
     image_coord: float = 5.0
+    # Legacy flag name; this now weights per-joint presence/visibility BCE.
     keypoint_confidence: float = 0.1
-    # YOLO-style instance ranking score trained against detached evaluator OKS.
+    # Direct pose AP score trained with evaluator-aligned detached OKS targets.
     person_confidence: float = 0.0
     # RefHuman expression-to-person classification over the generated candidates.
     ref_match: float = 1.0
@@ -75,6 +76,8 @@ class LossWeights:
     hard_joint_fraction: float = 0.2
     # Human proposal refinement and denoising supervision.
     box_objectness: float = 1.0
+    # Direct person/bbox AP score trained against detached matched IoU.
+    box_quality: float = 1.0
     box_l1: float = 5.0
     box_giou: float = 2.0
     box_relative: float = 1.0
@@ -131,10 +134,31 @@ def compute_pose_losses(
         weights,
         graph_anchor,
     )
-    box_total, box_parts = compute_box_refinement_losses(outputs, targets, weights)
+    pose_set_prediction = bool(
+        torch.is_tensor(outputs.get("pose_set_prediction"))
+        and bool(outputs["pose_set_prediction"].detach().item())
+    )
+    if pose_set_prediction:
+        box_total, box_parts = compute_pose_set_proposal_box_losses(
+            outputs,
+            targets,
+            weights,
+            graph_anchor,
+        )
+    else:
+        box_total, box_parts = compute_box_refinement_losses(outputs, targets, weights)
     total = total + box_total
     loss_parts.update(box_parts)
     loss_parts["loss_total"] = total
+    if weights.box_quality > 0.0:
+        box_quality_loss, box_quality_parts = compute_box_quality_loss(
+            outputs,
+            targets,
+            graph_anchor,
+        )
+        total = total + float(weights.box_quality) * box_quality_loss
+        loss_parts.update(box_quality_parts)
+        loss_parts["loss_total"] = total
     keypoint_dn_loss, keypoint_dn_parts = compute_keypoint_denoising_loss(
         outputs, weights, graph_anchor
     )
@@ -290,12 +314,13 @@ def compute_keypoint_denoising_loss(
             target_areas[positive],
             sigmas,
         )
-    # Negative DN skeletons are contrastive low-quality examples even if the
-    # shared decoder happens to move one of their joints close to the GT.
+    # Negative DN skeletons are contrastive low-quality *instances* even if the
+    # decoder moves one joint close to GT. Their per-joint presence labels are
+    # nevertheless unchanged and are kept separate below.
     quality_score[negative] = 0.0
     if torch.is_tensor(confidence_logits) and supervised.any():
         per_joint_confidence = F.binary_cross_entropy_with_logits(
-            confidence_logits, quality_score.detach(), reduction="none"
+            confidence_logits, target[..., 2].float(), reduction="none"
         )
         weighted = per_joint_confidence * supervised.float()
         per_slot = weighted.sum(dim=-1) / supervised.float().sum(dim=-1).clamp(min=1.0)
@@ -369,6 +394,23 @@ def _sigmoid_focal_loss(
     return loss
 
 
+def _quality_focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    alpha: float = 0.75,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """Varifocal-style loss for a direct quality-aware foreground logit."""
+    targets = targets.to(device=logits.device, dtype=logits.dtype).clamp(0.0, 1.0)
+    probabilities = logits.sigmoid()
+    negative_weight = float(alpha) * probabilities.pow(float(gamma))
+    weights = torch.where(targets.gt(0.0), targets, negative_weight)
+    return F.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none"
+    ) * weights
+
+
 def _box_giou_diagonal(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     lt = torch.maximum(boxes1[..., :2], boxes2[..., :2])
     rb = torch.minimum(boxes1[..., 2:], boxes2[..., 2:])
@@ -383,6 +425,15 @@ def _box_giou_diagonal(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tens
     enclosing_wh = (enclosing_rb - enclosing_lt).clamp(min=0.0)
     enclosing = (enclosing_wh[..., 0] * enclosing_wh[..., 1]).clamp(min=1e-8)
     return iou - (enclosing - union) / enclosing
+
+
+def _box_iou_diagonal(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    lt = torch.maximum(boxes1[..., :2], boxes2[..., :2])
+    rb = torch.minimum(boxes1[..., 2:], boxes2[..., 2:])
+    inter_wh = (rb - lt).clamp(min=0.0)
+    intersection = inter_wh[..., 0] * inter_wh[..., 1]
+    union = (box_area(boxes1) + box_area(boxes2) - intersection).clamp(min=1e-8)
+    return intersection / union
 
 
 def _box_regression_losses(
@@ -407,6 +458,205 @@ def _box_regression_losses(
         beta=0.1,
     ).sum(dim=-1)
     return l1, giou, relative
+
+
+def compute_box_quality_loss(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    graph_anchor: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Train the direct person/bbox AP logit against detached matched IoU."""
+    logits = outputs.get("pred_box_logits", outputs.get("box_quality_logits"))
+    pred_boxes = outputs.get("pred_boxes")
+    box_mask = outputs.get("box_mask")
+    if not all(torch.is_tensor(value) for value in (logits, pred_boxes, box_mask)):
+        return graph_anchor, {
+            "loss_box_quality": graph_anchor,
+            "box_quality_target_mean": graph_anchor.detach(),
+            "box_quality_prediction_mean": graph_anchor.detach(),
+            "box_quality_instances": graph_anchor.detach(),
+        }
+    assert isinstance(logits, torch.Tensor)
+    assert isinstance(pred_boxes, torch.Tensor)
+    assert isinstance(box_mask, torch.Tensor)
+    total = logits.sum() * 0.0
+    target_sum = logits.new_zeros(())
+    prediction_sum = logits.new_zeros(())
+    count = 0
+    positive_count = 0
+    for batch_idx, target in enumerate(targets):
+        valid_queries = torch.nonzero(
+            box_mask[batch_idx].bool(), as_tuple=False
+        ).flatten()
+        if valid_queries.numel() == 0:
+            continue
+        matched_gt_indices = target.get("matched_gt_indices")
+        if torch.is_tensor(matched_gt_indices):
+            matched = matched_gt_indices.to(device=logits.device)[valid_queries].ge(0)
+        else:
+            # Box-conditioned legacy batches have one positive query per row.
+            positive_limit = min(
+                int(valid_queries.numel()), int(target["boxes"].shape[0])
+            )
+            matched = torch.arange(
+                int(valid_queries.numel()), device=logits.device
+            ).lt(positive_limit)
+        quality_target = logits.new_zeros(valid_queries.shape, dtype=torch.float32)
+        if matched.any():
+            positive_count += int(matched.sum().item())
+            positive_queries = valid_queries[matched]
+            target_boxes = target["boxes"].to(
+                device=pred_boxes.device, dtype=pred_boxes.dtype
+            )
+            # Query-aligned targets place each matched GT at its query index.
+            # Legacy targets are row-aligned with the leading valid queries.
+            if torch.is_tensor(matched_gt_indices):
+                positive_targets = target_boxes[positive_queries]
+            else:
+                positive_targets = target_boxes[: int(positive_queries.numel())]
+            quality_target[matched] = _box_iou_diagonal(
+                pred_boxes[batch_idx, positive_queries], positive_targets
+            ).detach().float().clamp(0.0, 1.0)
+        sample_logits = logits[batch_idx, valid_queries].float()
+        total = total + _quality_focal_loss(sample_logits, quality_target).sum()
+        target_sum = target_sum + quality_target.sum()
+        prediction_sum = prediction_sum + sample_logits.sigmoid().detach().sum()
+        count += int(valid_queries.numel())
+    denom = max(positive_count, 1)
+    loss = total / denom
+    return loss, {
+        "loss_box_quality": loss,
+        "box_quality_target_mean": (target_sum / max(count, 1)).detach(),
+        "box_quality_prediction_mean": (prediction_sum / max(count, 1)).detach(),
+        "box_quality_instances": logits.new_tensor(float(count)),
+        "box_quality_positive_instances": logits.new_tensor(float(positive_count)),
+    }
+
+
+def compute_pose_set_proposal_box_losses(
+    outputs: dict[str, torch.Tensor],
+    targets: list[dict[str, torch.Tensor]],
+    weights: LossWeights,
+    graph_anchor: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise the canonical independently regressed person boxes.
+
+    The same query owns ``pred_boxes`` and ``pred_keypoints``; pose envelopes
+    never enter this objective. Locate/Stage1-proxy queries (source id 1) have
+    a learned residual box head, so they receive L1/GIoU supervision while their
+    fixed foreground class prior remains excluded from objectness supervision.
+    """
+    proposal_boxes = outputs.get("pred_boxes", outputs.get("input_boxes"))
+    objectness_logits = outputs.get("box_objectness_logits")
+    box_mask = outputs.get("box_mask")
+    if not all(
+        torch.is_tensor(value)
+        for value in (proposal_boxes, objectness_logits, box_mask)
+    ):
+        return graph_anchor, {
+            "loss_box_objectness": graph_anchor,
+            "loss_box_l1": graph_anchor,
+            "loss_box_giou": graph_anchor,
+            "loss_box_relative": graph_anchor,
+            "loss_box_dn": graph_anchor,
+            "box_valid_queries": graph_anchor.detach(),
+            "box_positive_queries": graph_anchor.detach(),
+        }
+    assert isinstance(proposal_boxes, torch.Tensor)
+    assert isinstance(objectness_logits, torch.Tensor)
+    assert isinstance(box_mask, torch.Tensor)
+
+    source_ids = outputs.get("proposal_source_ids")
+    if torch.is_tensor(source_ids):
+        objectness_mask = box_mask.bool() & source_ids.eq(0)
+        regression_mask = box_mask.bool() & (source_ids.eq(0) | source_ids.eq(1))
+    else:
+        objectness_mask = box_mask.bool()
+        regression_mask = box_mask.bool()
+
+    objectness_sum = proposal_boxes.sum() * 0.0
+    l1_sum = proposal_boxes.sum() * 0.0
+    giou_sum = proposal_boxes.sum() * 0.0
+    relative_sum = proposal_boxes.sum() * 0.0
+    valid_count = 0
+    objectness_positive_count = 0
+    positive_count = 0
+    for batch_idx, target in enumerate(targets):
+        target_boxes = target.get("boxes")
+        matched_gt_indices = target.get("matched_gt_indices")
+        if not torch.is_tensor(target_boxes) or not torch.is_tensor(matched_gt_indices):
+            continue
+        regression_queries = torch.nonzero(
+            regression_mask[batch_idx], as_tuple=False
+        ).flatten()
+        regression_queries = regression_queries[regression_queries < min(
+            int(target_boxes.shape[0]),
+            int(matched_gt_indices.shape[0]),
+        )]
+        objectness_queries = torch.nonzero(
+            objectness_mask[batch_idx], as_tuple=False
+        ).flatten()
+        objectness_queries = objectness_queries[objectness_queries < min(
+            int(target_boxes.shape[0]),
+            int(matched_gt_indices.shape[0]),
+        )]
+        matched_all = matched_gt_indices.to(device=proposal_boxes.device)
+        if objectness_queries.numel() > 0:
+            objectness_positive = matched_all[objectness_queries].ge(0)
+            labels = objectness_positive.to(dtype=objectness_logits.dtype)
+            objectness_sum = objectness_sum + _sigmoid_focal_loss(
+                objectness_logits[batch_idx, objectness_queries], labels
+            ).sum()
+            valid_count += int(objectness_queries.numel())
+            objectness_positive_count += int(objectness_positive.sum().item())
+        if regression_queries.numel() > 0:
+            regression_positive = matched_all[regression_queries].ge(0)
+        else:
+            regression_positive = torch.zeros(
+                0, device=proposal_boxes.device, dtype=torch.bool
+            )
+        if regression_positive.any():
+            positive_queries = regression_queries[regression_positive]
+            gt_boxes = target_boxes.to(
+                device=proposal_boxes.device,
+                dtype=proposal_boxes.dtype,
+            )[positive_queries]
+            l1, giou, relative = _box_regression_losses(
+                proposal_boxes[batch_idx, positive_queries],
+                gt_boxes,
+            )
+            l1_sum = l1_sum + l1.sum()
+            giou_sum = giou_sum + giou.sum()
+            relative_sum = relative_sum + relative.sum()
+            positive_count += int(regression_positive.sum().item())
+
+    # DETR-style positive normalization prevents the many background proposals
+    # from shrinking this auxiliary objectness signal toward zero.
+    objectness_loss = objectness_sum / max(objectness_positive_count, 1)
+    l1_loss = l1_sum / max(positive_count, 1)
+    giou_loss = giou_sum / max(positive_count, 1)
+    relative_loss = relative_sum / max(positive_count, 1)
+    zero = proposal_boxes.sum() * 0.0
+    total = (
+        float(weights.box_objectness) * objectness_loss
+        + float(weights.box_l1) * l1_loss
+        + float(weights.box_giou) * giou_loss
+        + float(weights.box_relative) * relative_loss
+    )
+    return total, {
+        "loss_box_objectness": objectness_loss,
+        "loss_box_l1": l1_loss,
+        "loss_box_giou": giou_loss,
+        "loss_box_relative": relative_loss,
+        # BoxDN was removed from the pose-set graph; keep the metric key stable.
+        "loss_box_dn": zero,
+        "box_valid_queries": torch.as_tensor(
+            float(valid_count), device=proposal_boxes.device
+        ),
+        "box_positive_queries": torch.as_tensor(
+            float(positive_count), device=proposal_boxes.device
+        ),
+    }
 
 
 def compute_box_refinement_losses(
@@ -555,10 +805,10 @@ def compute_refhuman_match_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Classify the referred person independently from pose/objectness quality.
 
-    The target is the query index stored by generated-box matching. Samples where
-    Locate failed to produce a matched referred-person proposal are excluded;
-    forcing an arbitrary negative-only target would teach the semantic head the
-    wrong person rather than improve grounding.
+    The target is the query index produced by Hungarian pose/proposal matching.
+    Samples whose referred GT person did not receive a valid query match are
+    excluded; forcing an arbitrary class would teach the semantic head the wrong
+    person rather than improve grounding.
     """
     ref_logits = outputs.get("ref_logits")
     box_mask = outputs.get("box_mask")
@@ -571,7 +821,11 @@ def compute_refhuman_match_loss(
             "ref_match_instances": anchor.detach(),
         }
 
-    total_loss = ref_logits.sum() * 0.0
+    total_ce = ref_logits.sum() * 0.0
+    total_rank = ref_logits.sum() * 0.0
+    total_contrast = ref_logits.sum() * 0.0
+    candidate_embed = outputs.get("ref_candidate_embed")
+    text_embed = outputs.get("ref_text_embed")
     correct = ref_logits.new_zeros(())
     margin_sum = ref_logits.new_zeros(())
     count = 0
@@ -594,20 +848,38 @@ def compute_refhuman_match_loss(
         target_tensor = torch.tensor(
             [target_position], device=logits.device, dtype=torch.long
         )
-        total_loss = total_loss + F.cross_entropy(logits.unsqueeze(0), target_tensor)
+        total_ce = total_ce + F.cross_entropy(logits.unsqueeze(0), target_tensor)
         predicted_position = int(logits.argmax().item())
         correct = correct + float(predicted_position == target_position)
         positive_logit = logits[target_position]
         if logits.numel() > 1:
             negative_mask = torch.ones_like(logits, dtype=torch.bool)
             negative_mask[target_position] = False
-            margin_sum = margin_sum + positive_logit - logits[negative_mask].max()
+            hardest_negative = logits[negative_mask].max()
+            margin = positive_logit - hardest_negative
+            margin_sum = margin_sum + margin
+            total_rank = total_rank + F.relu(logits.new_tensor(0.3) - margin)
+        if torch.is_tensor(candidate_embed) and torch.is_tensor(text_embed):
+            candidates = F.normalize(
+                candidate_embed[batch_idx, valid_queries].float(), dim=-1
+            )
+            text = F.normalize(text_embed[batch_idx].float(), dim=-1)
+            contrast_logits = torch.matmul(candidates, text) / 0.07
+            total_contrast = total_contrast + F.cross_entropy(
+                contrast_logits.unsqueeze(0), target_tensor
+            )
         count += 1
 
     denom = max(count, 1)
-    loss = total_loss / denom
+    loss_ce = total_ce / denom
+    loss_rank = total_rank / denom
+    loss_contrast = total_contrast / denom
+    loss = loss_ce + 0.5 * loss_rank + 0.2 * loss_contrast
     return loss, {
         "loss_ref_match": loss,
+        "loss_ref_match_ce": loss_ce,
+        "loss_ref_match_rank": loss_rank,
+        "loss_ref_match_contrast": loss_contrast,
         "ref_match_accuracy": (correct / denom).detach(),
         "ref_match_margin": (margin_sum / denom).detach(),
         "ref_match_instances": ref_logits.new_tensor(float(count)),
@@ -618,14 +890,11 @@ def compute_person_confidence_quality_loss(
     outputs: dict[str, torch.Tensor],
     targets: list[dict[str, torch.Tensor]],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Train the YOLO-style instance score against detached evaluator OKS.
-
-    GT-box queries predict their pose OKS instead of a constant person label.
-    During generated-box training, matched queries predict pose OKS and unmatched
-    generated boxes predict zero. Coordinates are detached from the target.
-    """
-    person_logits = outputs.get("pose_quality_logits", outputs.get("person_logits"))
-    if not torch.is_tensor(person_logits):
+    """Train the direct pose AP logit against detached evaluator-aligned OKS."""
+    pose_quality_logits = outputs.get(
+        "pred_pose_logits", outputs.get("pose_quality_logits")
+    )
+    if not torch.is_tensor(pose_quality_logits):
         raise ValueError("Pose-quality supervision requires tensor pose_quality_logits.")
     box_mask = outputs.get("box_mask")
     if not torch.is_tensor(box_mask):
@@ -634,14 +903,15 @@ def compute_person_confidence_quality_loss(
     if not torch.is_tensor(keypoints):
         raise ValueError("Confidence rescue requires keypoints.")
 
-    device = person_logits.device
+    device = pose_quality_logits.device
     sigmas = UNION_SIGMAS.to(device=device)
-    total_loss = person_logits.sum() * 0.0
-    target_sum = person_logits.new_zeros(())
-    prediction_sum = person_logits.new_zeros(())
-    target_sq_sum = person_logits.new_zeros(())
-    prediction_sq_sum = person_logits.new_zeros(())
+    total_loss = pose_quality_logits.sum() * 0.0
+    target_sum = pose_quality_logits.new_zeros(())
+    prediction_sum = pose_quality_logits.new_zeros(())
+    target_sq_sum = pose_quality_logits.new_zeros(())
+    prediction_sq_sum = pose_quality_logits.new_zeros(())
     count = 0
+    positive_count = 0
 
     for batch_idx, target in enumerate(targets):
         valid_queries = torch.nonzero(box_mask[batch_idx].bool(), as_tuple=False).flatten()
@@ -668,9 +938,10 @@ def compute_person_confidence_quality_loss(
         if not include.any():
             continue
 
-        instance_quality = person_logits.new_zeros((n,), dtype=torch.float32)
+        instance_quality = pose_quality_logits.new_zeros((n,), dtype=torch.float32)
         quality_mask = matched & supervised
         if quality_mask.any():
+            positive_count += int(quality_mask.sum().item())
             pred_xy = keypoints[batch_idx, queries[quality_mask], :, :2].detach()
             joint_quality = per_joint_oks_score(
                 pred_xy,
@@ -685,12 +956,8 @@ def compute_person_confidence_quality_loss(
             ).detach().clamp(0.0, 1.0)
 
         instance_quality = instance_quality[include]
-        logits = person_logits[batch_idx, queries[include]].float()
-        per_instance = F.binary_cross_entropy_with_logits(
-            logits,
-            instance_quality.float(),
-            reduction="none",
-        )
+        logits = pose_quality_logits[batch_idx, queries[include]].float()
+        per_instance = _quality_focal_loss(logits, instance_quality.float())
         total_loss = total_loss + per_instance.sum()
         probabilities = logits.sigmoid().detach()
         target_sum = target_sum + instance_quality.sum()
@@ -699,13 +966,14 @@ def compute_person_confidence_quality_loss(
         prediction_sq_sum = prediction_sq_sum + probabilities.square().sum()
         count += int(instance_quality.numel())
 
-    denom = max(count, 1)
+    denom = max(positive_count, 1)
     loss = total_loss / denom
-    mean_target = target_sum / denom
-    mean_prediction = prediction_sum / denom
-    target_std = (target_sq_sum / denom - mean_target.square()).clamp(min=0.0).sqrt()
+    metric_denom = max(count, 1)
+    mean_target = target_sum / metric_denom
+    mean_prediction = prediction_sum / metric_denom
+    target_std = (target_sq_sum / metric_denom - mean_target.square()).clamp(min=0.0).sqrt()
     prediction_std = (
-        prediction_sq_sum / denom - mean_prediction.square()
+        prediction_sq_sum / metric_denom - mean_prediction.square()
     ).clamp(min=0.0).sqrt()
     return loss, {
         "loss_person_confidence": loss,
@@ -714,7 +982,10 @@ def compute_person_confidence_quality_loss(
         "person_quality_target_std": target_std.detach(),
         "person_confidence_mean": mean_prediction.detach(),
         "person_confidence_std": prediction_std.detach(),
-        "person_confidence_instances": person_logits.new_tensor(float(count)),
+        "person_confidence_instances": pose_quality_logits.new_tensor(float(count)),
+        "pose_score_positive_instances": pose_quality_logits.new_tensor(
+            float(positive_count)
+        ),
     }
 
 
@@ -790,64 +1061,43 @@ def compute_box_conditioned_pose_losses(
         pred_keypoints_all = outputs["keypoints"][b, q]
         schema_valid_all = outputs["keypoint_valid_mask"][b].to(device).bool().view(1, -1).expand(n, -1)
 
-        # Confidence supervision is query-aware. GT-box Stage1 trains missing
-        # joints as weak negatives only for people that contain at least one
-        # annotation. Stage2 additionally turns every unmatched generated box
-        # into a full-strength negative without applying coordinate loss.
+        # Per-joint visibility/presence belongs only to matched people.  It is
+        # not an OKS score, and unmatched proposals must not flood this head with
+        # artificial all-zero skeletons.
         supervised_people = gt_valid.any(dim=-1)
         matched_gt_indices = target.get("matched_gt_indices")
         if matched_gt_indices is not None:
             matched_people = matched_gt_indices.to(device)[:n].ge(0)
-            confidence_people = supervised_people | ~matched_people
-            unmatched_people = ~matched_people
         else:
-            confidence_people = supervised_people
-            unmatched_people = torch.zeros_like(supervised_people)
+            matched_people = supervised_people
 
-        confidence_logits_all = outputs.get("keypoint_confidence_logits")
-        if torch.is_tensor(confidence_logits_all) and confidence_people.any():
-            confidence_logits = confidence_logits_all[b, q][confidence_people]
-            confidence_pred_xy = pred_keypoints_all[confidence_people, :, :2].detach()
-            confidence_gt = gt_keypoints[confidence_people]
-            confidence_valid = gt_valid[confidence_people]
-            confidence_schema = schema_valid_all[confidence_people]
-            confidence_areas = loss_areas[confidence_people]
-            confidence_unmatched = unmatched_people[confidence_people]
-            confidence_targets = per_joint_oks_score(
-                confidence_pred_xy,
-                confidence_gt[..., :2],
-                confidence_areas,
-                sigmas,
-            ).detach()
-            confidence_targets = torch.where(
-                confidence_valid,
-                confidence_targets,
-                torch.zeros_like(confidence_targets),
+        visibility_valid = target.get("visibility_valid", gt_valid).to(device)[:n].bool()
+        visibility_people = matched_people & visibility_valid.any(dim=-1)
+        visibility_logits_all = outputs.get(
+            "pred_keypoint_visibility_logits",
+            outputs.get("keypoint_confidence_logits"),
+        )
+        if torch.is_tensor(visibility_logits_all) and visibility_people.any():
+            visibility_logits = visibility_logits_all[b, q][visibility_people]
+            visibility_targets = gt_keypoints[visibility_people, :, 2].float()
+            visibility_mask = (
+                schema_valid_all[visibility_people]
+                & visibility_valid[visibility_people]
             )
-            if confidence_unmatched.any():
-                confidence_targets[confidence_unmatched] = 0.0
-            # Missing/undefined GT joints are ignored for matched people rather
-            # than treated as visibility negatives. Unmatched generated boxes
-            # supervise every schema joint as a full-strength zero-quality negative.
-            confidence_mask = confidence_schema & (
-                confidence_valid | confidence_unmatched[:, None]
-            )
-            confidence_weights = torch.ones_like(confidence_targets)
-            confidence_joint_loss = F.binary_cross_entropy_with_logits(
-                confidence_logits,
-                confidence_targets,
+            visibility_joint_loss = F.binary_cross_entropy_with_logits(
+                visibility_logits,
+                visibility_targets,
                 reduction="none",
             )
-            weighted_mask = confidence_weights * confidence_mask.float()
-            confidence_per_instance = (
-                (confidence_joint_loss * weighted_mask).sum(dim=-1)
-                / weighted_mask.sum(dim=-1).clamp(min=1.0)
+            visibility_per_instance = (
+                (visibility_joint_loss * visibility_mask.float()).sum(dim=-1)
+                / visibility_mask.float().sum(dim=-1).clamp(min=1.0)
             )
-            valid_confidence_people = confidence_mask.any(dim=-1)
-            total_confidence = total_confidence + confidence_per_instance[
-                valid_confidence_people
+            valid_visibility_people = visibility_mask.any(dim=-1)
+            total_confidence = total_confidence + visibility_per_instance[
+                valid_visibility_people
             ].sum()
-            num_confidence_instances += int(valid_confidence_people.sum().item())
+            num_confidence_instances += int(valid_visibility_people.sum().item())
 
         if not supervised_people.any():
             continue
@@ -923,6 +1173,9 @@ def compute_box_conditioned_pose_losses(
         "loss_hard_joint": total_hard_joint / max(num_hard_groups, 1),
         "loss_keypoint_confidence": total_confidence / max(num_confidence_instances, 1),
     }
+    loss_parts["loss_keypoint_visibility"] = loss_parts[
+        "loss_keypoint_confidence"
+    ]
     for decoder_idx, total_decoder in enumerate(total_decoder_coord, start=1):
         loss_parts[f"loss_coord_decoder_{decoder_idx}"] = total_decoder / denom
     if "coarse_keypoints" in outputs:

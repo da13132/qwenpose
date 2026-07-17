@@ -34,9 +34,15 @@ from .schemas import (
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 11
+RECORD_CACHE_VERSION = 12
 
 ALL_POSE_PROMPT = "Locate all the instances that match the following description: person."
+
+
+def build_refhuman_locate_prompt(ref_text: str) -> str:
+    """Return the single canonical LocateAnything referring-person prompt."""
+    ref_text = " ".join(str(ref_text or "").strip().split()) or "person"
+    return f'Locate the person that matches the following description: "{ref_text}".'
 
 DATASET_BOX_CONTEXT_SCALE = {
     "coco": 1.15,
@@ -156,6 +162,86 @@ def _start_cache_build_heartbeat(lock_path: Path, interval_seconds: float = 5.0)
     thread = Thread(target=_heartbeat, name=f"cache-heartbeat-{lock_path.name}", daemon=True)
     thread.start()
     return stop_event, thread
+
+
+LOCATE_PROMPT_CACHE_VERSION = 2
+# Backward-compatible export name used by older callers/tests. Version 2 is a
+# deliberately incompatible, full-prompt cache (pooled + token states).
+REFHUMAN_TEXT_CACHE_VERSION = LOCATE_PROMPT_CACHE_VERSION
+
+
+def normalize_refhuman_text(text: str) -> str:
+    """Canonicalize RefHuman captions before cache lookup."""
+    return " ".join(str(text or "").strip().split())
+
+
+def normalize_locate_prompt(prompt: str) -> str:
+    """Canonicalize a complete LocateAnything prompt before hashing."""
+    return " ".join(str(prompt or "").strip().split())
+
+
+def locate_prompt_embedding_key(prompt: str) -> str:
+    normalized = normalize_locate_prompt(prompt)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def refhuman_text_embedding_key(text: str) -> str:
+    """Compatibility helper mapping a caption to its canonical full prompt key."""
+    return locate_prompt_embedding_key(build_refhuman_locate_prompt(text))
+
+
+def load_refhuman_text_embedding_cache(
+    path: Path | str | None,
+) -> tuple[dict[str, torch.Tensor], int]:
+    """Load a caption-keyed frozen LocateAnything text-embedding cache."""
+    if path is None or not str(path).strip():
+        return {}, 0
+    cache_path = Path(path).expanduser()
+    if not cache_path.is_file():
+        raise FileNotFoundError(
+            f"RefHuman text embedding cache does not exist: {cache_path}. "
+            "Run scripts/cache_refhuman_text_embeddings.py first."
+        )
+    try:
+        # The v2 cache also contains future token-level features. mmap keeps
+        # four Stage1 DDP workers from each materializing several GB of token
+        # tensors when the current pooled path only touches small vectors.
+        payload = torch.load(
+            cache_path, map_location="cpu", weights_only=False, mmap=True
+        )
+    except TypeError:
+        payload = torch.load(cache_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"Invalid RefHuman text cache payload in {cache_path}.")
+    version = int(payload.get("version", -1))
+    if version != REFHUMAN_TEXT_CACHE_VERSION:
+        raise ValueError(
+            f"Unsupported RefHuman text cache version {version}; "
+            f"expected {REFHUMAN_TEXT_CACHE_VERSION}."
+        )
+    raw_embeddings = payload.get("pooled_embeddings", payload.get("embeddings"))
+    if not isinstance(raw_embeddings, dict) or not raw_embeddings:
+        raise ValueError(f"RefHuman text cache has no embeddings: {cache_path}")
+    hidden_dim = int(payload.get("hidden_dim", 0))
+    embeddings: dict[str, torch.Tensor] = {}
+    for key, value in raw_embeddings.items():
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value)
+        vector = value.detach().cpu().flatten().contiguous()
+        if hidden_dim <= 0:
+            hidden_dim = int(vector.numel())
+        if int(vector.numel()) != hidden_dim:
+            raise ValueError(
+                f"RefHuman cache vector {key!r} has {int(vector.numel())} values; "
+                f"expected {hidden_dim}."
+            )
+        embeddings[str(key)] = vector
+    raw_tokens = payload.get("token_embeddings")
+    if not isinstance(raw_tokens, dict) or set(raw_tokens) != set(embeddings):
+        raise ValueError(
+            f"Locate prompt cache must contain token_embeddings for every pooled prompt: {cache_path}"
+        )
+    return embeddings, hidden_dim
 
 
 @dataclass
@@ -573,6 +659,9 @@ class PoseRecordDataset(Dataset):
         use_prompts: bool = True,
         letterbox_size: int | None = None,
         letterbox_fill: int = 127,
+        refhuman_text_embeddings: dict[str, torch.Tensor] | None = None,
+        refhuman_text_embedding_dim: int = 0,
+        require_cached_refhuman_text: bool = False,
     ) -> None:
         self.records = records
         self.max_instances = max_instances
@@ -587,6 +676,9 @@ class PoseRecordDataset(Dataset):
             else None
         )
         self.letterbox_fill = max(0, min(int(letterbox_fill), 255))
+        self.refhuman_text_embeddings = refhuman_text_embeddings or {}
+        self.refhuman_text_embedding_dim = max(int(refhuman_text_embedding_dim), 0)
+        self.require_cached_refhuman_text = bool(require_cached_refhuman_text)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -749,6 +841,22 @@ class PoseRecordDataset(Dataset):
             output_width, output_height = record.width, record.height
             letterbox_metadata = (0, 0, record.width, record.height)
 
+        cached_text_embedding = torch.zeros(
+            self.refhuman_text_embedding_dim, dtype=torch.float32
+        )
+        cached_text_embedding_valid = False
+        if self.refhuman_text_embedding_dim > 0:
+            cache_key = locate_prompt_embedding_key(record.prompt)
+            cached = self.refhuman_text_embeddings.get(cache_key)
+            if cached is not None:
+                cached_text_embedding = cached.to(dtype=torch.float32).clone()
+                cached_text_embedding_valid = True
+            elif self.require_cached_refhuman_text:
+                raise KeyError(
+                    "Missing cached LocateAnything prompt embedding for "
+                    f"{record.prompt!r} (key={cache_key})."
+                )
+
         return {
             "image": image,
             "vision_image": vision_image,
@@ -781,8 +889,16 @@ class PoseRecordDataset(Dataset):
                 "letterbox_resized_width": int(letterbox_metadata[2]),
                 "letterbox_resized_height": int(letterbox_metadata[3]),
             },
-            "prompt": record.prompt if self.use_prompts else "",
-            "ref_text": record.ref_text if self.use_prompts else "",
+            # Keep the canonical prompt as task metadata even when the visual
+            # backbone is vision-only. Callers already pass ``None`` to that
+            # processor; erasing this string would break cache diagnostics and
+            # make Stage1/Stage2/Stage3 prompt-contract checks impossible.
+            "prompt": record.prompt,
+            "ref_text": record.ref_text,
+            "cached_text_embedding": cached_text_embedding,
+            "cached_text_embedding_valid": torch.tensor(
+                cached_text_embedding_valid, dtype=torch.bool
+            ),
         }
 
 
@@ -809,7 +925,7 @@ class EpochRandomRefHumanDataset(PoseRecordDataset):
             tuple[str, tuple[float, float, float, float]], list[PoseRecord]
         ] = defaultdict(list)
         for record in records:
-            grouped_records[_refhuman_instance_key(record)].append(record)
+            grouped_records[refhuman_instance_key(record)].append(record)
 
         representatives: list[PoseRecord] = []
         caption_pools: list[list[PoseRecord]] = []
@@ -1061,6 +1177,12 @@ def pose_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "targets": [item["target"] for item in batch],
         "prompts": [item["prompt"] for item in batch],
         "ref_texts": [item.get("ref_text", "") for item in batch],
+        "cached_text_embeddings": torch.stack(
+            [item["cached_text_embedding"] for item in batch], dim=0
+        ),
+        "cached_text_embedding_mask": torch.stack(
+            [item["cached_text_embedding_valid"] for item in batch], dim=0
+        ),
         "image_paths": [item["image_path"] for item in batch],
         "source_datasets": [item.get("source_dataset", item["target"].get("dataset", "")) for item in batch],
     }
@@ -1722,6 +1844,7 @@ def load_refhuman_records(
     root: Path,
     split: str = "train",
     max_samples: int | None = None,
+    max_instances: int | None = None,
 ) -> list[PoseRecord]:
     ann_path = root / f"RefHuman_{split}.json"
     image_root = root / "images"
@@ -1750,6 +1873,9 @@ def load_refhuman_records(
         expression_rows.append((img, ann, candidate_key, caption))
 
     records: list[PoseRecord] = []
+    selected_instance_keys: set[
+        tuple[str, tuple[float, float, float, float]]
+    ] = set()
     for img, ann, target_key, caption in expression_rows:
         group_key = f"{img['file_name']}::{img.get('original_id', img.get('origin_id', img['file_name']))}"
         candidates = grouped_candidates[group_key]
@@ -1768,7 +1894,8 @@ def load_refhuman_records(
             visibility_masks.append(visibility_valid)
         if ref_target < 0:
             continue
-        prompt = f'Locate a single person that matches the following description: "{caption}".'
+        prompt = build_refhuman_locate_prompt(caption)
+        previous_count = len(records)
         _record_if_valid(
             records,
             image_root / img["file_name"],
@@ -1786,12 +1913,24 @@ def load_refhuman_records(
             ref_target=ref_target,
             visibility_valid=visibility_masks,
         )
+        if len(records) == previous_count:
+            continue
+        instance_key = refhuman_instance_key(records[-1])
+        if (
+            max_instances is not None
+            and int(max_instances) > 0
+            and instance_key not in selected_instance_keys
+            and len(selected_instance_keys) >= int(max_instances)
+        ):
+            records.pop()
+            break
+        selected_instance_keys.add(instance_key)
         if max_samples and len(records) >= max_samples:
             break
     return records
 
 
-def _refhuman_instance_key(record: PoseRecord) -> tuple[str, tuple[float, float, float, float]]:
+def refhuman_instance_key(record: PoseRecord) -> tuple[str, tuple[float, float, float, float]]:
     if record.ref_target < 0 or record.ref_target >= int(record.boxes_xyxy.shape[0]):
         return (str(record.image_path), (0.0, 0.0, 0.0, 0.0))
     target_box = record.boxes_xyxy[int(record.ref_target)]
@@ -1821,8 +1960,13 @@ def build_datasets(
     record_cache_dir: Path | None = Path(".cache/qwenpose_records"),
     disable_record_cache: bool = False,
     show_progress: bool = True,
+    refhuman_text_embedding_cache: Path | str | None = None,
+    require_cached_refhuman_text: bool = False,
 ) -> Dataset:
     named_datasets: list[tuple[str, Dataset]] = []
+    text_embeddings, text_embedding_dim = load_refhuman_text_embedding_cache(
+        refhuman_text_embedding_cache
+    )
     weights = parse_dataset_mix_weights(dataset_mix_weights)
     overall_started = time.perf_counter()
     progress_bar = None
@@ -1946,6 +2090,9 @@ def build_datasets(
             "use_prompts": use_prompts,
             "letterbox_size": letterbox_size,
             "letterbox_fill": letterbox_fill,
+            "refhuman_text_embeddings": text_embeddings,
+            "refhuman_text_embedding_dim": text_embedding_dim,
+            "require_cached_refhuman_text": require_cached_refhuman_text,
         }
         if name == "refhuman" and refhuman_max_captions_per_instance > 0:
             pose_dataset: Dataset = EpochRandomRefHumanDataset(

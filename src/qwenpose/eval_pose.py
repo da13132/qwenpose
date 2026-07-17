@@ -151,8 +151,7 @@ def predictions_to_coco_results(
         img_id = image_id_map[image_id_str]
         # Keypoints are already in absolute image coordinates.
         for pred in row["predictions"]:
-            person_score = float(pred["person_score"])
-            all_kpts = pred["keypoints"]  # [U, 3] with x, y, vis in absolute coords
+            all_kpts = pred["keypoints"]  # [U, 3] with x, y, visibility
 
             # Extract COCO17 keypoints (already in absolute coords from tensor_to_prediction_rows)
             coco_kpts = []
@@ -160,8 +159,11 @@ def predictions_to_coco_results(
                 kpt_idx = int(kpt_idx)
                 kx = float(all_kpts[kpt_idx][0])
                 ky = float(all_kpts[kpt_idx][1])
-                kvis = float(all_kpts[kpt_idx][2])
-                coco_kpts.extend([kx, ky, kvis])
+                # Official COCO OKS ignores the prediction's third channel, but
+                # several wrappers incorrectly use it to zero coordinates. Keep
+                # all model x/y values and serialize a stable present marker;
+                # learned visibility remains available in the full prediction.
+                coco_kpts.extend([kx, ky, 1.0])
 
             if "score" not in pred:
                 raise KeyError(
@@ -175,6 +177,34 @@ def predictions_to_coco_results(
                 "keypoints": coco_kpts,
                 "score": score,
             })
+    return results
+
+
+def predictions_to_coco_bbox_results(
+    predictions_rows: list[dict],
+    image_id_map: dict[str, int],
+) -> list[dict]:
+    """Convert predictions to the official single-class COCO bbox format."""
+    results: list[dict] = []
+    for row in predictions_rows:
+        mapped_image_id = image_id_map.get(str(row["image_id"]))
+        if mapped_image_id is None:
+            continue
+        for prediction in row.get("predictions", []):
+            xyxy = prediction.get("bbox_2d", [])
+            if len(xyxy) != 4:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in xyxy)
+            results.append(
+                {
+                    "image_id": mapped_image_id,
+                    "category_id": 1,
+                    "bbox": [x1, y1, max(x2 - x1, 0.0), max(y2 - y1, 0.0)],
+                    "score": float(
+                        prediction.get("box_score", prediction.get("person_score", 0.0))
+                    ),
+                }
+            )
     return results
 
 
@@ -224,6 +254,27 @@ def compute_coco_keypoint_ap(
         else:
             metrics[name] = 0.0
     return metrics
+
+
+def compute_coco_bbox_ap(
+    coco_gt_dict: dict,
+    coco_results: list[dict],
+) -> dict[str, float]:
+    """Compute COCO bbox AP for the person category."""
+    names = ["AP", "AP50", "AP75", "APs", "APm", "APl", "AR1", "AR10", "AR", "ARs", "ARm", "ARl"]
+    if not coco_results:
+        return {name: 0.0 for name in names}
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    coco_gt = COCO()
+    coco_gt.dataset = coco_gt_dict
+    coco_gt.createIndex()
+    evaluator = COCOeval(coco_gt, coco_gt.loadRes(coco_results), "bbox")
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
+    return {name: float(evaluator.stats[index]) for index, name in enumerate(names)}
 
 
 def compute_official_coco_keypoint_ap(
@@ -287,6 +338,56 @@ def compute_official_coco_keypoint_ap(
     evaluator.accumulate()
     evaluator.summarize()
     names = ["AP", "AP50", "AP75", "APm", "APl", "AR", "AR50", "AR75", "ARm", "ARl"]
+    return {name: float(evaluator.stats[index]) for index, name in enumerate(names)}
+
+
+def compute_official_coco_bbox_ap(
+    prediction_rows: list[dict],
+    dataset_root: Path,
+    split: str,
+) -> dict[str, float]:
+    """Evaluate independent human boxes with official COCO bbox AP."""
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    coco_split = split if split.endswith("2017") else f"{split}2017"
+    annotation_path = (
+        dataset_root / "coco" / "annotations" / f"person_keypoints_{coco_split}.json"
+    )
+    if not annotation_path.is_file():
+        raise FileNotFoundError(f"Official COCO annotations not found: {annotation_path}")
+    results: list[dict] = []
+    image_ids: set[int] = set()
+    for row in prediction_rows:
+        if row.get("dataset") != "coco":
+            continue
+        image_id = int(row["image_id"])
+        image_ids.add(image_id)
+        for prediction in row.get("predictions", []):
+            xyxy = prediction.get("bbox_2d", [])
+            if len(xyxy) != 4:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in xyxy)
+            results.append(
+                {
+                    "image_id": image_id,
+                    "category_id": 1,
+                    "bbox": [x1, y1, max(x2 - x1, 0.0), max(y2 - y1, 0.0)],
+                    "score": float(
+                        prediction.get("box_score", prediction.get("person_score", 0.0))
+                    ),
+                }
+            )
+    names = ["AP", "AP50", "AP75", "APs", "APm", "APl", "AR1", "AR10", "AR", "ARs", "ARm", "ARl"]
+    if not image_ids or not results:
+        return {name: 0.0 for name in names}
+    coco_gt = COCO(str(annotation_path))
+    evaluator = COCOeval(coco_gt, coco_gt.loadRes(results), "bbox")
+    evaluator.params.imgIds = sorted(image_ids)
+    evaluator.params.catIds = [1]
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
     return {name: float(evaluator.stats[index]) for index, name in enumerate(names)}
 
 
@@ -641,27 +742,53 @@ def tensor_to_prediction_rows(
     raw_boxes_abs: list[list[list[float]]] | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
-    if not bool(outputs.get("person_confidence_head_available", False)):
-        raise RuntimeError(
-            "Official COCO pose evaluation requires a trained person confidence "
-            "head. Refusing to rank poses with fixed person logits or an implicit "
-            "keypoint-confidence fallback."
+    if not bool(
+        outputs.get(
+            "pose_score_head_available",
+            outputs.get("person_confidence_head_available", False),
         )
-    detection_scores = outputs["person_logits"].sigmoid().detach().cpu()
+    ):
+        raise RuntimeError(
+            "Official COCO pose evaluation requires a trained direct pose-score "
+            "head (the former person confidence head). Refusing to derive "
+            "instance scores from joint visibility."
+        )
+    person_class_logits = outputs.get("person_class_logits")
+    if not torch.is_tensor(person_class_logits):
+        pred_logits = outputs.get("pred_logits")
+        person_class_logits = (
+            pred_logits.squeeze(-1)
+            if torch.is_tensor(pred_logits)
+            else outputs["person_logits"]
+        )
+    person_scores = person_class_logits.sigmoid().detach().cpu()
+    pred_box_logits = outputs.get("pred_box_logits")
+    box_quality_logits = outputs.get("box_quality_logits")
+    box_quality_scores = (
+        box_quality_logits.sigmoid().detach().cpu()
+        if torch.is_tensor(box_quality_logits)
+        else torch.ones_like(person_scores)
+    )
+    if torch.is_tensor(pred_box_logits):
+        box_ap_scores = pred_box_logits.sigmoid().detach().cpu()
+    else:
+        box_ap_scores = person_scores * box_quality_scores
     ref_logits = outputs["ref_logits"].detach().cpu()
+    pred_pose_logits = outputs.get("pred_pose_logits")
     pose_quality_logits = outputs.get("pose_quality_logits")
     pose_quality_scores = (
         pose_quality_logits.sigmoid().detach().cpu()
         if torch.is_tensor(pose_quality_logits)
-        else detection_scores
+        else torch.ones_like(person_scores)
     )
+    if torch.is_tensor(pred_pose_logits):
+        pose_ap_scores = pred_pose_logits.sigmoid().detach().cpu()
+    else:
+        pose_ap_scores = person_scores * pose_quality_scores
     ref_match_scores = ref_logits.sigmoid()
     ref_quality_alpha = max(float(getattr(args, "ref_pose_quality_alpha", 0.25)), 0.0)
-    ref_final_scores = ref_match_scores * pose_quality_scores.clamp_min(1e-6).pow(
-        ref_quality_alpha
-    )
     box_mask = outputs.get("box_mask")
-    box_mask_cpu = box_mask.detach().cpu().bool() if box_mask is not None else torch.ones_like(detection_scores, dtype=torch.bool)
+    box_mask_cpu = box_mask.detach().cpu().bool() if box_mask is not None else torch.ones_like(person_scores, dtype=torch.bool)
     refinement_fallback = outputs.get("ref_box_refinement_fallback_mask")
     refinement_fallback_cpu = (
         refinement_fallback.detach().cpu().bool()
@@ -669,7 +796,6 @@ def tensor_to_prediction_rows(
         else torch.zeros_like(box_mask_cpu)
     )
     boxes = outputs["boxes"].detach().cpu()
-    pose_boxes = outputs.get("pose_boxes", outputs["boxes"]).detach().cpu()
     keypoints = outputs["keypoints"].detach().cpu()
     schema_valid_output = outputs.get("keypoint_valid_mask")
     if torch.is_tensor(schema_valid_output):
@@ -680,9 +806,9 @@ def tensor_to_prediction_rows(
         ).cpu()
     else:
         pose_scores_all = keypoints[..., 2].mean(dim=-1)
-    # Canonical COCO ranking score: one learned scalar per pose query. Joint
-    # quality remains diagnostic metadata and is never multiplied into score.
-    final_scores = detection_scores
+    # Box and keypoint AP intentionally use separate direct scores. Candidate
+    # selection is the union of box-ranked and pose-ranked NMS survivors so a
+    # low box score cannot erase an otherwise strong pose (and vice versa).
     for b, target in enumerate(batch["targets"]):
         width = float(target["width"])
         height = float(target["height"])
@@ -695,31 +821,60 @@ def tensor_to_prediction_rows(
         )
         valid = torch.nonzero(box_mask_cpu[b], as_tuple=False).flatten()
         direct_refhuman = task_id == 1 and valid.numel() == 1
+        ref_probabilities = torch.zeros_like(ref_match_scores[b])
+        if valid.numel() > 0:
+            ref_probabilities[valid] = torch.softmax(ref_logits[b, valid], dim=0)
+        ref_final_scores = ref_probabilities * pose_ap_scores[b].clamp_min(
+            1e-6
+        ).pow(ref_quality_alpha)
         if task_id == 1:
             if valid.numel() > 0:
-                best_local = int(torch.argmax(ref_final_scores[b, valid]).item())
+                best_local = int(torch.argmax(ref_final_scores[valid]).item())
                 selected = [int(valid[best_local].item())]
             else:
                 selected = []
         else:
-            keep = valid[final_scores[b, valid] >= args.score_threshold] if valid.numel() > 0 else valid
-            if keep.numel() == 0 and valid.numel() > 0:
-                keep = valid[:1]
-            nms_scores = final_scores[b, keep] if keep.numel() > 0 else torch.zeros(0)
+            pose_keep = (
+                valid[pose_ap_scores[b, valid] >= args.score_threshold]
+                if valid.numel() > 0
+                else valid
+            )
+            box_keep = (
+                valid[box_ap_scores[b, valid] >= args.score_threshold]
+                if valid.numel() > 0
+                else valid
+            )
+            if pose_keep.numel() == 0 and valid.numel() > 0:
+                pose_keep = valid[torch.argmax(pose_ap_scores[b, valid])].view(1)
+            if box_keep.numel() == 0 and valid.numel() > 0:
+                box_keep = valid[torch.argmax(box_ap_scores[b, valid])].view(1)
             if str(getattr(args, "box_source", "")).lower() == "gt":
                 # GT-box evaluation already has one query per annotated person;
                 # box NMS could incorrectly remove distinct crowded instances.
-                order = torch.argsort(nms_scores, descending=True)
-                order = order[: max(int(args.max_predictions_per_image), 0)]
-                selected = [int(keep[idx].item()) for idx in order.tolist()]
+                pose_order = torch.argsort(
+                    pose_ap_scores[b, pose_keep], descending=True
+                )[: max(int(args.max_predictions_per_image), 0)]
+                box_order = torch.argsort(
+                    box_ap_scores[b, box_keep], descending=True
+                )[: max(int(args.max_predictions_per_image), 0)]
+                pose_selected = [int(pose_keep[idx].item()) for idx in pose_order]
+                box_selected = [int(box_keep[idx].item()) for idx in box_order]
             else:
-                kept_local = nms_box_indices_xyxy(
-                    detection_boxes[keep],
-                    nms_scores,
+                pose_local = nms_box_indices_xyxy(
+                    detection_boxes[pose_keep],
+                    pose_ap_scores[b, pose_keep],
                     iou_thresh=float(getattr(args, "post_pose_nms_iou_thresh", 0.95)),
                     max_boxes=args.max_predictions_per_image,
                 )
-                selected = [int(keep[idx].item()) for idx in kept_local]
+                box_local = nms_box_indices_xyxy(
+                    detection_boxes[box_keep],
+                    box_ap_scores[b, box_keep],
+                    iou_thresh=float(getattr(args, "post_box_nms_iou_thresh", 0.65)),
+                    max_boxes=args.max_predictions_per_image,
+                )
+                pose_selected = [int(pose_keep[idx].item()) for idx in pose_local]
+                box_selected = [int(box_keep[idx].item()) for idx in box_local]
+            selected = list(dict.fromkeys(pose_selected + box_selected))
 
         predictions = []
         for query_idx in selected:
@@ -730,30 +885,31 @@ def tensor_to_prediction_rows(
                 box[2] * width,
                 box[3] * height,
             ]
-            pose_box = pose_boxes[b, query_idx].tolist()
-            pose_box_abs = [
-                pose_box[0] * width,
-                pose_box[1] * height,
-                pose_box[2] * width,
-                pose_box[3] * height,
-            ]
             kp = keypoints[b, query_idx].clone()
             kp[:, 0] *= width
             kp[:, 1] *= height
             prediction_score = (
-                pose_quality_scores[b, query_idx]
+                pose_ap_scores[b, query_idx]
                 if direct_refhuman
-                else ref_final_scores[b, query_idx]
+                else ref_final_scores[query_idx]
                 if task_id == 1
-                else final_scores[b, query_idx]
+                else pose_ap_scores[b, query_idx]
             )
             prediction = {
                 "query": query_idx,
-                "person_score": float(detection_scores[b, query_idx].item()),
-                "pose_score": float(pose_scores_all[b, query_idx].item()),
+                "category_id": 1,
+                "category_name": "person",
+                "person_score": float(box_ap_scores[b, query_idx].item()),
+                "box_quality_score": float(box_quality_scores[b, query_idx].item()),
+                "box_score": float(box_ap_scores[b, query_idx].item()),
+                "pose_score": float(pose_ap_scores[b, query_idx].item()),
+                "joint_score": float(pose_scores_all[b, query_idx].item()),
                 "pose_quality_score": float(pose_quality_scores[b, query_idx].item()),
                 "score": float(prediction_score.item()),
+                # Raw sigmoid is retained as a diagnostic. Candidate selection
+                # above uses the cross-query softmax probability.
                 "ref_score": float(ref_match_scores[b, query_idx].item()),
+                "ref_probability": float(ref_probabilities[query_idx].item()),
                 "ref_grounding_mode": (
                     "direct" if direct_refhuman else "candidate_fallback"
                 ) if task_id == 1 else None,
@@ -761,7 +917,6 @@ def tensor_to_prediction_rows(
                     refinement_fallback_cpu[b, query_idx].item()
                 ),
                 "bbox_2d": box_abs,
-                "pose_bbox_2d": pose_box_abs,
                 "keypoints": kp.tolist(),
             }
             if query_idx < len(sample_raw_boxes) and len(sample_raw_boxes[query_idx]) == 4:
@@ -1145,6 +1300,9 @@ def main() -> None:
                                     vis_path,
                                     sample_idx=local_idx,
                                     max_instances=args.visualize_max_instances,
+                                    score_threshold=args.score_threshold,
+                                    prediction_row=rows_by_mode[mode][local_idx],
+                                    ref_pose_quality_alpha=args.ref_pose_quality_alpha,
                                 )
                                 visualized_samples[mode] += 1
                     batches += 1
@@ -1183,8 +1341,9 @@ def main() -> None:
         for mode in decode_modes
     }
     official_coco_metrics_by_mode: dict[str, dict[str, float]] = {}
+    official_coco_bbox_metrics_by_mode: dict[str, dict[str, float]] = {}
     if "coco" in dataset_names:
-        print("Computing official pycocotools COCO keypoint AP...")
+        print("Computing official pycocotools COCO keypoint and bbox AP...")
         official_coco_metrics_by_mode = {
             mode: compute_official_coco_keypoint_ap(
                 all_predictions_rows[mode],
@@ -1193,9 +1352,20 @@ def main() -> None:
             )
             for mode in decode_modes
         }
+        official_coco_bbox_metrics_by_mode = {
+            mode: compute_official_coco_bbox_ap(
+                all_predictions_rows[mode],
+                args.dataset_root,
+                args.split,
+            )
+            for mode in decode_modes
+        }
     print(json.dumps(pose_metrics_by_mode, ensure_ascii=False, indent=2))
     if official_coco_metrics_by_mode:
-        print(json.dumps({"official_coco": official_coco_metrics_by_mode}, ensure_ascii=False, indent=2))
+        print(json.dumps({
+            "official_coco_keypoints": official_coco_metrics_by_mode,
+            "official_coco_bbox": official_coco_bbox_metrics_by_mode,
+        }, ensure_ascii=False, indent=2))
 
     predictions_json_paths = {
         mode: mode_output_dirs[mode] / "predictions.json"
@@ -1232,6 +1402,7 @@ def main() -> None:
             "ap_metrics": metrics.get("overall_ap", {}),
             "ap_metrics_per_dataset": metrics.get("per_dataset", {}),
             "official_coco_keypoint_metrics": official_coco_metrics_by_mode.get(mode),
+            "official_coco_bbox_metrics": official_coco_bbox_metrics_by_mode.get(mode),
             "predictions_jsonl": str(predictions_paths[mode]),
             "predictions_json": str(predictions_json_paths[mode]),
             "visualizations_dir": str(visualization_dirs[mode]) if args.visualize_max_samples > 0 else None,
@@ -1262,6 +1433,7 @@ def main() -> None:
         "ap_metrics": ap_metrics_all,
         "ap_metrics_per_dataset": ap_metrics_per_dataset,
         "official_coco_keypoint_metrics": official_coco_metrics_by_mode.get(primary_mode),
+        "official_coco_bbox_metrics": official_coco_bbox_metrics_by_mode.get(primary_mode),
         "predictions_jsonl": str(predictions_path),
         "predictions_json": str(predictions_json_path),
         "visualizations_dir": str(visualization_dir) if args.visualize_max_samples > 0 else None,
@@ -1308,6 +1480,14 @@ def main() -> None:
         report.append("| Metric | Value |")
         report.append("|--------|-------|")
         for key, value in official_coco_metrics.items():
+            report.append(f"| {key} | {float(value):.4f} |")
+
+    official_coco_bbox_metrics = summary.get("official_coco_bbox_metrics")
+    if official_coco_bbox_metrics:
+        report.extend(["", "## Official COCO BBox Metrics (pycocotools)", ""])
+        report.append("| Metric | Value |")
+        report.append("|--------|-------|")
+        for key, value in official_coco_bbox_metrics.items():
             report.append(f"| {key} | {float(value):.4f} |")
 
     for ds_name, ds_metrics in sorted(ap_metrics_per_dataset.items()):

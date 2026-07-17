@@ -4,6 +4,12 @@ All notable changes to this repository are recorded here, with the newest releas
 
 ## Unreleased - unified 800 LocatePose
 
+- Made the independently regressed human proposal the canonical `pred_boxes`
+  output in every LocatePose path; keypoint envelopes are now diagnostic-only.
+- Split human classification, detached-IoU box quality, detached-OKS pose
+  quality, and per-joint quality into explicit outputs and AP ranking scores.
+- Added official COCO person bbox export/evaluation alongside keypoint AP, and
+  updated inference/visualization labels to show human, box, and pose scores.
 - Restored LocateAnything autoregressive box generation as the only default LocatePose training path: `scripts/locatepose.sh` now runs frozen-GT Stage 1 followed by generated-box/coordinate-token-LM Stage 2; the temporary `locatepose4llm.sh` wrapper was removed.
 - Replaced the legacy 256/640 dual-RGB branches with one 800×800 P2/P3/P4 pose pyramid at 200×200, 100×100, and 50×50, shared without architectural changes across Stage 1/2.
 - Removed every SimCC training, decoding, evaluation, inference, and shell configuration path. Keypoint coordinates now come only from direct regression with coordinate deep supervision.

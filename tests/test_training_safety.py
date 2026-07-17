@@ -12,9 +12,7 @@ from qwenpose.eagle_lora import (
     EagleFeatureExtractor,
     PrunedEagleLMHead,
     build_eagle_lm_inputs,
-    compute_eagle_pbd_grounding_losses,
     eagle_generation_is_pruned,
-    extract_eagle_pbd_blocks_from_lm_logits,
     prune_eagle_generation_components,
 )
 from qwenpose.train_pose import (
@@ -167,76 +165,6 @@ def test_eagle_lm_inputs_supervise_only_complete_assistant_response() -> None:
         "<box><100><200><300><400></box> END",
         "None END",
     ]
-
-
-def test_pbd_grounding_loss_backpropagates_to_coordinate_logits() -> None:
-    model = _DummyEagle(hidden_size=4)
-    model.token_ids = {
-        "box_start_token_id": 8,
-        "box_end_token_id": 9,
-        "coord_start_token_id": 10,
-        "coord_end_token_id": 14,
-    }
-    extractor = EagleFeatureExtractor(
-        model,
-        refiner_layers=0,
-        feature_source="raw_visual",
-    )
-    logits = torch.randn(1, 6, 20, requires_grad=True)
-    target_ids = torch.tensor([[8, 10, 11, 12, 13, 9]])
-    gt_boxes = torch.tensor([[0.0, 0.25, 0.5, 0.75]])
-
-    losses, soft_boxes = compute_eagle_pbd_grounding_losses(
-        extractor,
-        logits,
-        target_ids,
-        gt_boxes,
-        temperature=1.0,
-    )
-    total = sum(losses.values()) + soft_boxes.sum() * 0.0
-    total.backward()
-
-    assert soft_boxes.shape == (1, 4)
-    assert logits.grad is not None
-    assert torch.isfinite(logits.grad).all()
-    assert float(logits.grad[:, 1:5].abs().sum()) > 0.0
-
-
-def test_extracts_all_batched_teacher_forced_pbd_blocks_in_response_order() -> None:
-    model = _DummyEagle(hidden_size=4)
-    model.token_ids = {
-        "box_start_token_id": 8,
-        "box_end_token_id": 9,
-        "coord_start_token_id": 10,
-        "coord_end_token_id": 14,
-    }
-    extractor = EagleFeatureExtractor(model, refiner_layers=0, feature_source="raw_visual")
-    shift_labels = torch.tensor(
-        [
-            [8, 10, 11, 12, 13, 9, 3, -100, -100, -100, -100, -100, -100],
-            [8, 14, 13, 12, 11, 9, 8, 10, 10, 14, 14, 9, 3],
-        ]
-    )
-    valid = shift_labels.ne(-100)
-    logits = torch.randn(int(valid.sum()), 20, requires_grad=True)
-
-    blocks, targets = extract_eagle_pbd_blocks_from_lm_logits(
-        extractor,
-        logits,
-        shift_labels,
-        valid,
-        torch.tensor([1, 2]),
-    )
-
-    assert blocks.shape == (3, 6, 20)
-    assert targets.tolist() == [
-        [8, 10, 11, 12, 13, 9],
-        [8, 14, 13, 12, 11, 9],
-        [8, 10, 10, 14, 14, 9],
-    ]
-    blocks.sum().backward()
-    assert logits.grad is not None
-    assert int(torch.count_nonzero(logits.grad)) == 3 * 6 * 20
 
 
 def test_raw_visual_extractor_has_no_lm_image_fusion_parameters() -> None:

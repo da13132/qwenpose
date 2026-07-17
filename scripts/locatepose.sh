@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# LocatePose 三阶段解耦训练：
-#   Stage 1：只加载 MoonViT + mlp1，不加载 LLM；以全局 person queries 训练
-#            无 ROI PoseHead，同时训练全部 MoonViT block 的视觉 LoRA 和完整 projector。
-#   Stage 2：加载完整 LocateAnything；冻结 PoseHead、视觉 LoRA 和 Stage1
-#            训练后的视觉 projector，只训练指定 Qwen2.5 层的 LLM LoRA。
-#   Stage 3：冻结完整 LocateAnything；使用其真实生成框训练/校准 PoseHead，
-#            解决 GT 框训练与推理生成框之间的分布差异。
+# LocatePose 三阶段训练：
+#   Stage 1：四个数据集 100% 注入带形变的 GT-derived box；先做受限 box refinement，
+#            再由当前 GroupPose decoder 回归姿态，训练 50 epoch。
+#   Stage 2：冻结 PoseHead 与视觉侧，只训练 LocateAnything grounding LLM LoRA。
+#   Stage 3：冻结 LocateAnything；四个数据集统一使用真实生成 box 校准 PoseHead。
 #
 # 阶段选择示例：
 #   bash scripts/locatepose.sh all
@@ -114,7 +112,7 @@ PYTHON="${PYTHON:-${DEFAULT_PYTHON}}"
 # ==============================================================================
 
 # RUN_ID：本次运行标识；默认使用启动时间。分开跑阶段时建议显式复用 OUTPUT_DIR。
-RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-gtbox-prepose}"
 
 # OUTPUT_DIR：三阶段共同根目录；包含 stage1、stage2、stage3、init_weights 和 logs。
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/locatepose/locatepose-3stage-${RUN_ID}}"
@@ -141,7 +139,7 @@ STAGE3_INIT_WEIGHTS_DIR="${STAGE3_INIT_WEIGHTS_DIR:-${OUTPUT_DIR}/stage3_init_we
 # DATASET_ROOT：所有数据集的共同根目录，内部包含 coco、mpii、crowdpose、refhuman。
 DATASET_ROOT="${DATASET_ROOT:-datasets}"
 
-# STAGE1_TRAIN_DATASETS：无 ROI pose-set 训练；RefHuman 读取离线文本 embedding。
+# STAGE1_TRAIN_DATASETS：四个数据集统一使用带 Locate 风格误差的 GT-derived box。
 STAGE1_TRAIN_DATASETS="${STAGE1_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 
 # STAGE2_TRAIN_DATASETS：第二阶段 grounding 恢复数据集；默认四个数据集全部参与。
@@ -152,10 +150,6 @@ STAGE3_TRAIN_DATASETS="${STAGE3_TRAIN_DATASETS:-coco,mpii,crowdpose,refhuman}"
 
 # STAGE1_DATASET_MIX_WEIGHTS：第一阶段各数据集每 epoch 的遍历倍率。
 STAGE1_DATASET_MIX_WEIGHTS="${STAGE1_DATASET_MIX_WEIGHTS:-coco:1,mpii:1,crowdpose:1,refhuman:1}"
-
-# PROMPT_EMBEDDING_CACHE：完整规范 prompt 的 prompt-only token/pooled 缓存；
-# Stage1 对全部数据集读取该缓存，因此不加载 Qwen2.5 LLM。
-PROMPT_EMBEDDING_CACHE="${PROMPT_EMBEDDING_CACHE:-${REFHUMAN_TEXT_EMBEDDING_CACHE:-.cache/qwenpose_text/locateanything_prompt_tokens.pt}}"
 
 # STAGE2_DATASET_MIX_WEIGHTS：第二阶段各数据集每 epoch 的遍历倍率。
 STAGE2_DATASET_MIX_WEIGHTS="${STAGE2_DATASET_MIX_WEIGHTS:-coco:1,mpii:1,crowdpose:1,refhuman:1}"
@@ -211,9 +205,6 @@ POSE_HIDDEN_DIM="${POSE_HIDDEN_DIM:-448}"
 # POSE_FEATURE_CHANNELS：MoonViT P2/P3 特征经 1×1 投影后的通道数。
 POSE_FEATURE_CHANNELS="${POSE_FEATURE_CHANNELS:-256}"
 
-# POSE_HUMAN_DECODER_LAYERS：旧框 decoder 兼容字段；新图中不执行。
-POSE_HUMAN_DECODER_LAYERS="${POSE_HUMAN_DECODER_LAYERS:-2}"
-
 # POSE_NUM_PERSON_QUERIES：内部多人 pose-set 候选数。
 POSE_NUM_PERSON_QUERIES="${POSE_NUM_PERSON_QUERIES:-60}"
 
@@ -238,11 +229,8 @@ POSE_DECODER_HEADS="${POSE_DECODER_HEADS:-8}"
 # POSE_DROPOUT：PoseHead Transformer dropout；默认 0。
 POSE_DROPOUT="${POSE_DROPOUT:-0}"
 
-# POSE_ROI_SIZE：旧 checkpoint 兼容字段；无 ROI 图中不使用。
-POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
-
-# POSE_BOX_CONDITION_SCALE：旧 ROI 条件兼容字段；无 ROI 图中不使用。
-POSE_BOX_CONDITION_SCALE="${POSE_BOX_CONDITION_SCALE:-1.25}"
+# POSE_BOX_CONDITION_SCALE：tight box 外扩后的多尺度视觉/注意力上下文倍率。
+POSE_BOX_CONDITION_SCALE="${POSE_BOX_CONDITION_SCALE:-1.15}"
 
 # POSE_DEFORMABLE_POINTS：人体框和关键点可变形注意力每层每尺度采样点数。
 POSE_DEFORMABLE_POINTS="${POSE_DEFORMABLE_POINTS:-4}"
@@ -307,8 +295,7 @@ STAGE1_EPOCHS="${STAGE1_EPOCHS:-50}"
 # STAGE1_MAX_STEPS：Stage1 optimizer step 上限；0 表示只由 epoch 控制。
 STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-0}"
 
-# STAGE1_BATCH_SIZE：Stage1 单卡 micro-batch。新无 ROI Pose DETR 图默认保守使用 4；
-# 更大的历史实测数据来自旧图，不能直接作为当前结构的显存依据。
+# STAGE1_BATCH_SIZE：Stage1 单卡 micro-batch；当前四卡配置默认 24。
 STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-24}"
 
 # STAGE1_GRAD_ACCUM_STEPS：Stage1 梯度累积步数。
@@ -317,11 +304,13 @@ STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-1}"
 # STAGE1_LR：Stage1 PoseHead 基础学习率；视觉 LoRA 再乘 LOCATE_VISION_SCALE。
 STAGE1_LR="${STAGE1_LR:-2e-4}"
 
-# 半数 Stage1 batch 使用带小噪声的 GT 框模拟 LocateAnything 外部框；
-# 其余 batch 保持当前纯内部 person-query 路线。
-STAGE1_LOCATE_PROXY_PROBABILITY="${STAGE1_LOCATE_PROXY_PROBABILITY:-0.5}"
+# Stage1 所有注入框均做 Locate 风格形变；普通多人图像独立以 50% 概率
+# 自适应模拟 1-3 个漏检和 1-3 个重复误检。RefHuman 始终保留 referred person。
+STAGE1_LOCATE_PROXY_PROBABILITY="${STAGE1_LOCATE_PROXY_PROBABILITY:-1.0}"
 STAGE1_LOCATE_PROXY_CENTER_NOISE="${STAGE1_LOCATE_PROXY_CENTER_NOISE:-0.03}"
 STAGE1_LOCATE_PROXY_SCALE_NOISE="${STAGE1_LOCATE_PROXY_SCALE_NOISE:-0.06}"
+STAGE1_LOCATE_PROXY_MISS_PROBABILITY="${STAGE1_LOCATE_PROXY_MISS_PROBABILITY:-0.50}"
+STAGE1_LOCATE_PROXY_DUPLICATE_PROBABILITY="${STAGE1_LOCATE_PROXY_DUPLICATE_PROBABILITY:-0.50}"
 
 # STAGE2_EPOCHS：Stage2 grounding 恢复 epoch 数；默认 10。
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-10}"
@@ -366,7 +355,10 @@ WARMUP_STEPS="${WARMUP_STEPS:-100}"
 # 9. checkpoint 恢复、阶段初始化与回退规则
 # ==============================================================================
 
-# STAGE1_RESUME_FROM_CHECKPOINT：Stage1 完整断点续训来源；空值表示新训练。
+# STAGE1_INIT_CHECKPOINT：由旧 checkpoint-6500 转换得到的当前架构 step-0 权重。
+STAGE1_INIT_CHECKPOINT="${STAGE1_INIT_CHECKPOINT:-outputs/locatepose/locatepose-init-from-checkpoint-6500-20260717/checkpoint-0}"
+
+# STAGE1_RESUME_FROM_CHECKPOINT：仅用于新训练产生的严格断点续训；默认从初始化包 step 0 开始。
 STAGE1_RESUME_FROM_CHECKPOINT="${STAGE1_RESUME_FROM_CHECKPOINT:-}"
 
 # STAGE2_RESUME_FROM_CHECKPOINT：Stage2 完整断点续训来源；优先级最高。
@@ -395,19 +387,19 @@ STAGE3_ALLOW_STAGE1_FALLBACK="${STAGE3_ALLOW_STAGE1_FALLBACK:-1}"
 # ==============================================================================
 
 # W_OKS：最终关键点标准 OKS loss 权重。
-W_OKS="${W_OKS:-1.0}"
+W_OKS="${W_OKS:-2.0}"
 
 # W_IMAGE_COORD：最终关键点整图归一化 SmoothL1 loss 权重。
-W_IMAGE_COORD="${W_IMAGE_COORD:-5.0}"
+W_IMAGE_COORD="${W_IMAGE_COORD:-8.0}"
 
 # W_KEYPOINT_CONFIDENCE：每个关键点定位质量置信度 loss 权重。
 W_KEYPOINT_CONFIDENCE="${W_KEYPOINT_CONFIDENCE:-0.1}"
 
 # W_PERSON_CONFIDENCE：人体实例质量置信度 loss 权重；0 表示关闭该头。
-W_PERSON_CONFIDENCE="${W_PERSON_CONFIDENCE:-1.0}"
+W_PERSON_CONFIDENCE="${W_PERSON_CONFIDENCE:-0.5}"
 
-# W_REF_MATCH：RefHuman CE + margin ranking + contrastive 指定人 loss 权重。
-W_REF_MATCH="${W_REF_MATCH:-1.0}"
+# Stage1 的 GT box 与 Stage3 的 Locate box 已指定人物；语言 grounding 仅由 Stage2 负责。
+W_REF_MATCH="${W_REF_MATCH:-0.0}"
 
 # W_HARD_JOINT：困难关键点额外 loss 权重；0 表示关闭。
 W_HARD_JOINT="${W_HARD_JOINT:-0.0}"
@@ -416,7 +408,7 @@ W_HARD_JOINT="${W_HARD_JOINT:-0.0}"
 HARD_JOINT_FRACTION="${HARD_JOINT_FRACTION:-0.2}"
 
 # W_DECODER_COORDS：逐层 grouped decoder 的框内归一化坐标辅助权重。
-W_DECODER_COORDS="${W_DECODER_COORDS:-0.25,0.5,0.75}"
+W_DECODER_COORDS="${W_DECODER_COORDS:-0.1,0.25,0.5}"
 
 # W_COARSE_COORD：粗关键点框内坐标辅助 loss 权重。
 W_COARSE_COORD="${W_COARSE_COORD:-0.0}"
@@ -428,21 +420,18 @@ W_DEFORM_COORD="${W_DEFORM_COORD:-0.0}"
 W_REFINE_COORDS="${W_REFINE_COORDS:-}"
 
 # W_BOX_OBJECTNESS：内部 proposal 的人体/背景 focal loss 权重。
-W_BOX_OBJECTNESS="${W_BOX_OBJECTNESS:-1.0}"
+W_BOX_OBJECTNESS="${W_BOX_OBJECTNESS:-0.0}"
 # W_BOX_QUALITY：独立人体框的 IoU 质量校准权重，用于 bbox AP 排序。
-W_BOX_QUALITY="${W_BOX_QUALITY:-1.0}"
+W_BOX_QUALITY="${W_BOX_QUALITY:-0.5}"
 
 # W_BOX_L1：内部 proposal box 的整图归一化 L1 loss 权重。
-W_BOX_L1="${W_BOX_L1:-5.0}"
+W_BOX_L1="${W_BOX_L1:-2.0}"
 
 # W_BOX_GIOU：内部 proposal box 的 GIoU loss 权重。
-W_BOX_GIOU="${W_BOX_GIOU:-2.0}"
+W_BOX_GIOU="${W_BOX_GIOU:-1.0}"
 
 # W_BOX_RELATIVE：额外相对中心/尺寸约束；默认关闭，L1+GIoU 已足够。
 W_BOX_RELATIVE="${W_BOX_RELATIVE:-0.0}"
-
-# W_BOX_DN：BoxDN 已从当前 pose-set 路径移除，保留兼容参数且固定为 0。
-W_BOX_DN="${W_BOX_DN:-0.0}"
 
 # W_KEYPOINT_DN：关键点 DN 重建与对比总 loss 权重。
 W_KEYPOINT_DN="${W_KEYPOINT_DN:-1.0}"
@@ -505,6 +494,9 @@ VISUALIZE_OBJECTNESS_THRESHOLD="${VISUALIZE_OBJECTNESS_THRESHOLD:-0.05}"
 
 # VISUALIZE_POSE_THRESHOLD：person*pose-quality 低于该值时只画框、不画骨架。
 VISUALIZE_POSE_THRESHOLD="${VISUALIZE_POSE_THRESHOLD:-0.05}"
+
+# 预测关键点可见性低于该阈值时不绘制该点及相关骨架边。
+VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD="${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD:-0.50}"
 
 # VISUALIZE_MIN_GT_AREA_RATIO：最大 GT 人体面积低于该比例时跳过可视化。
 VISUALIZE_MIN_GT_AREA_RATIO="${VISUALIZE_MIN_GT_AREA_RATIO:-0.005}"
@@ -626,8 +618,6 @@ common_args() {
 
     # --hidden_dim：PoseHead 主隐藏维度。
     --hidden_dim "${POSE_HIDDEN_DIM}"
-    # --human_decoder_layers：旧框 decoder 兼容字段，新图中不执行。
-    --human_decoder_layers "${POSE_HUMAN_DECODER_LAYERS}"
     # --num_person_queries：整图 pose-set 候选数。
     --num_person_queries "${POSE_NUM_PERSON_QUERIES}"
     # --num_ref_queries：RefHuman 文本条件候选数。
@@ -644,14 +634,12 @@ common_args() {
     --decoder_heads "${POSE_DECODER_HEADS}"
     # --pose_dropout：PoseHead dropout。
     --pose_dropout "${POSE_DROPOUT}"
-    # --box_condition_scale：姿态 ROI 条件框放大倍率。
+    # --box_condition_scale：多尺度 box pooling 与首层姿态注意力上下文倍率。
     --box_condition_scale "${POSE_BOX_CONDITION_SCALE}"
     # --pose_coordinate_init：关键点 reference 初始化方式。
     --pose_coordinate_init "${POSE_COORDINATE_INIT}"
     # --dynamic_reference_offset_scale：动态人体先验 residual 缩放。
     --dynamic_reference_offset_scale "${POSE_DYNAMIC_REFERENCE_OFFSET_SCALE}"
-    # --pose_roi_size：旧 checkpoint 兼容字段；无 ROI 图中不使用。
-    --pose_roi_size "${POSE_ROI_SIZE}"
     # --pose_feature_channels：P2/P3 投影通道数。
     --pose_feature_channels "${POSE_FEATURE_CHANNELS}"
     # --deformable_points：可变形注意力采样点数。
@@ -660,8 +648,6 @@ common_args() {
     --deformable_min_radius_cells "${POSE_DEFORMABLE_MIN_RADIUS_CELLS}"
     # --ref_text_scale：RefHuman 文本条件缩放。
     --ref_text_scale "${POSE_REF_TEXT_SCALE}"
-    # --disable_box_denoising：新图没有 BoxDN。
-    --disable_box_denoising
 
     # --w_oks：最终姿态 OKS loss 权重。
     --w_oks "${W_OKS}"
@@ -696,14 +682,6 @@ common_args() {
     # --w_box_relative：人体框相对偏移权重。
     --w_box_relative "${W_BOX_RELATIVE}"
 
-    # --max_dn_queries：BoxDN 最大 query 数。
-    --max_dn_queries 96
-    # --max_dn_groups：BoxDN 最大组数。
-    --max_dn_groups 4
-    # --dn_positive_noise：BoxDN 正样本噪声强度。
-    --dn_positive_noise 0.4
-    # --dn_negative_noise：BoxDN 负样本噪声强度。
-    --dn_negative_noise 1.0
     # --max_keypoint_dn_queries：关键点 DN 人体骨架 query 总上限。
     --max_keypoint_dn_queries "${MAX_KEYPOINT_DN_QUERIES}"
     # --max_keypoint_dn_groups：关键点 DN 最大正/负组数。
@@ -716,8 +694,6 @@ common_args() {
     --keypoint_dn_negative_ks_min 0.1
     # --keypoint_dn_negative_ks_max：关键点 DN 负样本最高 KS。
     --keypoint_dn_negative_ks_max 0.5
-    # --w_box_dn：BoxDN loss 权重。
-    --w_box_dn "${W_BOX_DN}"
     # --w_keypoint_dn：关键点 DN loss 权重。
     --w_keypoint_dn "${W_KEYPOINT_DN}"
 
@@ -743,6 +719,8 @@ common_args() {
     --visualize_objectness_threshold "${VISUALIZE_OBJECTNESS_THRESHOLD}"
     # --visualize_pose_threshold：低姿态质量候选不绘制骨架。
     --visualize_pose_threshold "${VISUALIZE_POSE_THRESHOLD}"
+    # --visualize_keypoint_visibility_threshold：不可见点及相关边不绘制。
+    --visualize_keypoint_visibility_threshold "${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD}"
     # --visualize_min_gt_area_ratio：小人体可视化过滤阈值。
     --visualize_min_gt_area_ratio "${VISUALIZE_MIN_GT_AREA_RATIO}"
     # --device：训练设备类型；物理卡由 CUDA_VISIBLE_DEVICES 控制。
@@ -783,8 +761,9 @@ print_configuration_summary() {
 选择阶段：stage1=${RUN_STAGE1} stage2=${RUN_STAGE2} stage3=${RUN_STAGE3}
 物理 GPU：${CUDA_VISIBLE_DEVICES}；进程数：${NPROC_PER_NODE}
 输出根目录：${OUTPUT_DIR}
-Stage1：vision_only + no-ROI pose-set + cached RefHuman text + full-range vision LoRA；datasets=${STAGE1_TRAIN_DATASETS}
+Stage1：vision_only + noisy GT-derived boxes + adaptive miss/duplicate + pre-pose box refinement；datasets=${STAGE1_TRAIN_DATASETS}
         epochs=${STAGE1_EPOCHS} batch/gpu=${STAGE1_BATCH_SIZE} accum=${STAGE1_GRAD_ACCUM_STEPS} effective=${stage1_effective} lr=${STAGE1_LR}
+        proxy=center_std=${STAGE1_LOCATE_PROXY_CENTER_NOISE} scale_log_std=${STAGE1_LOCATE_PROXY_SCALE_NOISE} miss_p=${STAGE1_LOCATE_PROXY_MISS_PROBABILITY} duplicate_p=${STAGE1_LOCATE_PROXY_DUPLICATE_PROBABILITY}
 Stage2：raw_visual + grounding_only + freeze_pose + selective_llm_lora；datasets=${STAGE2_TRAIN_DATASETS}
         epochs=${STAGE2_EPOCHS} batch/gpu=${STAGE2_BATCH_SIZE} accum=${STAGE2_GRAD_ACCUM_STEPS} effective=${stage2_effective} lr=${STAGE2_LR}
 Stage3：raw_visual + hard Locate boxes + freeze Locate + train PoseHead；datasets=${STAGE3_TRAIN_DATASETS}
@@ -794,9 +773,9 @@ Stage3：raw_visual + hard Locate boxes + freeze Locate + train PoseHead；datas
 LLM LoRA：layers=${LOCATE_LLM_LAYERS} modules=${LOCATE_LLM_MODULES} lr_scale=${LOCATE_LLM_SCALE}
 统一输入：letterbox=${LETTERBOX_SIZE}x${LETTERBOX_SIZE} fill=${LETTERBOX_FILL}
 视觉 token：image_limit=${LOCATE_IMAGE_TOKEN_LIMIT} batch_limit=${LOCATE_BATCH_TOKEN_LIMIT:-unlimited}
-Pose DETR：queries=${POSE_NUM_PERSON_QUERIES} ref_queries=${POSE_NUM_REF_QUERIES} encoder=${POSE_MULTISCALE_ENCODER_LAYERS}x${POSE_MULTISCALE_ENCODER_POINTS} refinement=${POSE_REFINEMENT_STEPS}
-关键点 DN：max_queries=${MAX_KEYPOINT_DN_QUERIES} max_groups=${MAX_KEYPOINT_DN_GROUPS}（每组每人 1 正 + 1 负）
-Locate prompt cache：${PROMPT_EMBEDDING_CACHE}
+Pose DETR：queries=${POSE_NUM_PERSON_QUERIES} encoder=${POSE_MULTISCALE_ENCODER_LAYERS}x${POSE_MULTISCALE_ENCODER_POINTS} decoder=${POSE_DECODER_LAYERS} context=${POSE_BOX_CONDITION_SCALE}
+关键点 DN：max_queries=${MAX_KEYPOINT_DN_QUERIES} max_groups=${MAX_KEYPOINT_DN_GROUPS}
+Stage1 init：${STAGE1_INIT_CHECKPOINT}
 Stage2 grounding：lm=${W_LOCATE_BOX_LM}
 Stage3 generation：mode=${LOCATE_GENERATION_MODE} max_new_tokens=${LOCATE_BOX_MAX_NEW_TOKENS} refhuman_only=${STAGE3_GENERATE_REFHUMAN_ONLY}
 日志：${LOG_FILE}
@@ -805,19 +784,14 @@ EOF
 }
 
 # ==============================================================================
-# 14. Stage1：无 ROI Pose DETR + 缓存文本 + 全范围视觉 LoRA
+# 14. Stage1：noisy GT-derived boxes + 漏检/多检 + pre-pose refinement
 # ==============================================================================
 
 run_stage1() {
   common_args "${STAGE1_DATASET_MIX_WEIGHTS}"
-  if [[ ! -f "${PROMPT_EMBEDDING_CACHE}" ]]; then
-    echo "Stage1 的通用 prompt token 缓存不存在：${PROMPT_EMBEDDING_CACHE}" >&2
-    echo "请先运行：${PYTHON} scripts/cache_refhuman_text_embeddings.py --output ${PROMPT_EMBEDDING_CACHE}" >&2
-    exit 1
-  fi
   mkdir -p "${STAGE1_OUTPUT_DIR}"
   local args=("${COMMON_ARGS[@]}"
-    # --datasets：Stage1 同时训练普通多人姿态与 RefHuman 指定人选择。
+    # --datasets：四个数据集统一使用对应 GT box 训练姿态。
     --datasets "${STAGE1_TRAIN_DATASETS}"
     # --output_dir：Stage1 输出目录。
     --output_dir "${STAGE1_OUTPUT_DIR}"
@@ -833,12 +807,14 @@ run_stage1() {
     --lr "${STAGE1_LR}"
     # --locate_feature_source=vision_only：只实例化 MoonViT + mlp1，不加载 3B LLM。
     --locate_feature_source vision_only
-    # --box_source=person_queries：主路径完全依靠整图内部 proposal，不输入 GT box。
+    # person_queries 保留当前 external-box 注入实现；proxy 概率为 1 即每个 batch 注入 GT box。
     --box_source person_queries
-    # 50% batch 注入 noisy-GT Locate 代理框；clean GT 始终作为 box/pose target。
+    # 所有真实注入框做形变；普通多人图像再模拟自适应漏检和重复误检。
     --locate_proxy_probability "${STAGE1_LOCATE_PROXY_PROBABILITY}"
     --locate_proxy_center_noise "${STAGE1_LOCATE_PROXY_CENTER_NOISE}"
     --locate_proxy_scale_noise "${STAGE1_LOCATE_PROXY_SCALE_NOISE}"
+    --locate_proxy_miss_probability "${STAGE1_LOCATE_PROXY_MISS_PROBABILITY}"
+    --locate_proxy_duplicate_probability "${STAGE1_LOCATE_PROXY_DUPLICATE_PROBABILITY}"
     # --locate_gradient_checkpointing：全 27 层视觉 LoRA 降低激活显存。
     --locate_gradient_checkpointing
     # --locate_train_scope=selective_vision_lora：训练全范围视觉 LoRA；projector 默认全量训练。
@@ -852,11 +828,13 @@ run_stage1() {
   else
     args+=(--no-train_locate_projector)
   fi
-  # --prompt_embedding_cache：全部任务使用完整规范 prompt 的冻结缓存。
-  args+=(--prompt_embedding_cache "${PROMPT_EMBEDDING_CACHE}")
-  # --resume_from_checkpoint：可选的 Stage1 完整断点续训来源。
-  [[ -n "${STAGE1_RESUME_FROM_CHECKPOINT}" ]] && args+=(--resume_from_checkpoint "${STAGE1_RESUME_FROM_CHECKPOINT}")
-  echo "[Stage1] 无 ROI P2/P3/P4 Pose DETR；训练 PoseHead、全范围 MoonViT LoRA；projector_train=${STAGE1_TRAIN_LOCATE_PROJECTOR}。"
+  # 新训练默认从当前架构的 step-0 初始化包开始；显式 resume 时严格续训。
+  if [[ -n "${STAGE1_RESUME_FROM_CHECKPOINT}" ]]; then
+    args+=(--resume_from_checkpoint "${STAGE1_RESUME_FROM_CHECKPOINT}")
+  else
+    args+=(--resume_from_checkpoint "${STAGE1_INIT_CHECKPOINT}")
+  fi
+  echo "[Stage1] noisy GT-derived boxes + adaptive miss/duplicate；pre-pose 修框后进入 GroupPose。"
   run_train_pose "${args[@]}"
 }
 

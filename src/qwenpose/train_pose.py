@@ -364,10 +364,14 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Final P2 local enhancement steps; DETRPose uses exactly one.",
     )
-    parser.add_argument("--human_decoder_layers", type=int, default=2)
     parser.add_argument("--decoder_heads", type=int, default=8)
     parser.add_argument("--pose_dropout", type=float, default=0.0)
-    parser.add_argument("--box_condition_scale", type=float, default=1.25)
+    parser.add_argument(
+        "--box_condition_scale",
+        type=float,
+        default=1.15,
+        help="Context expansion used by multiscale box pooling and pose attention; joint initialization stays on the tight box.",
+    )
     parser.add_argument(
         "--pose_coordinate_init",
         choices=(
@@ -395,12 +399,6 @@ def parse_args() -> argparse.Namespace:
         default="configs/schema_joint_priors.json",
         help="Schema prior JSON used by anatomical_dynamic and schema_prior modes.",
     )
-    parser.add_argument(
-        "--pose_roi_size",
-        type=int,
-        default=16,
-        help="Deprecated compatibility option; the DETRPose path does not build ROI memory.",
-    )
     parser.add_argument("--pose_feature_channels", type=int, default=256)
     parser.add_argument("--deformable_points", type=int, default=4)
     parser.add_argument("--deformable_min_radius_cells", type=float, default=2.0)
@@ -410,28 +408,6 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Scale applied when RefHuman text conditions human and joint queries.",
     )
-    parser.add_argument(
-        "--disable_ref_visual_modulation",
-        action="store_true",
-        help="Disable zero-initialized RefHuman text FiLM modulation on the Locate feature map.",
-    )
-    parser.add_argument(
-        "--disable_box_denoising",
-        dest="disable_box_denoising",
-        action="store_true",
-        default=True,
-        help="Disable legacy BoxDN; this is the DETRPose default.",
-    )
-    parser.add_argument(
-        "--enable_box_denoising",
-        dest="disable_box_denoising",
-        action="store_false",
-        help="Explicitly re-enable legacy BoxDN for compatibility experiments.",
-    )
-    parser.add_argument("--max_dn_queries", type=int, default=96)
-    parser.add_argument("--max_dn_groups", type=int, default=4)
-    parser.add_argument("--dn_positive_noise", type=float, default=0.40)
-    parser.add_argument("--dn_negative_noise", type=float, default=1.00)
     parser.add_argument(
         "--disable_keypoint_denoising",
         action="store_true",
@@ -599,7 +575,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_box_l1", type=float, default=5.0)
     parser.add_argument("--w_box_giou", type=float, default=2.0)
     parser.add_argument("--w_box_relative", type=float, default=1.0)
-    parser.add_argument("--w_box_dn", type=float, default=1.0)
     parser.add_argument("--w_keypoint_dn", type=float, default=1.0)
     parser.add_argument(
         "--box_jitter_scale",
@@ -642,6 +617,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.06,
         help="Stddev of Stage1 Locate-proxy log-width/log-height noise.",
+    )
+    parser.add_argument(
+        "--locate_proxy_miss_probability",
+        type=float,
+        default=0.5,
+        help=(
+            "For ordinary multi-person images, probability of dropping an adaptive "
+            "1-3 GT-derived external boxes while retaining at least one person."
+        ),
+    )
+    parser.add_argument(
+        "--locate_proxy_duplicate_probability",
+        type=float,
+        default=0.5,
+        help=(
+            "For ordinary multi-person images, probability of adding an adaptive "
+            "1-3 unmatched duplicate detections."
+        ),
     )
     parser.add_argument(
         "--num_person_queries",
@@ -715,6 +708,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm_max_answer_instances", type=int, default=10)
     parser.add_argument("--visualize_every", type=int, default=0, help="Save one training visualization every N optimizer steps. Use 0 to disable.")
     parser.add_argument("--visualize_max_instances", type=int, default=8)
+    parser.add_argument(
+        "--visualize_keypoint_visibility_threshold",
+        type=float,
+        default=0.5,
+        help="Only draw predicted joints whose learned visibility probability reaches this threshold.",
+    )
     parser.add_argument(
         "--visualize_nms_iou_thresh",
         type=float,
@@ -1379,39 +1378,110 @@ def prepare_locate_proxy_conditioning(
     max_instances: int,
     center_noise: float,
     scale_noise: float,
+    miss_probability: float = 0.5,
+    duplicate_probability: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]]]:
-    """Build Stage1 external priors while retaining all clean pose targets."""
+    """Build noisy Stage1 Locate-style detections with explicit GT identity.
+
+    Every retained real detection receives center/log-size noise. Ordinary
+    multi-person samples independently simulate missed and duplicate detections.
+    The number of affected boxes scales with crowd size: at most one for a
+    three-person image and at most three for a ten-person image. RefHuman keeps
+    exactly its referred person so language identity cannot be corrupted.
+    """
     clean_targets = prepare_person_query_conditioning(
         targets, task_ids, device, max_instances=max_instances
     )[2]
     selected_boxes: list[torch.Tensor] = []
-    for sample_idx, target in enumerate(targets):
-        clean_boxes = target["boxes"]
+    for sample_idx, clean_target in enumerate(clean_targets):
+        clean_boxes = clean_target["boxes"]
         count = int(clean_boxes.shape[0])
         task_id = int(task_ids[sample_idx].detach().cpu().item())
         if task_id == 1:
-            ref_target = int(target["ref_target"].detach().cpu().item())
-            indices = [ref_target] if 0 <= ref_target < count else []
+            ref_target = int(clean_target["ref_target"].detach().cpu().item())
+            retained_indices = [ref_target] if 0 <= ref_target < count else []
         else:
-            indices = list(range(min(count, max(int(max_instances), 1))))
-        if indices:
-            index_tensor = torch.as_tensor(
-                indices, device=clean_boxes.device, dtype=torch.long
+            retained_indices = list(range(count))
+
+        missed_count = 0
+        if (
+            task_id != 1
+            and len(retained_indices) > 1
+            and random.random() < max(0.0, min(float(miss_probability), 1.0))
+        ):
+            max_missed = min(
+                3,
+                len(retained_indices) - 1,
+                max(1, (len(retained_indices) + 2) // 3),
             )
-            proxy = jitter_locate_proxy_boxes_xyxy(
-                clean_boxes[index_tensor],
-                center_noise=center_noise,
-                scale_noise=scale_noise,
+            missed_count = random.randint(1, max_missed)
+            missed = set(random.sample(retained_indices, missed_count))
+            retained_indices = [idx for idx in retained_indices if idx not in missed]
+
+        proxy_parts: list[torch.Tensor] = []
+        source_gt_indices: list[int] = []
+        if retained_indices:
+            retained_tensor = torch.as_tensor(
+                retained_indices, device=clean_boxes.device, dtype=torch.long
             )
-            context_scale = _context_scale_for_indices(target, indices, len(indices)).to(
-                device=proxy.device, dtype=proxy.dtype
+            proxy_parts.append(
+                jitter_locate_proxy_boxes_xyxy(
+                    clean_boxes[retained_tensor],
+                    center_noise=center_noise,
+                    scale_noise=scale_noise,
+                )
             )
-            proxy = expand_boxes_xyxy_per_box(proxy, context_scale)
-        else:
-            proxy = clean_boxes[:0].clone()
+            source_gt_indices.extend(retained_indices)
+
+        duplicate_count = 0
+        if (
+            task_id != 1
+            and count > 1
+            and retained_indices
+            and random.random()
+            < max(0.0, min(float(duplicate_probability), 1.0))
+        ):
+            max_duplicates = min(
+                3,
+                max(1, (count + 2) // 3),
+                max(max(int(max_instances), 1) - len(retained_indices), 0),
+            )
+            if max_duplicates > 0:
+                duplicate_count = random.randint(1, max_duplicates)
+                duplicate_sources = [
+                    random.choice(retained_indices) for _ in range(duplicate_count)
+                ]
+                duplicate_tensor = torch.as_tensor(
+                    duplicate_sources, device=clean_boxes.device, dtype=torch.long
+                )
+                proxy_parts.append(
+                    jitter_locate_proxy_boxes_xyxy(
+                        clean_boxes[duplicate_tensor],
+                        center_noise=max(float(center_noise) * 1.5, 0.05),
+                        scale_noise=max(float(scale_noise) * 1.5, 0.10),
+                    )
+                )
+                # Duplicate detections are intentional false positives. They
+                # receive confidence/quality supervision but no pose/box target.
+                source_gt_indices.extend([-1] * duplicate_count)
+
+        proxy = (
+            torch.cat(proxy_parts, dim=0)
+            if proxy_parts
+            else clean_boxes[:0].clone()
+        )
         selected_boxes.append(proxy)
-        clean_targets[sample_idx]["locate_proxy_active"] = torch.tensor(
+        clean_target["locate_proxy_active"] = torch.tensor(
             True, device=clean_boxes.device, dtype=torch.bool
+        )
+        clean_target["locate_proxy_gt_indices"] = torch.tensor(
+            source_gt_indices, device=clean_boxes.device, dtype=torch.long
+        )
+        clean_target["locate_proxy_missed_count"] = torch.tensor(
+            missed_count, device=clean_boxes.device, dtype=torch.long
+        )
+        clean_target["locate_proxy_duplicate_count"] = torch.tensor(
+            duplicate_count, device=clean_boxes.device, dtype=torch.long
         )
 
     max_boxes = max([int(boxes.shape[0]) for boxes in selected_boxes] + [1])
@@ -1427,188 +1497,6 @@ def prepare_locate_proxy_conditioning(
             box_tensor[sample_idx, :n] = boxes.to(device=device, dtype=torch.float32)
             box_mask[sample_idx, :n] = True
     return box_tensor, box_mask, clean_targets
-
-
-def prepare_box_denoising(
-    targets: list[dict[str, torch.Tensor]],
-    device: torch.device,
-    *,
-    max_queries: int = 96,
-    max_groups: int = 4,
-    positive_noise: float = 0.40,
-    negative_noise: float = 1.00,
-    image_size: int = 800,
-) -> dict[str, torch.Tensor] | None:
-    """Build DN-DETR/DINO-style positive and negative box queries.
-
-    Positive queries reconstruct their clean GT box. Negative queries are moved
-    far enough from the source person to supervise background objectness only.
-    """
-    max_queries = max(int(max_queries), 0)
-    max_groups = max(int(max_groups), 1)
-    if max_queries < 2:
-        return None
-    minimum_center_shift = 2.0 / max(float(image_size), 1.0)
-    minimum_box_size = 4.0 / max(float(image_size), 1.0)
-
-    per_sample: list[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = []
-    for target in targets:
-        clean_boxes = target["boxes"].to(device=device, dtype=torch.float32)
-        clean_source_indices = torch.arange(
-            clean_boxes.shape[0], device=device, dtype=torch.long
-        )
-        if clean_boxes.numel() == 0:
-            per_sample.append(
-                (
-                    clean_boxes.new_zeros((0, 4)),
-                    clean_boxes.new_zeros((0,)),
-                    clean_boxes.new_zeros((0, 4)),
-                    torch.zeros(0, device=device, dtype=torch.long),
-                    torch.zeros(0, device=device, dtype=torch.long),
-                )
-            )
-            continue
-        matched = target.get("matched_gt_indices")
-        if isinstance(matched, torch.Tensor):
-            positive_source = matched.to(device=device)[: clean_boxes.shape[0]].ge(0)
-            clean_boxes = clean_boxes[positive_source]
-            clean_source_indices = clean_source_indices[positive_source]
-        wh = (clean_boxes[:, 2:] - clean_boxes[:, :2]).clamp(min=minimum_box_size)
-        valid = (wh[:, 0] > 0.0) & (wh[:, 1] > 0.0)
-        clean_boxes = clean_boxes[valid]
-        clean_source_indices = clean_source_indices[valid]
-        if clean_boxes.numel() == 0:
-            per_sample.append(
-                (
-                    clean_boxes.new_zeros((0, 4)),
-                    clean_boxes.new_zeros((0,)),
-                    clean_boxes.new_zeros((0, 4)),
-                    torch.zeros(0, device=device, dtype=torch.long),
-                    torch.zeros(0, device=device, dtype=torch.long),
-                )
-            )
-            continue
-        max_gt = max(max_queries // 2, 1)
-        clean_boxes = clean_boxes[:max_gt]
-        clean_source_indices = clean_source_indices[:max_gt]
-        n = int(clean_boxes.shape[0])
-        groups = min(max_groups, max(max_queries // max(2 * n, 1), 1))
-        noisy_boxes: list[torch.Tensor] = []
-        labels: list[float] = []
-        target_boxes: list[torch.Tensor] = []
-        group_ids: list[int] = []
-        source_indices: list[int] = []
-
-        for group_idx in range(groups):
-            for clean, source_idx_tensor in zip(clean_boxes, clean_source_indices):
-                source_idx = int(source_idx_tensor.item())
-                xy1, xy2 = clean[:2], clean[2:]
-                box_wh = (xy2 - xy1).clamp(min=minimum_box_size)
-                center = (xy1 + xy2) * 0.5
-
-                center_scale = max(float(positive_noise) * 0.5, 0.0)
-                center_shift = (torch.rand(2, device=device) * 2.0 - 1.0) * box_wh * center_scale
-                center_shift = torch.where(
-                    center_shift.abs() < minimum_center_shift,
-                    center_shift.sign().masked_fill(center_shift.eq(0), 1.0) * minimum_center_shift,
-                    center_shift,
-                )
-                size_scale = 1.0 + (torch.rand(2, device=device) * 2.0 - 1.0) * float(positive_noise)
-                positive_wh = (box_wh * size_scale.clamp(min=0.5)).clamp(min=minimum_box_size)
-                positive_center = center + center_shift
-                positive_box = torch.cat(
-                    [positive_center - positive_wh * 0.5, positive_center + positive_wh * 0.5]
-                ).clamp(0.0, 1.0)
-                noisy_boxes.append(positive_box)
-                labels.append(1.0)
-                target_boxes.append(clean)
-                group_ids.append(group_idx)
-                source_indices.append(source_idx)
-
-                negative_box = positive_box
-                best_negative_iou = float("inf")
-                for _ in range(10):
-                    direction = torch.where(
-                        torch.rand(2, device=device) > 0.5,
-                        torch.ones(2, device=device),
-                        -torch.ones(2, device=device),
-                    )
-                    distance = 0.20 + 0.30 * torch.rand(2, device=device)
-                    negative_center = center + direction * distance * box_wh * max(float(negative_noise), 0.0)
-                    negative_scale = 1.0 + (
-                        torch.rand(2, device=device) * 2.0 - 1.0
-                    ) * max(float(negative_noise), 0.0)
-                    negative_wh = (box_wh * negative_scale.clamp(min=0.4, max=2.0)).clamp(
-                        min=minimum_box_size
-                    )
-                    candidate = torch.cat(
-                        [negative_center - negative_wh * 0.5, negative_center + negative_wh * 0.5]
-                    ).clamp(0.0, 1.0)
-                    candidate_iou = float(
-                        box_iou_xyxy(candidate.view(1, 4), clean.view(1, 4))[0, 0]
-                    )
-                    if candidate_iou < best_negative_iou:
-                        best_negative_iou = candidate_iou
-                        negative_box = candidate
-                    if candidate_iou < 0.30:
-                        break
-                noisy_boxes.append(negative_box)
-                labels.append(0.0)
-                target_boxes.append(clean)
-                group_ids.append(group_idx)
-                source_indices.append(source_idx)
-
-        sample_boxes = torch.stack(noisy_boxes[:max_queries], dim=0)
-        sample_labels = torch.tensor(labels[:max_queries], device=device, dtype=torch.float32)
-        sample_targets = torch.stack(target_boxes[:max_queries], dim=0)
-        sample_groups = torch.tensor(group_ids[:max_queries], device=device, dtype=torch.long)
-        sample_sources = torch.tensor(
-            source_indices[:max_queries], device=device, dtype=torch.long
-        )
-        per_sample.append(
-            (sample_boxes, sample_labels, sample_targets, sample_groups, sample_sources)
-        )
-
-    padded_count = max([int(item[0].shape[0]) for item in per_sample] + [0])
-    if padded_count <= 0:
-        return None
-    boxes = torch.zeros(len(per_sample), padded_count, 4, device=device, dtype=torch.float32)
-    mask = torch.zeros(len(per_sample), padded_count, device=device, dtype=torch.bool)
-    labels = torch.zeros(len(per_sample), padded_count, device=device, dtype=torch.float32)
-    target_boxes = torch.zeros(len(per_sample), padded_count, 4, device=device, dtype=torch.float32)
-    group_ids = torch.full(
-        (len(per_sample), padded_count),
-        -1,
-        device=device,
-        dtype=torch.long,
-    )
-    source_indices = torch.full_like(group_ids, -1)
-    for batch_idx, (
-        sample_boxes,
-        sample_labels,
-        sample_targets,
-        sample_groups,
-        sample_sources,
-    ) in enumerate(per_sample):
-        count = int(sample_boxes.shape[0])
-        if count <= 0:
-            continue
-        boxes[batch_idx, :count] = sample_boxes
-        labels[batch_idx, :count] = sample_labels
-        target_boxes[batch_idx, :count] = sample_targets
-        group_ids[batch_idx, :count] = sample_groups
-        source_indices[batch_idx, :count] = sample_sources
-        mask[batch_idx, :count] = True
-    return {
-        "dn_boxes": boxes,
-        "dn_box_mask": mask,
-        "dn_labels": labels,
-        "dn_target_boxes": target_boxes,
-        "dn_group_ids": group_ids,
-        "dn_source_indices": source_indices,
-    }
 
 
 def prepare_keypoint_denoising(
@@ -1663,6 +1551,14 @@ def prepare_keypoint_denoising(
         matched = target.get("matched_gt_indices")
         if isinstance(matched, torch.Tensor):
             candidate = candidate & matched.to(device=device).ge(0)
+        proxy_sources = target.get("locate_proxy_gt_indices")
+        if isinstance(proxy_sources, torch.Tensor):
+            retained = proxy_sources.to(device=device, dtype=torch.long)
+            retained = retained[(retained >= 0) & (retained < candidate.numel())]
+            retained_mask = torch.zeros_like(candidate)
+            if retained.numel() > 0:
+                retained_mask[retained.unique()] = True
+            candidate = candidate & retained_mask
         indices = torch.nonzero(candidate, as_tuple=False).flatten()
         max_people = max(max_queries // 2, 1)
         indices = indices[:max_people]
@@ -1778,71 +1674,6 @@ def prepare_keypoint_denoising(
         "keypoint_dn_source_indices": source_indices,
         "keypoint_dn_group_ids": group_ids,
     }
-
-
-def pair_keypoint_denoising_with_box_denoising(
-    box_dn: dict[str, torch.Tensor] | None,
-    keypoint_dn: dict[str, torch.Tensor] | None,
-) -> dict[str, torch.Tensor] | None:
-    """Attach each pose-DN skeleton to its matching positive box-DN query.
-
-    Pairing is exact on ``(batch, source person, DN group)``. Both the positive
-    and negative skeleton for a person use the same positive noisy-box query;
-    negative skeletons remain quality-only examples in the pose-DN loss. Any
-    skeleton without a positive box-DN partner is masked out instead of falling
-    back to a main prediction query.
-    """
-
-    if box_dn is None or keypoint_dn is None:
-        return None
-    required_box = (
-        "dn_box_mask",
-        "dn_labels",
-        "dn_group_ids",
-        "dn_source_indices",
-    )
-    required_pose = (
-        "keypoint_dn_mask",
-        "keypoint_dn_source_indices",
-        "keypoint_dn_group_ids",
-    )
-    if not all(torch.is_tensor(box_dn.get(key)) for key in required_box):
-        return None
-    if not all(torch.is_tensor(keypoint_dn.get(key)) for key in required_pose):
-        return None
-
-    box_mask = box_dn["dn_box_mask"].bool()
-    box_positive = box_dn["dn_labels"].gt(0.5)
-    box_groups = box_dn["dn_group_ids"].long()
-    box_sources = box_dn["dn_source_indices"].long()
-    pose_mask = keypoint_dn["keypoint_dn_mask"].bool()
-    pose_groups = keypoint_dn["keypoint_dn_group_ids"].long()
-    pose_sources = keypoint_dn["keypoint_dn_source_indices"].long()
-    if box_mask.shape[0] != pose_mask.shape[0]:
-        raise ValueError("box-DN and pose-DN batch sizes must match for pairing.")
-
-    box_query_indices = torch.full_like(pose_sources, -1)
-    for batch_idx in range(int(pose_mask.shape[0])):
-        for pose_idx in torch.nonzero(pose_mask[batch_idx], as_tuple=False).flatten():
-            source = pose_sources[batch_idx, pose_idx]
-            group = pose_groups[batch_idx, pose_idx]
-            candidates = (
-                box_mask[batch_idx]
-                & box_positive[batch_idx]
-                & box_sources[batch_idx].eq(source)
-                & box_groups[batch_idx].eq(group)
-            )
-            candidate_indices = torch.nonzero(candidates, as_tuple=False).flatten()
-            if candidate_indices.numel() > 0:
-                box_query_indices[batch_idx, pose_idx] = candidate_indices[0]
-
-    paired_mask = pose_mask & box_query_indices.ge(0)
-    if not paired_mask.any():
-        return None
-    paired = dict(keypoint_dn)
-    paired["keypoint_dn_mask"] = paired_mask
-    paired["keypoint_dn_box_query_indices"] = box_query_indices
-    return paired
 
 
 def box_iou_xyxy(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -2174,6 +2005,7 @@ def align_targets_to_person_queries(
         and bool(outputs["pose_set_prediction"].detach().item())
     )
     query_mask = outputs.get("box_mask")
+    proposal_source_ids = outputs.get("proposal_source_ids")
     aligned: list[dict[str, Any]] = []
     for batch_idx, target in enumerate(targets):
         if query_mask is None:
@@ -2186,6 +2018,51 @@ def align_targets_to_person_queries(
         sample_predictions = predicted[batch_idx, query_indices]
         gt_boxes = target.get("loss_boxes", target["boxes"])
         gt_indices = list(range(int(gt_boxes.shape[0])))
+        proxy_gt_indices = target.get("locate_proxy_gt_indices")
+        if (
+            torch.is_tensor(proxy_gt_indices)
+            and torch.is_tensor(proposal_source_ids)
+            and bool(target.get("locate_proxy_active", False))
+        ):
+            # Stage1 external boxes carry their source identity explicitly.
+            # Never let an immature pose prediction remap a referred/noisy box
+            # to another person. Missed GT people remain missed; intentional
+            # duplicate detections carry source -1 and remain background.
+            external_queries = torch.nonzero(
+                valid_queries & proposal_source_ids[batch_idx].detach().eq(1),
+                as_tuple=False,
+            ).flatten()
+            source_indices = proxy_gt_indices.to(
+                device=predicted.device, dtype=torch.long
+            )
+            fixed_count = min(
+                int(external_queries.numel()), int(source_indices.numel())
+            )
+            matches: list[tuple[int, int, float]] = []
+            for external_idx in range(fixed_count):
+                query_idx = int(external_queries[external_idx].item())
+                gt_idx = int(source_indices[external_idx].item())
+                if not 0 <= gt_idx < int(gt_boxes.shape[0]):
+                    continue
+                iou = float(
+                    box_iou_xyxy(
+                        proposal_boxes[batch_idx, query_idx : query_idx + 1].float(),
+                        target["boxes"][gt_idx : gt_idx + 1]
+                        .to(device=proposal_boxes.device)
+                        .float(),
+                    )[0, 0].detach().item()
+                )
+                matches.append((query_idx, gt_idx, iou))
+            aligned.append(
+                align_target_to_predictions(
+                    target,
+                    predicted[batch_idx],
+                    gt_indices,
+                    matches,
+                    task_id=int(task_ids[batch_idx].detach().cpu().item()),
+                )
+            )
+            continue
         if (
             pose_set_prediction
             and torch.is_tensor(predicted_keypoints)
@@ -3357,6 +3234,8 @@ class LocatePoseUnifiedConfig:
     locate_proxy_probability: float = 0.0
     locate_proxy_center_noise: float = 0.03
     locate_proxy_scale_noise: float = 0.06
+    locate_proxy_miss_probability: float = 0.5
+    locate_proxy_duplicate_probability: float = 0.5
 
     @classmethod
     def from_args(
@@ -3402,6 +3281,12 @@ class LocatePoseUnifiedConfig:
             ),
             locate_proxy_scale_noise=float(
                 getattr(args, "locate_proxy_scale_noise", 0.06)
+            ),
+            locate_proxy_miss_probability=float(
+                getattr(args, "locate_proxy_miss_probability", 0.5)
+            ),
+            locate_proxy_duplicate_probability=float(
+                getattr(args, "locate_proxy_duplicate_probability", 0.5)
             ),
         )
 
@@ -3693,6 +3578,8 @@ class LocatePoseUnifiedRuntime:
                     max_instances=config.max_instances,
                     center_noise=config.locate_proxy_center_noise,
                     scale_noise=config.locate_proxy_scale_noise,
+                    miss_probability=config.locate_proxy_miss_probability,
+                    duplicate_probability=config.locate_proxy_duplicate_probability,
                 )
             return prepare_person_query_conditioning(
                 batch["targets"],
@@ -3755,7 +3642,7 @@ class LocatePoseUnifiedRuntime:
                 match_iou_thresh=config.box_match_iou_thresh,
                 nms_iou_thresh=config.box_nms_iou_thresh,
                 disable_pre_pose_nms=config.disable_pre_pose_nms,
-                gt_ref_fallback_on_failure=True,
+                gt_ref_fallback_on_failure=False,
             )
             return boxes, mask, all_pose_targets() if pose_set_architecture else selected_targets
         boxes, mask, selected_targets = prepare_box_conditioning(
@@ -4546,9 +4433,8 @@ def build_progress_loss_postfix(
 ) -> dict[str, str]:
     """Build a compact tqdm postfix from weighted head contributions.
 
-    ``pose`` and ``box`` are the complete non-DN regression-head objectives.
-    Their denoising objectives are deliberately reported as ``posedn`` and
-    ``boxdn`` so a large DN auxiliary cannot be mistaken for main-head error.
+    ``pose`` and ``box`` are the complete regression-head objectives; keypoint
+    denoising is reported separately as ``posedn``.
     """
 
     group_totals = _weighted_loss_group_totals(loss_metrics, weights)
@@ -4557,7 +4443,6 @@ def build_progress_loss_postfix(
         ("pose", "pose"),
         ("pose_dn", "posedn"),
         ("box", "box"),
-        ("box_dn", "boxdn"),
     ):
         if group_totals.get(group, 0.0) > 0.0:
             postfix[label] = _format_loss_float(group_totals[group])
@@ -4626,7 +4511,6 @@ def _weighted_loss_items(
     add("box", "l1", "loss_box_l1", weights.box_l1)
     add("box", "giou", "loss_box_giou", weights.box_giou)
     add("box", "rel", "loss_box_relative", weights.box_relative)
-    add("box_dn", "total", "loss_box_dn", weights.box_dn)
     # loss_keypoint_dn already contains its internal pose/confidence/deep-
     # supervision weights. Apply only the outer DN weight here so the displayed
     # value is exactly its contribution to loss_total.
@@ -4665,7 +4549,6 @@ def build_detailed_loss_message(
         "pose": "pose",
         "pose_dn": "posedn",
         "box": "box",
-        "box_dn": "boxdn",
         "ref": "ref",
         "lm": "lm",
     }
@@ -4710,8 +4593,7 @@ def format_loss_weights(weights: LossWeights) -> str:
         f"quality={_format_loss_weight(weights.box_quality)},"
         f"l1={_format_loss_weight(weights.box_l1)},"
         f"giou={_format_loss_weight(weights.box_giou)},"
-        f"relative={_format_loss_weight(weights.box_relative)},"
-        f"dn={_format_loss_weight(weights.box_dn)}) "
+        f"relative={_format_loss_weight(weights.box_relative)}) "
         f"keypoint_dn={_format_loss_weight(weights.keypoint_dn)} "
         f"lm={_format_loss_weight(weights.lm)}"
     )
@@ -4906,6 +4788,7 @@ def save_pose_visualization(
     sample_idx: int = 0,
     max_instances: int = 8,
     score_threshold: float = 0.05,
+    keypoint_visibility_threshold: float = 0.5,
     draw_all_schema_keypoints: bool = False,
     prediction_row: dict[str, Any] | None = None,
     ref_pose_quality_alpha: float = 0.25,
@@ -5216,12 +5099,9 @@ def save_pose_visualization(
         predicted_valid = (
             schema_valid
             if draw_all_schema_keypoints
-            else schema_valid & (keypoints[idx, :, 2] >= score_threshold)
+            else schema_valid
+            & (keypoints[idx, :, 2] >= float(keypoint_visibility_threshold))
         )
-        if not predicted_valid.any():
-            # Visibility is not the pose AP score. Keep a high-ranked pose
-            # inspectable even while its separate visibility head is immature.
-            predicted_valid = schema_valid
         _draw_pose(
             draw,
             keypoints[idx],
@@ -5848,7 +5728,29 @@ def load_training_checkpoint(
     payload_path = resolved_path / CHECKPOINT_PAYLOAD_NAME if resolved_path.is_dir() else resolved_path
     payload = torch.load(payload_path, map_location="cpu")
     module = unwrap_training_model(model)
-    module.pose_model.load_state_dict(payload["model"])
+    source_model_state = payload["model"]
+    if bool(payload.get("allow_partial_model_init", False)):
+        current_state = module.pose_model.state_dict()
+        compatible_state = {
+            key: value
+            for key, value in source_model_state.items()
+            if key in current_state and tuple(value.shape) == tuple(current_state[key].shape)
+        }
+        incompatible = module.pose_model.load_state_dict(compatible_state, strict=False)
+        payload["partial_model_init_report"] = {
+            "loaded_tensors": len(compatible_state),
+            "source_tensors": len(source_model_state),
+            "missing_keys": list(incompatible.missing_keys),
+            "unexpected_keys": list(incompatible.unexpected_keys),
+        }
+        if is_main_process():
+            print(
+                "Compatible weight-only PoseHead initialization: "
+                f"loaded={len(compatible_state)}/{len(source_model_state)}, "
+                f"new_or_changed={len(incompatible.missing_keys)}."
+            )
+    else:
+        module.pose_model.load_state_dict(source_model_state)
     backbone_state = payload.get(
         "backbone_adapter",
         payload.get("backbone_trainable", payload.get("qwen_trainable")),
@@ -6110,14 +6012,10 @@ def main() -> None:
         raise ValueError("Pose feature channels must be positive.")
     if args.decoder_heads <= 0 or args.hidden_dim % args.decoder_heads != 0:
         raise ValueError("--hidden_dim must be divisible by positive --decoder_heads.")
-    if args.human_decoder_layers <= 0 or args.pose_decoder_layers <= 0:
-        raise ValueError("Human and pose decoder layer counts must be positive.")
+    if args.pose_decoder_layers <= 0:
+        raise ValueError("Pose decoder layer count must be positive.")
     if args.deformable_points <= 0 or args.deformable_min_radius_cells <= 0.0:
         raise ValueError("Deformable sampling points and minimum radius must be positive.")
-    if args.max_dn_queries < 0 or args.max_dn_groups <= 0:
-        raise ValueError("DN query count must be non-negative and DN groups positive.")
-    if args.dn_positive_noise < 0.0 or args.dn_negative_noise < 0.0:
-        raise ValueError("DN noise scales must be non-negative.")
     if args.max_keypoint_dn_queries < 0 or args.max_keypoint_dn_groups <= 0:
         raise ValueError("Keypoint-DN query count must be non-negative and groups positive.")
     for range_name, lower, upper in (
@@ -6154,8 +6052,6 @@ def main() -> None:
     decoder_coord_weights = parse_float_list(args.w_decoder_coords)
     if any(weight < 0.0 for weight in decoder_coord_weights):
         raise ValueError("--w_decoder_coords weights must be non-negative.")
-    if args.pose_roi_size <= 1:
-        raise ValueError("--pose_roi_size must be greater than 1.")
     if args.letterbox_size < 0:
         raise ValueError("--letterbox_size must be non-negative.")
     if not 0 <= args.letterbox_fill <= 255:
@@ -6168,10 +6064,18 @@ def main() -> None:
         raise ValueError("--visualize_objectness_threshold must be in [0, 1].")
     if not 0.0 <= args.visualize_pose_threshold <= 1.0:
         raise ValueError("--visualize_pose_threshold must be in [0, 1].")
+    if not 0.0 <= args.visualize_keypoint_visibility_threshold <= 1.0:
+        raise ValueError(
+            "--visualize_keypoint_visibility_threshold must be in [0, 1]."
+        )
     if not 0.0 <= args.locate_proxy_probability <= 1.0:
         raise ValueError("--locate_proxy_probability must be in [0, 1].")
     if args.locate_proxy_center_noise < 0.0 or args.locate_proxy_scale_noise < 0.0:
         raise ValueError("Locate proxy noise scales must be non-negative.")
+    if not 0.0 <= args.locate_proxy_miss_probability <= 1.0:
+        raise ValueError("--locate_proxy_miss_probability must be in [0, 1].")
+    if not 0.0 <= args.locate_proxy_duplicate_probability <= 1.0:
+        raise ValueError("--locate_proxy_duplicate_probability must be in [0, 1].")
     if args.locate_proxy_probability > 0.0 and args.box_source != "person_queries":
         raise ValueError(
             "--locate_proxy_probability is only valid with --box_source=person_queries."
@@ -6182,9 +6086,8 @@ def main() -> None:
         args.w_box_l1,
         args.w_box_giou,
         args.w_box_relative,
-        args.w_box_dn,
     ) < 0.0:
-        raise ValueError("All box refinement and denoising loss weights must be non-negative.")
+        raise ValueError("All box refinement loss weights must be non-negative.")
     if args.w_keypoint_confidence < 0.0:
         raise ValueError("--w_keypoint_confidence must be non-negative.")
     if args.w_keypoint_dn < 0.0:
@@ -6327,11 +6230,6 @@ def main() -> None:
     #    ALL_POSE from pose datasets and REF_POSE from RefHuman.
     # ------------------------------------------------------------------
     dataset_names = [name.strip().lower() for name in args.datasets.replace("/", ",").split(",") if name.strip()]
-    if args.locate_feature_source == "vision_only" and args.refhuman_text_embedding_cache is None:
-        raise ValueError(
-            "vision-only Stage1 requires --prompt_embedding_cache for every task prompt. "
-            "Run scripts/cache_refhuman_text_embeddings.py first."
-        )
     if args.pose_augment and args.locate_feature_source != "vision_only":
         raise ValueError(
             "--pose_augment is restricted to vision-only Stage 1 so geometric transforms "
@@ -6659,10 +6557,8 @@ def main() -> None:
             decoder_heads=int(saved_pose_config.get("decoder_heads", args.decoder_heads)),
             dropout=float(saved_pose_config.get("dropout", args.pose_dropout)),
             box_condition_scale=float(saved_pose_config.get("box_condition_scale", args.box_condition_scale)),
-            pose_roi_size=int(saved_pose_config.get("pose_roi_size", args.pose_roi_size)),
             use_refinement=bool(saved_pose_config.get("use_refinement", not args.disable_refinement)),
             pose_feature_channels=int(saved_pose_config["pose_feature_channels"]),
-            human_decoder_layers=int(saved_pose_config.get("human_decoder_layers", args.human_decoder_layers)),
             deformable_points=int(saved_pose_config.get("deformable_points", args.deformable_points)),
             deformable_min_radius_cells=float(
                 saved_pose_config.get("deformable_min_radius_cells", args.deformable_min_radius_cells)
@@ -6676,7 +6572,6 @@ def main() -> None:
             deformable_scale_prior_temperature=float(
                 saved_pose_config.get("deformable_scale_prior_temperature", 1.5)
             ),
-            enable_box_denoising=False,
             enable_keypoint_denoising=bool(
                 saved_pose_config.get(
                     "enable_keypoint_denoising", not args.disable_keypoint_denoising
@@ -6684,12 +6579,6 @@ def main() -> None:
             ),
             ref_text_scale=float(
                 saved_pose_config.get("ref_text_scale", args.ref_text_scale)
-            ),
-            enable_ref_visual_modulation=bool(
-                saved_pose_config.get(
-                    "enable_ref_visual_modulation",
-                    not args.disable_ref_visual_modulation,
-                )
             ),
             legacy_checkpoint_compat=False,
             enable_person_confidence_head=bool(
@@ -6737,19 +6626,15 @@ def main() -> None:
             decoder_heads=args.decoder_heads,
             dropout=args.pose_dropout,
             box_condition_scale=args.box_condition_scale,
-            pose_roi_size=args.pose_roi_size,
             use_refinement=not args.disable_refinement,
             pose_feature_channels=args.pose_feature_channels,
-            human_decoder_layers=args.human_decoder_layers,
             deformable_points=args.deformable_points,
             deformable_min_radius_cells=args.deformable_min_radius_cells,
             deformable_scale_prior_strength=0.5,
             deformable_scale_prior_center_cells=6.0,
             deformable_scale_prior_temperature=1.5,
-            enable_box_denoising=False,
             enable_keypoint_denoising=not args.disable_keypoint_denoising,
             ref_text_scale=args.ref_text_scale,
-            enable_ref_visual_modulation=not args.disable_ref_visual_modulation,
             legacy_checkpoint_compat=False,
             enable_person_confidence_head=True,
             person_confidence_rescue=False,
@@ -6905,7 +6790,6 @@ def main() -> None:
             f"hidden_dim={model_config.hidden_dim}, "
             f"external_dim={model_config.external_dim}, "
             f"decoder_heads={model_config.decoder_heads}, "
-            f"human_decoder_layers={model_config.human_decoder_layers}, "
             f"pose_decoder_layers={model_config.pose_decoder_layers}, "
             f"refinement_steps={model_config.refinement_steps}, "
             f"dropout={model_config.dropout}"
@@ -6928,13 +6812,11 @@ def main() -> None:
             f"scale=[{args.augment_scale_min},{args.augment_scale_max}], "
             f"translate=±{args.augment_translate_fraction}"
         )
-        print(f"Box condition scale: {model_config.box_condition_scale}")
-        print(f"Pose ROI size: {model_config.pose_roi_size}x{model_config.pose_roi_size}")
+        print(f"Box context scale: {model_config.box_condition_scale}")
         if backbone_name == "eagle":
             print(
                 "Locate pose feature: "
                 f"channels={model_config.pose_feature_channels}, grid=native_dynamic, "
-                f"human_decoder_layers={model_config.human_decoder_layers}, "
                 f"pose_decoder_layers={model_config.pose_decoder_layers}"
             )
         else:
@@ -6942,15 +6824,8 @@ def main() -> None:
                 "Qwen pose feature: "
                 f"channels={model_config.pose_feature_channels}, "
                 f"grid={int(args.qwen_feature_size)}x{int(args.qwen_feature_size)}, "
-                f"human_decoder_layers={model_config.human_decoder_layers}, "
                 f"pose_decoder_layers={model_config.pose_decoder_layers}"
             )
-        print(
-            "Box denoising: "
-            f"enabled={model_config.enable_box_denoising}, "
-            f"max_queries={args.max_dn_queries}, groups={args.max_dn_groups}, "
-            f"positive_noise={args.dn_positive_noise}, negative_noise={args.dn_negative_noise}"
-        )
         print(
             "Keypoint denoising: "
             f"enabled={model_config.enable_keypoint_denoising}, "
@@ -6981,7 +6856,6 @@ def main() -> None:
         print(
             "RefHuman conditioning: "
             f"text_scale={model_config.ref_text_scale}, "
-            f"visual_modulation={model_config.enable_ref_visual_modulation and not model_config.use_global_person_queries}, "
             f"match_loss_weight={args.w_ref_match}"
         )
         print(f"Box source: {args.box_source}")
@@ -7078,7 +6952,6 @@ def main() -> None:
         box_l1=args.w_box_l1,
         box_giou=args.w_box_giou,
         box_relative=args.w_box_relative,
-        box_dn=args.w_box_dn,
         keypoint_dn=args.w_keypoint_dn,
         decoder_coords=parse_float_list(args.w_decoder_coords),
         coarse_coord=args.w_coarse_coord,
@@ -7325,19 +7198,6 @@ def main() -> None:
                     box_source=args.box_source,
                 )
                 dn_batch: dict[str, torch.Tensor] = {}
-                box_dn_batch: dict[str, torch.Tensor] | None = None
-                if not args.locate_grounding_only and not args.disable_box_denoising:
-                    box_dn_batch = prepare_box_denoising(
-                        pose_targets,
-                        device,
-                        max_queries=args.max_dn_queries,
-                        max_groups=args.max_dn_groups,
-                        positive_noise=args.dn_positive_noise,
-                        negative_noise=args.dn_negative_noise,
-                        image_size=args.image_size,
-                    )
-                    if box_dn_batch is not None:
-                        dn_batch.update(box_dn_batch)
                 if (
                     not args.locate_grounding_only
                     and not args.disable_keypoint_denoising
@@ -7353,11 +7213,6 @@ def main() -> None:
                         negative_ks_max=args.keypoint_dn_negative_ks_max,
                         image_size=args.image_size,
                     )
-                    if not bool(model_config.use_detrpose_architecture):
-                        keypoint_dn_batch = pair_keypoint_denoising_with_box_denoising(
-                            box_dn_batch,
-                            keypoint_dn_batch,
-                        )
                     if keypoint_dn_batch is not None:
                         dn_batch.update(keypoint_dn_batch)
                 if backbone_processor is None:
@@ -7879,7 +7734,8 @@ def main() -> None:
                                 vis_path,
                                 sample_idx=vis_sample_idx,
                                 max_instances=args.visualize_max_instances,
-                                draw_all_schema_keypoints=True,
+                                keypoint_visibility_threshold=args.visualize_keypoint_visibility_threshold,
+                                draw_all_schema_keypoints=False,
                                 proposal_nms_iou_thresh=args.visualize_nms_iou_thresh,
                                 proposal_objectness_threshold=args.visualize_objectness_threshold,
                                 proposal_pose_threshold=args.visualize_pose_threshold,

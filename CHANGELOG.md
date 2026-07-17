@@ -2,22 +2,20 @@
 
 All notable changes to this repository are recorded here, with the newest release listed first.
 
-## Unreleased - unified 800 LocatePose
+## v3.0 - 2026-07-17
 
-- Made the independently regressed human proposal the canonical `pred_boxes`
-  output in every LocatePose path; keypoint envelopes are now diagnostic-only.
-- Split human classification, detached-IoU box quality, detached-OKS pose
-  quality, and per-joint quality into explicit outputs and AP ranking scores.
-- Added official COCO person bbox export/evaluation alongside keypoint AP, and
-  updated inference/visualization labels to show human, box, and pose scores.
-- Restored LocateAnything autoregressive box generation as the only default LocatePose training path: `scripts/locatepose.sh` now runs frozen-GT Stage 1 followed by generated-box/coordinate-token-LM Stage 2; the temporary `locatepose4llm.sh` wrapper was removed.
-- Replaced the legacy 256/640 dual-RGB branches with one 800×800 P2/P3/P4 pose pyramid at 200×200, 100×100, and 50×50, shared without architectural changes across Stage 1/2.
-- Removed every SimCC training, decoding, evaluation, inference, and shell configuration path. Keypoint coordinates now come only from direct regression with coordinate deep supervision.
-- Added a two-layer human box refinement decoder, explicit person objectness, refined-box export, relative/L1/GIoU box losses, and DN-DETR/DINO-style positive/negative box denoising queries that never enter the keypoint decoder.
-- Kept the Pose visual input identical across stages by using normalized raw MoonViT features. The merged Stage 2 retains the full LLM for grounding and RefHuman text conditioning without an LLM-image feature-fusion branch.
-- Reworked RefHuman to use LocateAnything's native referring-expression grounding directly: the primary prompt returns one target box, target-only box LM/matching supervises it, and an all-person generation plus `ref_match_head` is retained only as the empty-result fallback. The existing regression head locally refines the grounded box; inference restores the Locate box if a RefHuman refinement drifts below 0.30 IoU.
-- Added strict checkpoint guards: checkpoints from the dual-RGB/SimCC architecture are incompatible and must be replaced by a newly trained Stage 1 checkpoint before Stage 2.
-- Merged the old LocatePose Stage 2/3 runs into one 13-epoch Stage 2 over COCO, MPII, CrowdPose, and RefHuman; added per-dataset traversal multipliers with a `3,3,3,1` default, zero disabling, and deterministic cross-epoch continuation for fractional values.
+- Reworked LocatePose into an explicit three-stage pipeline: noisy GT-derived box pose training, frozen-Pose grounding restoration, and frozen-Locate real generated-box pose calibration.
+- Added Stage-1 Locate-style box corruption for every retained box with configurable center and log-scale noise, plus independent 50% adaptive missed-detection and duplicate-detection simulation on ordinary multi-person images.
+- Made missed/duplicate counts crowd-size aware: 2-3 people affect at most one box, 4-6 affect at most two, and 7+ affect at most three while missed detections always retain at least one true person.
+- Added explicit external-query-to-GT identity tracking. RefHuman now keeps the referred person fixed through noisy-box conditioning and cannot be reassigned to another person by Hungarian pose matching.
+- Switched external-box training to external-query-only matching and output masking so deliberately missed people are not silently recovered by internal proposals; duplicate boxes remain unmatched false positives.
+- Added native P2/P3/P4 Locate feature pooling, pre-pose and post-pose box refinement supervision, detached trusted external box conditioning, grouped iterative pose decoding, and keypoint denoising.
+- Made the independently regressed human proposal the canonical `pred_boxes` output; keypoint envelopes remain diagnostic-only, while human, box-quality, pose-quality, and per-joint confidence outputs stay explicit.
+- Updated evaluation and inference for the three-stage checkpoint layout, real generated-box calibration, COCO person-box export, score reporting, and RefHuman generated-box safety behavior.
+- Added `scripts/initialize_locatepose_checkpoint.py` to migrate compatible tensors into the v3.0 architecture and create a clean step-0 weights-only initialization checkpoint.
+- Updated `scripts/locatepose.sh` to create timestamped run directories, support arbitrary stage selections, and safely convert checkpoints between stages with different optimizer parameter groups.
+- Removed stale two-stage and BoxDN release documentation; keypoint coordinates use direct regression and keypoint DN rather than the retired SimCC/box-DN training paths.
+- Added regression coverage for noisy boxes, adaptive misses/duplicates, RefHuman identity locking, external-only gradients, the complete LocatePose pose-set path, and training safety. The release test suite passes 103 tests.
 
 ## v2.3 - 2026-07-12
 

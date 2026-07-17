@@ -461,10 +461,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--hidden_dim", type=int, default=448)
     parser.add_argument("--pose_decoder_layers", type=int, default=3)
-    parser.add_argument("--refinement_steps", type=int, default=3)
+    parser.add_argument("--refinement_steps", type=int, default=1)
     parser.add_argument("--decoder_heads", type=int, default=8)
-    parser.add_argument("--box_condition_scale", type=float, default=1.25)
-    parser.add_argument("--pose_roi_size", type=int, default=16)
+    parser.add_argument("--box_condition_scale", type=float, default=1.15)
     parser.add_argument(
         "--box_source",
         choices=["gt", "qwen_generate", "locate_generate", "person_queries"],
@@ -532,9 +531,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_predictions_per_image", type=int, default=100)
     parser.add_argument("--visualize_max_samples", type=int, default=100)
     parser.add_argument("--visualize_max_instances", type=int, default=8)
+    parser.add_argument(
+        "--visualize_keypoint_visibility_threshold",
+        type=float,
+        default=0.5,
+        help="Only draw joints whose learned visibility probability reaches this threshold.",
+    )
 
-    parser.add_argument("--w_oks", type=float, default=0.5)
-    parser.add_argument("--w_coord", type=float, default=3.0)
+    parser.add_argument("--w_oks", type=float, default=2.0)
+    parser.add_argument("--w_coord", type=float, default=0.0)
+    parser.add_argument("--w_image_coord", type=float, default=8.0)
     parser.add_argument(
         "--w_keypoint_confidence",
         "--w_vis",
@@ -664,7 +670,6 @@ def load_eval_model(args: argparse.Namespace, checkpoint: dict, device: torch.de
             "refinement_steps": args.refinement_steps,
             "decoder_heads": args.decoder_heads,
             "box_condition_scale": args.box_condition_scale,
-            "pose_roi_size": args.pose_roi_size,
             "use_refinement": not args.disable_refinement,
         }
         if saved_pose_config is None
@@ -989,14 +994,16 @@ def main() -> None:
         args.backbone = "eagle"
     if args.box_condition_scale <= 0:
         raise ValueError("--box_condition_scale must be positive.")
-    if args.pose_roi_size <= 1:
-        raise ValueError("--pose_roi_size must be greater than 1.")
     if not 0.0 <= args.hard_joint_fraction <= 1.0:
         raise ValueError("--hard_joint_fraction must be in [0, 1].")
     if args.visualize_max_samples < 0:
         raise ValueError("--visualize_max_samples must be non-negative.")
     if args.visualize_max_instances <= 0:
         raise ValueError("--visualize_max_instances must be positive.")
+    if not 0.0 <= args.visualize_keypoint_visibility_threshold <= 1.0:
+        raise ValueError(
+            "--visualize_keypoint_visibility_threshold must be in [0, 1]."
+        )
     if args.qwen_box_max_new_tokens <= 0:
         raise ValueError("--qwen_box_max_new_tokens must be positive.")
     if args.locate_box_max_new_tokens <= 0:
@@ -1132,6 +1139,7 @@ def main() -> None:
     weights = LossWeights(
         oks=args.w_oks,
         coord=args.w_coord,
+        image_coord=args.w_image_coord,
         keypoint_confidence=args.w_keypoint_confidence,
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
@@ -1301,6 +1309,7 @@ def main() -> None:
                                     sample_idx=local_idx,
                                     max_instances=args.visualize_max_instances,
                                     score_threshold=args.score_threshold,
+                                    keypoint_visibility_threshold=args.visualize_keypoint_visibility_threshold,
                                     prediction_row=rows_by_mode[mode][local_idx],
                                     ref_pose_quality_alpha=args.ref_pose_quality_alpha,
                                 )

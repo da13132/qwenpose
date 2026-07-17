@@ -5,9 +5,9 @@ set -Eeuo pipefail
 # LocatePose 验证脚本
 #
 # 默认行为：
-#   1. 自动定位 outputs/locatepose 下最近一次 run；
-#   2. 优先选择 stage2_locate_box_closed_loop 的最新 checkpoint；
-#   3. 默认由 LocateAnything 生成框，再评估 PoseHead；
+#   1. 自动定位 outputs/locatepose 下最近一次三阶段 run；
+#   2. 优先选择 stage3_generated_box_pose_calibration，其次 Stage2/Stage1；
+#   3. 默认由 LocateAnything 根据 prompt 生成框，再评估 PoseHead；
 #   4. 导出 summary.json、predictions.jsonl、predictions.json、report.md。
 #   5. BOX_SOURCE=locate_generate 使用 vLLM/Transformers 生成后端。
 #
@@ -66,18 +66,15 @@ dir_has_checkpoints() {
 
 resolve_default_checkpoint_target() {
   local run_dir="$1"
-  local stage2_dir="${run_dir}/stage2_locate_box_closed_loop"
-  local stage1_dir="${run_dir}/stage1_freeze_locate_gt_box"
-  local legacy_stage2_dir="${run_dir}/stage2_unfreeze_locate_person_queries"
-  local legacy_stage1_dir="${run_dir}/stage1_freeze_locate_person_queries"
-  if dir_has_checkpoints "${stage2_dir}"; then
+  local stage3_dir="${run_dir}/stage3_generated_box_pose_calibration"
+  local stage2_dir="${run_dir}/stage2_restore_locate_grounding"
+  local stage1_dir="${run_dir}/stage1_vision_gt_pose"
+  if dir_has_checkpoints "${stage3_dir}"; then
+    printf '%s\n' "${stage3_dir}"
+  elif dir_has_checkpoints "${stage2_dir}"; then
     printf '%s\n' "${stage2_dir}"
   elif dir_has_checkpoints "${stage1_dir}"; then
     printf '%s\n' "${stage1_dir}"
-  elif dir_has_checkpoints "${legacy_stage2_dir}"; then
-    printf '%s\n' "${legacy_stage2_dir}"
-  elif dir_has_checkpoints "${legacy_stage1_dir}"; then
-    printf '%s\n' "${legacy_stage1_dir}"
   else
     printf '%s\n' "${run_dir}"
   fi
@@ -109,7 +106,7 @@ EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-${TRAIN_OUTPUT_DIR}/eval_locatepose_${EVAL_T
 # DATASET_ROOT：数据集根目录，默认项目内 datasets/。
 DATASET_ROOT="${DATASET_ROOT:-datasets}"
 # DATASETS：验证数据集列表，逗号分隔；支持 coco,crowdpose,mpii,refhuman,aic。
-DATASETS="${DATASETS:-coco}"
+DATASETS="${DATASETS:-coco,mpii,crowdpose,refhuman}"
 # SPLIT：验证 split；coco 会映射到 val2017/train2017，其余数据集通常用 val/train。
 SPLIT="${SPLIT:-val}"
 # MAX_SAMPLES_PER_DATASET：每个数据集最多验证多少条记录；空表示全量，调试可设 10/100。
@@ -140,13 +137,11 @@ LOCATE_MODEL_PATH="${LOCATE_MODEL_PATH:-weights/LocateAnything-3B}"
 # LOCATE_DTYPE：LocateAnything PyTorch 加载精度；4090/ADA 通常用 bfloat16。
 LOCATE_DTYPE="${LOCATE_DTYPE:-bfloat16}"
 # LOCATE_ATTN_IMPLEMENTATION：Locate attention 后端；sdpa 稳定，flash_attention_2 更快但依赖环境。
-LOCATE_ATTN_IMPLEMENTATION="${LOCATE_ATTN_IMPLEMENTATION:-sdpa}"
+LOCATE_ATTN_IMPLEMENTATION="${LOCATE_ATTN_IMPLEMENTATION:-flash_attention_2}"
 # LOCATE_IMAGE_TOKEN_LIMIT：LocateAnything 原生 raw MoonViT patch token 上限；默认 4096，和训练脚本保持一致。
 LOCATE_IMAGE_TOKEN_LIMIT="${LOCATE_IMAGE_TOKEN_LIMIT:-4096}"
-# LOCATE_FEATURE_SIZE：统一 800 架构使用 100x100 raw MoonViT 特征。
-LOCATE_FEATURE_SIZE="${LOCATE_FEATURE_SIZE:-100}"
-# LOCATE_FEATURE_REFINER_LAYERS：Locate feature refiner 层数；checkpoint 有 refiner 权重时必须匹配。
-LOCATE_FEATURE_REFINER_LAYERS="${LOCATE_FEATURE_REFINER_LAYERS:-2}"
+# 当前训练直接使用原生可变 P2/P3 网格，不设置固定 feature size。
+LOCATE_FEATURE_REFINER_LAYERS="${LOCATE_FEATURE_REFINER_LAYERS:-0}"
 # LOCATE_FEATURE_REFINER_BOTTLENECK_DIM：feature refiner bottleneck 通道数。
 LOCATE_FEATURE_REFINER_BOTTLENECK_DIM="${LOCATE_FEATURE_REFINER_BOTTLENECK_DIM:-256}"
 # LOCATE_FEATURE_REFINER_INIT_SCALE：feature refiner 残差初始化尺度。
@@ -173,13 +168,11 @@ HIDDEN_DIM="${HIDDEN_DIM:-448}"
 # POSE_DECODER_LAYERS：Pose decoder 层数；旧 checkpoint 无 pose_config 时使用该值。
 POSE_DECODER_LAYERS="${POSE_DECODER_LAYERS:-3}"
 # REFINEMENT_STEPS：关键点局部细化步数；必须与 checkpoint 结构匹配。
-REFINEMENT_STEPS="${REFINEMENT_STEPS:-3}"
+REFINEMENT_STEPS="${REFINEMENT_STEPS:-1}"
 # DECODER_HEADS：Pose decoder attention heads 数；必须与训练结构匹配。
 DECODER_HEADS="${DECODER_HEADS:-8}"
 # BOX_CONDITION_SCALE：PoseHead 条件框扩展比例，和训练保持一致可避免分布偏移。
-BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.2}"
-# POSE_ROI_SIZE：每个 bbox 在 hidden map 上采样的 ROI 特征边长。
-POSE_ROI_SIZE="${POSE_ROI_SIZE:-16}"
+BOX_CONDITION_SCALE="${BOX_CONDITION_SCALE:-1.15}"
 
 ###############################################################################
 # 条件框来源、单次复用与 Locate 生成参数
@@ -230,7 +223,7 @@ DISABLE_SINGLE_PASS_FEATURES="${DISABLE_SINGLE_PASS_FEATURES:-0}"
 # LOCATE_GENERATION_MODE：LocateAnything generate 模式，训练脚本默认 hybrid。
 LOCATE_GENERATION_MODE="${LOCATE_GENERATION_MODE:-hybrid}"
 # LOCATE_BOX_MAX_NEW_TOKENS：Locate 生成框最大新 token 数；拥挤图需要大，快速 smoke 可调小。
-LOCATE_BOX_MAX_NEW_TOKENS="${LOCATE_BOX_MAX_NEW_TOKENS:-8192}"
+LOCATE_BOX_MAX_NEW_TOKENS="${LOCATE_BOX_MAX_NEW_TOKENS:-512}"
 # BOX_MATCH_IOU_THRESH：生成框和 GT 框匹配阈值，仅影响 loss 对齐，不改变导出预测框。
 BOX_MATCH_IOU_THRESH="${BOX_MATCH_IOU_THRESH:-0.10}"
 # BOX_NMS_IOU_THRESH：仅在启用 PoseHead 前 NMS 时使用。
@@ -254,6 +247,8 @@ KEYPOINT_DECODE_MODES="${KEYPOINT_DECODE_MODES:-}"
 VISUALIZE_MAX_SAMPLES="${VISUALIZE_MAX_SAMPLES:-100}"
 # VISUALIZE_MAX_INSTANCES：单张可视化最多绘制多少个人体实例。
 VISUALIZE_MAX_INSTANCES="${VISUALIZE_MAX_INSTANCES:-8}"
+# 只绘制可见性回归概率达到阈值的关键点与骨架边。
+VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD="${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD:-0.50}"
 # SCORE_THRESHOLD：官方 COCO AP 前不预删候选，由 evaluator 自行排序并保留 top-20。
 SCORE_THRESHOLD="${SCORE_THRESHOLD:-0.0}"
 # MAX_PREDICTIONS_PER_IMAGE：单张图最多导出的预测实例数，避免 JSON 过大。
@@ -264,11 +259,12 @@ MAX_PREDICTIONS_PER_IMAGE="${MAX_PREDICTIONS_PER_IMAGE:-100}"
 ###############################################################################
 
 # W_OKS：OKS loss 权重，需要和训练脚本同名以便复现实验配置。
-W_OKS="${W_OKS:-0.5}"
-# W_COORD：坐标回归 loss 权重。
-W_COORD="${W_COORD:-3.0}"
+W_OKS="${W_OKS:-2.0}"
+# 旧 box-normalized final coordinate loss 关闭；最终绝对图像坐标权重与训练一致。
+W_COORD="${W_COORD:-0.0}"
+W_IMAGE_COORD="${W_IMAGE_COORD:-8.0}"
 # W_VIS：关键点可见性 BCE loss 权重。
-W_VIS="${W_VIS:-0.05}"
+W_VIS="${W_VIS:-0.1}"
 # W_HARD_JOINT：hard keypoint mining loss 权重，默认关闭。
 W_HARD_JOINT="${W_HARD_JOINT:-0.0}"
 # HARD_JOINT_FRACTION：hard mining 选取的可见关键点比例。
@@ -290,7 +286,6 @@ args=(
   --locate_model_path "${LOCATE_MODEL_PATH}"
   --locate_dtype "${LOCATE_DTYPE}"
   --locate_attn_implementation "${LOCATE_ATTN_IMPLEMENTATION}"
-  --locate_feature_size "${LOCATE_FEATURE_SIZE}"
   --locate_feature_refiner_layers "${LOCATE_FEATURE_REFINER_LAYERS}"
   --locate_feature_refiner_bottleneck_dim "${LOCATE_FEATURE_REFINER_BOTTLENECK_DIM}"
   --locate_feature_refiner_init_scale "${LOCATE_FEATURE_REFINER_INIT_SCALE}"
@@ -305,7 +300,6 @@ args=(
   --refinement_steps "${REFINEMENT_STEPS}"
   --decoder_heads "${DECODER_HEADS}"
   --box_condition_scale "${BOX_CONDITION_SCALE}"
-  --pose_roi_size "${POSE_ROI_SIZE}"
   --box_source "${BOX_SOURCE}"
   --locate_generation_backend "${LOCATE_GENERATION_BACKEND}"
   --gpu "${GPU}"
@@ -331,8 +325,10 @@ args=(
   --max_predictions_per_image "${MAX_PREDICTIONS_PER_IMAGE}"
   --visualize_max_samples "${VISUALIZE_MAX_SAMPLES}"
   --visualize_max_instances "${VISUALIZE_MAX_INSTANCES}"
+  --visualize_keypoint_visibility_threshold "${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD}"
   --w_oks "${W_OKS}"
   --w_coord "${W_COORD}"
+  --w_image_coord "${W_IMAGE_COORD}"
   --w_vis "${W_VIS}"
   --w_hard_joint "${W_HARD_JOINT}"
   --hard_joint_fraction "${HARD_JOINT_FRACTION}"

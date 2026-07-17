@@ -1,21 +1,22 @@
 # QwenPose 中文说明
 
-版本：`v2.3`
+版本：`v3.0`
 
 [English](README.md) | 中文
 
 这是一个面向公开复现的 box-conditioned 人体姿态估计训练快照。当前仓库维护两条基于同一套 PoseHead、数据管线和验证代码的主线：
 
-- `LocatePose`：基于 `LocateAnything-3B` 自回归出框的两阶段训练方案
+- `LocatePose`：基于 `LocateAnything-3B` 的三阶段 noisy-box、grounding 恢复与真实生成框校准方案
 - `QwenPose`：基于 `Qwen3-VL-4B-Instruct` 的两阶段闭环训练方案
 
 下面的文档顺序也与此保持一致：先讲共享环境和数据，再讲 `LocatePose`，最后讲 `QwenPose`。
 
 ## 仓库公开内容
 
-- `scripts/locatepose.sh`：LocatePose 两阶段训练主入口
+- `scripts/locatepose.sh`：LocatePose 三阶段训练主入口
 - `scripts/eval_locatepose.sh`：LocatePose 验证入口
 - `scripts/infer_locatepose.sh`：LocatePose 单图、文件夹与 RefHuman 推理入口
+- `scripts/initialize_locatepose_checkpoint.py`：v3.0 架构 checkpoint 初始化/迁移工具
 - `scripts/train_qwenpose_two_stage.sh`：QwenPose 两阶段训练主入口
 - `scripts/eval_qwenpose.sh`：QwenPose 验证入口
 - `scripts/zero2.json`、`scripts/zero3.json`、`scripts/zero3_offload.json`：两条主线共用的 DeepSpeed 预设
@@ -37,6 +38,7 @@ qwenpose/
 │   ├── eval_locatepose.sh
 │   ├── eval_qwenpose.sh
 │   ├── infer_locatepose.sh
+│   ├── initialize_locatepose_checkpoint.py
 │   ├── locatepose.sh
 │   ├── wait_for_4gpu_locatepose.sh
 │   ├── train_qwenpose_two_stage.sh
@@ -76,7 +78,7 @@ qwenpose/
 
 ## 已验证环境
 
-这个 `v2.3` 快照在以下环境中完成验证：
+这个 `v3.0` 快照在以下环境中完成验证：
 
 - Python `3.11.15`
 - CUDA `12.6`
@@ -208,10 +210,10 @@ datasets/
 
 当前默认配方说明：
 
-- `LocatePose` 的 Stage1/2 都使用 `coco,mpii,crowdpose,refhuman` 与 raw multimodal 特征
-- RefHuman 从 Stage1 起参与训练；Stage2 使用 LocateAnything 生成框和共享 PoseHead
+- LocatePose 三个阶段默认都使用 `coco,mpii,crowdpose,refhuman`
+- Stage1 使用 vision-only Locate 特征和 noisy GT-derived boxes；Stage2 冻结 PoseHead 恢复 grounding；Stage3 使用真实 LocateAnything 生成框校准 PoseHead
+- RefHuman 从 Stage1 起参与训练，并固定 referred person 的外部框来源身份
 - `QwenPose` 的 stage 1 和 stage 2 默认都使用 `coco`
-- RefHuman 需要 LLM 文本路径；LocatePose Stage1 会加载该路径但冻结 Locate 参数
 
 ### COCO
 
@@ -319,90 +321,84 @@ ZERO_STAGE=zero3 bash scripts/train_qwenpose_two_stage.sh
 ZERO_STAGE=none bash scripts/train_qwenpose_two_stage.sh
 ```
 
-当前 LocatePose 使用单 GPU 安全的自回归生成闭环，可通过 `LOCATEPOSE_CUDA_VISIBLE_DEVICES` 指定物理 GPU。
+LocatePose 默认使用四张物理卡 `4,5,6,7`，并根据可见 GPU 数自动设置进程数。可通过 `LOCATEPOSE_CUDA_VISIBLE_DEVICES` 覆盖；Stage3 也支持单卡生成。
 
 ## LocatePose
 
-LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，Stage1/2 使用完全相同的 800×800 Pose 架构和参数形状。
+LocatePose 以 `LocateAnything-3B` 作为 grounding backbone，通过三个明确阶段训练同一套 800×800 GroupPose 风格姿态架构。
 
-### LocatePose 默认两阶段设置
+### LocatePose 默认三阶段设置
 
-| 阶段 | 目录名 | Backbone 状态 | 条件框来源 | 默认数据集 | 默认 epoch |
-|------|--------|----------------|------------|------------|------------|
-| stage 1 | `stage1_freeze_locate_gt_box` | 冻结 Locate backbone | GT 框 | `coco,mpii,crowdpose,refhuman` | `30` |
-| stage 2 | `stage2_locate_box_closed_loop` | 选择性训练视觉/LLM LoRA | RefHuman 用 LocateAnything 框，普通姿态数据用 GT 框 | `coco,mpii,crowdpose,refhuman` | `25` |
+| 阶段 | 目录名 | 可训练组件 | 条件框来源 | 默认数据集 | 默认 epoch |
+|------|--------|------------|------------|------------|------------|
+| stage 1 | `stage1_vision_gt_pose` | PoseHead、全范围视觉 LoRA、projector | noisy GT-derived external boxes | `coco,mpii,crowdpose,refhuman` | `50` |
+| stage 2 | `stage2_restore_locate_grounding` | 指定 Locate LLM LoRA | GT 坐标 token teacher forcing；跳过 PoseHead | `coco,mpii,crowdpose,refhuman` | `10` |
+| stage 3 | `stage3_generated_box_pose_calibration` | 仅 PoseHead | LocateAnything 真实生成框 | `coco,mpii,crowdpose,refhuman` | `5` |
 
-两个阶段统一使用单一 RGB Pose 金字塔：800×800 输入产生 200×200、100×100、50×50 的 stride-4/8/16 特征。旧 256 与 640 两条 RGB 分支以及全部 SimCC 头均已删除。LocateAnything/GT 框条件化共享关键点 decoder；box DN 与关键点 DN 都保留。
+Stage1 使用 Locate 原生 P2/P3/P4 特征、外部框多尺度池化、pre-pose 修框、分组迭代关键点解码、post-pose 修框与 keypoint DN。所有保留的 GT-derived box 都会增加中心和 log-scale 噪声。普通多人图像会分别以 `0.50` 概率模拟漏检和重复误检，受影响框数量随人数从 1 个增长到最多 3 个。RefHuman 只保留 referred person，并记录明确来源身份，因此 Hungarian 匹配不能把它重新分配给其他人物。
 
-两个阶段都会完整加载多模态 Locate backbone，并向 PoseHead 提供 raw MoonViT 特征（`raw_visual`）。Stage1 冻结 Locate。Stage2 保留 `lm_head` 和 KV cache，自回归生成 RefHuman 框，把生成框与 GT 匹配后监督 PoseHead，同时用 GT 坐标 token 计算 teacher-forcing loss，并选择性训练视觉与 LLM LoRA。
+存在 external boxes 时，只有 external queries 参与匹配、loss 和输出筛选。这样漏掉的人不会被内部 proposal 自动补回，重复框则作为未匹配误检负样本。
+
+Stage2 冻结 PoseHead 和视觉侧，完全跳过姿态前向，只通过坐标 token 语言模型监督恢复 LocateAnything grounding。Stage3 冻结全部 LocateAnything 参数，让 PoseHead 适应推理时真实自回归框分布。
 
 其他关键默认值：
 
-- LocatePose 脚本默认使用物理卡 `3`；可通过 `LOCATEPOSE_CUDA_VISIBLE_DEVICES` 覆盖
-- Stage1：`BATCH_SIZE=1`、`GRAD_ACCUM_STEPS=4`、`LR=2e-4`
-- Stage2：`BATCH_SIZE=1`、`GRAD_ACCUM_STEPS=4`、`LR=1e-4`
-- 图像尺寸固定为 `800`；公开训练方案中的 Locate 特征图固定为 100×100
-- `POSE_PYRAMID_CHANNELS=128`，`POSE_PYRAMID_BLOCKS=3`
-- `POSE_ROI_SIZE=16`，`HUMAN_DECODER_LAYERS=2`，`POSE_DECODER_LAYERS=3`
-- `DEFORMABLE_POINTS=4`，`DEFORMABLE_MIN_RADIUS_CELLS=2.0`
-- `ENABLE_BOX_DENOISING=1`，`MAX_DN_QUERIES=96`，`MAX_DN_GROUPS=4`
-- `DN_POSITIVE_NOISE=0.40`，`DN_NEGATIVE_NOISE=1.00`
-- `W_BOX_OBJECTNESS=1.0`，`W_BOX_L1=5.0`，`W_BOX_GIOU=2.0`，`W_BOX_RELATIVE=1.0`，`W_BOX_DN=1.0`
-- RefHuman：`REF_TEXT_SCALE=0.2`、`W_REF_MATCH=1.0`
-- 两个阶段都使用 `raw_visual` 与 `person_queries`
-- Stage2 默认使用 `selective_lora`，视觉层 15–26，LLM 层 32–35
-- 两阶段默认数据倍率都是 `coco:1,mpii:1,crowdpose:1,refhuman:1`；支持 `0` 与小数倍率
-- 关键点坐标只使用直接回归；不存在 SimCC 分支或融合解码
-- raw-visual RefHuman 训练路径关闭坐标生成和同步图像增强
+- 默认物理 GPU 为 `4,5,6,7`，进程数根据可见 GPU 自动计算
+- Stage1：单卡 batch `24`、累积 `1`、有效 global batch `96`、学习率 `2e-4`
+- Stage2：单卡 batch `4`、累积 `1`、学习率 `1e-4`
+- Stage3：单卡 batch `4`、累积 `1`、学习率 `5e-5`
+- 输入 letterbox 到 `800×800`；Locate image token 上限默认 `4096`
+- `60` 个 person queries、`2` 层多尺度 encoder、`3` 层 pose decoder、`4` 个 deformable points
+- keypoint DN 默认 `40` 个 query、`20` 个 group
+- Stage1 proxy 中心标准差默认 `0.03`，宽高 log-scale 标准差默认 `0.06`
+- 漏检与重复误检概率默认均为 `0.50`
+- 每次训练默认自动生成带时间戳的输出根目录
 
 ### 训练 LocatePose
 
-直接启动新训练：
+顺序执行全部三个阶段：
 
 ```bash
-bash scripts/locatepose.sh
+bash scripts/locatepose.sh all
 ```
 
-指定 run 名启动；脚本始终使用物理卡 1、2、3：
+只启动 Stage1：
 
 ```bash
-RUN_NAME=locatepose_v2_2 \
-ZERO_STAGE=zero2 \
-bash scripts/locatepose.sh
+bash scripts/locatepose.sh stage1
 ```
 
-只做数据链路快速检查：
+复用同一个输出根目录启动后续阶段：
 
 ```bash
-DRY_RUN_DATA=1 ZERO_STAGE=none bash scripts/locatepose.sh
+OUTPUT_DIR=outputs/locatepose/locatepose-3stage-<timestamp>-gtbox-prepose \
+bash scripts/locatepose.sh stage2 stage3
 ```
 
-从已有 run、stage 目录、checkpoint 目录或 checkpoint 文件继续：
+覆盖可见物理 GPU：
 
 ```bash
-bash scripts/locatepose.sh --resume outputs/locatepose/<run_name>
+LOCATEPOSE_CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/locatepose.sh stage1
 ```
+
+不同阶段的优化器参数组不同时，脚本会自动把上一阶段 checkpoint 转换成仅权重初始化包，避免错误恢复 optimizer、GradScaler、RNG 和数据游标。
 
 ### LocatePose 常用变量
 
 - `LOCATE_MODEL_PATH`：LocateAnything-3B 本地权重路径
 - `DATASET_ROOT`：数据根目录，默认 `datasets`
-- `OUTPUT_ROOT`：训练输出根目录，默认 `outputs/locatepose`
-- `ZERO_STAGE`：`zero2`、`zero3`、`zero3_offload` 或 `none`
-- `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`：逗号分隔的数据集列表；默认都包含 RefHuman 在内的四个数据集
-- `STAGE1_DATASET_MIX_WEIGHTS`、`STAGE2_DATASET_MIX_WEIGHTS`：每 epoch 的数据集遍历倍率；允许非负整数、小数和 `0`
-- Stage1 固定使用 `raw_visual` 并冻结 Locate；`STAGE2_LOCATE_TRAIN_SCOPE` 默认使用 `selective_lora`
-- `POSE_PYRAMID_CHANNELS`、`POSE_PYRAMID_BLOCKS`：统一 P2/P3/P4 RGB 编码器配置
-- `HUMAN_DECODER_LAYERS`：人体框迭代 refinement 层数
-- `ENABLE_BOX_DENOISING`、`MAX_DN_QUERIES`、`MAX_DN_GROUPS`、`DN_POSITIVE_NOISE`、`DN_NEGATIVE_NOISE`：仅框 denoising 配置
-- `W_BOX_OBJECTNESS`、`W_BOX_L1`、`W_BOX_GIOU`、`W_BOX_RELATIVE`、`W_BOX_DN`：人体框 loss 权重
-- `REF_TEXT_SCALE`：共享 PoseHead 的 RefHuman 姿态 query 文本条件缩放系数
-- `W_REF_MATCH`：独立的 RefHuman 表达式到候选人体分类 loss
-- `REF_POSE_QUALITY_ALPHA`：评估/推理中独立指代分数之后使用的姿态质量指数
-- `SCHEMA_JOINT_PRIORS_PATH`：各 schema 的 box-relative 关节点几何先验 JSON 文件
-- `W_IMAGE_COORD`、`W_COARSE_COORD`、`W_DEFORM_COORD`、`W_REFINE_COORDS`：坐标回归与深监督权重
-- `LOCATE_IMAGE_TOKEN_LIMIT`：每张图的 raw MoonViT token 上限
-- `STAGE1_LOCATE_BATCH_TOKEN_LIMIT`、`STAGE2_LOCATE_BATCH_TOKEN_LIMIT`：各阶段单卡 micro batch token 总预算
+- `OUTPUT_DIR`：所有所选阶段共用的时间戳根目录
+- `LOCATEPOSE_CUDA_VISIBLE_DEVICES`：逗号分隔的物理 GPU 列表
+- `STAGE1_TRAIN_DATASETS`、`STAGE2_TRAIN_DATASETS`、`STAGE3_TRAIN_DATASETS`：各阶段数据集列表
+- `STAGE1_DATASET_MIX_WEIGHTS`、`STAGE2_DATASET_MIX_WEIGHTS`、`STAGE3_DATASET_MIX_WEIGHTS`：各阶段遍历倍率
+- `STAGE1_LOCATE_PROXY_CENTER_NOISE`、`STAGE1_LOCATE_PROXY_SCALE_NOISE`：Stage1 框形变
+- `STAGE1_LOCATE_PROXY_MISS_PROBABILITY`、`STAGE1_LOCATE_PROXY_DUPLICATE_PROBABILITY`：普通多人图像的自适应漏检/多检
+- `STAGE1_BATCH_SIZE`、`STAGE2_BATCH_SIZE`、`STAGE3_BATCH_SIZE`：各阶段单卡 micro-batch
+- `STAGE1_INIT_CHECKPOINT`、`STAGE2_INIT_CHECKPOINT`、`STAGE3_INIT_CHECKPOINT`：显式初始化来源
+- `LOCATE_VISION_LAYERS`、`LOCATE_VISION_MODULES`、`LOCATE_LLM_LAYERS`、`LOCATE_LLM_MODULES`：LoRA 层与模块范围
+- `MAX_KEYPOINT_DN_QUERIES`、`MAX_KEYPOINT_DN_GROUPS`：keypoint DN 容量
+- `LOCATE_GENERATION_MODE`、`LOCATE_BOX_MAX_NEW_TOKENS`：Stage3 自回归生成配置
+- `STAGE3_GENERATE_REFHUMAN_ONLY`：设为 `1` 时仅 RefHuman 使用真实生成框
 
 ### 验证 LocatePose
 
@@ -417,7 +413,7 @@ bash scripts/eval_locatepose.sh
 验证指定 checkpoint 或 stage 目录：
 
 ```bash
-CHECKPOINT=outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+CHECKPOINT=outputs/locatepose/<run_name>/stage3_generated_box_pose_calibration \
 bash scripts/eval_locatepose.sh
 ```
 
@@ -454,7 +450,7 @@ outputs/locatepose/<run_name>/eval_locatepose_<timestamp>/
 
 ```bash
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --checkpoint outputs/locatepose/<run_name>/stage3_generated_box_pose_calibration \
   --input demo/images \
   --format coco
 ```
@@ -464,7 +460,7 @@ bash scripts/infer_locatepose.sh \
 ```bash
 BOX_SOURCE=locate_generate LOCATE_GENERATION_BACKEND=transformers \
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --checkpoint outputs/locatepose/<run_name>/stage3_generated_box_pose_calibration \
   --input demo/images \
   --format crowdpose
 ```
@@ -476,7 +472,7 @@ RefHuman 文本条件推理示例：
 ```bash
 REF_POSE_QUALITY_ALPHA=0.25 \
 bash scripts/infer_locatepose.sh \
-  --checkpoint outputs/locatepose/<run_name>/stage2_locate_box_closed_loop \
+  --checkpoint outputs/locatepose/<run_name>/stage3_generated_box_pose_calibration \
   --input datasets/refhuman \
   --format refhuman \
   --split val
@@ -589,10 +585,13 @@ BOX_SOURCE=gt bash scripts/eval_qwenpose.sh
 典型 LocatePose 训练目录：
 
 ```text
-outputs/locatepose/<run_name>/
+outputs/locatepose/locatepose-3stage-<timestamp>-gtbox-prepose/
 ├── logs/
-├── stage1_freeze_locate_gt_box/
-└── stage2_locate_box_closed_loop/
+├── stage1_vision_gt_pose/
+├── stage2_restore_locate_grounding/
+├── stage2_init_weights/
+├── stage3_generated_box_pose_calibration/
+└── stage3_init_weights/
 ```
 
 典型 QwenPose 训练目录：
@@ -613,6 +612,6 @@ outputs/qwenpose_two_stage_qwen/<run_name>/
 - `VERSION`：仓库版本号
 - `CHANGELOG.md`：按时间倒序记录版本变更
 - `qwenpose.__version__`：Python 包版本
-- Git tag，例如 `v2.3`
+- Git tag，例如 `v3.0`
 
 每次发布新的公开快照时，建议将代码、README、变更记录和 tag 一起更新，这样 Git 历史与文档说明才能保持一致。

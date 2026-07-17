@@ -185,14 +185,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden_dim", type=int, default=448, help="PoseHead hidden dimension。")
     # --pose_decoder_layers：Pose decoder 层数；加载旧 checkpoint 缺少 pose_config 时使用。
     parser.add_argument("--pose_decoder_layers", type=int, default=3, help="Pose decoder 层数。")
-    # --refinement_steps：关键点 refinement 步数；加载旧 checkpoint 缺少 pose_config 时使用。
-    parser.add_argument("--refinement_steps", type=int, default=3, help="关键点 refinement 步数。")
+    # --refinement_steps：关键点局部 refinement 步数；与训练默认一致。
+    parser.add_argument("--refinement_steps", type=int, default=1, help="关键点 refinement 步数。")
     # --decoder_heads：Pose decoder attention head 数；加载旧 checkpoint 缺少 pose_config 时使用。
     parser.add_argument("--decoder_heads", type=int, default=8, help="Pose decoder attention head 数。")
-    # --box_condition_scale：PoseHead 使用 box 前的扩框比例；影响关键点上下文。
-    parser.add_argument("--box_condition_scale", type=float, default=1.2, help="PoseHead 条件框扩展比例。")
-    # --pose_roi_size：每个 box 的 ROI 特征采样边长；越大越耗显存。
-    parser.add_argument("--pose_roi_size", type=int, default=16, help="Pose ROI 特征边长。")
+    # --box_condition_scale：tight box 外扩后的多尺度 pooling/attention 上下文。
+    parser.add_argument("--box_condition_scale", type=float, default=1.15, help="PoseHead 条件框扩展比例。")
     # --disable_refinement：关闭关键点 refinement 分支；用于兼容无 refinement checkpoint 或加速。
     parser.add_argument("--disable_refinement", action="store_true", help="关闭关键点 refinement。")
 
@@ -240,6 +238,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize_max_samples", type=int, default=-1, help="最多保存多少张可视化；-1 全部，0 关闭。")
     # --visualize_max_instances：每张可视化最多绘制多少个人体实例。
     parser.add_argument("--visualize_max_instances", type=int, default=8, help="每张可视化最多绘制实例数。")
+    parser.add_argument(
+        "--visualize_keypoint_visibility_threshold",
+        type=float,
+        default=0.5,
+        help="只绘制可见性概率达到该阈值的关键点。",
+    )
     # --disable_progress：关闭 tqdm 进度条；适合写日志或非交互环境。
     parser.add_argument("--disable_progress", action="store_true", help="关闭进度条。")
     # --device：PyTorch PoseHead/Locate 特征推理设备；指定 gpu 时通常保持 cuda 即可。
@@ -1397,6 +1401,7 @@ def main() -> None:
                                 sample_idx=local_idx,
                                 max_instances=args.visualize_max_instances,
                                 score_threshold=args.score_threshold,
+                                keypoint_visibility_threshold=args.visualize_keypoint_visibility_threshold,
                                 prediction_row=rows[local_idx],
                                 ref_pose_quality_alpha=args.ref_pose_quality_alpha,
                             )

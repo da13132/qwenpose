@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import random
 import tempfile
 import unittest
 from unittest import mock
@@ -63,7 +64,6 @@ from qwenpose.metrics import (
 from qwenpose.model import (
     QwenPoseConfig,
     QwenPoseModel,
-    SinePositionEncoding,
     apply_refhuman_box_refinement_safety,
     apply_keypoint_decode_mode,
     build_schema_joint_priors,
@@ -85,9 +85,7 @@ from qwenpose.train_pose import (
     _locate_coord_token,
     locate_generation_token_budget,
     nms_box_indices_xyxy,
-    pair_keypoint_denoising_with_box_denoising,
     parse_locate_bbox_response,
-    prepare_box_denoising,
     prepare_keypoint_denoising,
     prepare_locate_proxy_conditioning,
     prepare_locate_generated_box_conditioning_from_responses,
@@ -360,18 +358,97 @@ class MultiDatasetPoseTests(unittest.TestCase):
             "box_context_scale": torch.ones(2),
             "ref_target": torch.tensor(1),
         }
+        torch.manual_seed(19)
         proxy, mask, clean = prepare_locate_proxy_conditioning(
             [target],
             torch.tensor([1]),
             torch.device("cpu"),
             max_instances=10,
-            center_noise=0.0,
-            scale_noise=0.0,
+            center_noise=0.03,
+            scale_noise=0.06,
+            miss_probability=1.0,
+            duplicate_probability=1.0,
         )
         self.assertEqual(mask.tolist(), [[True]])
-        self.assertTrue(torch.allclose(proxy[0, 0], boxes[1]))
+        self.assertFalse(torch.allclose(proxy[0, 0], boxes[1]))
         self.assertEqual(int(clean[0]["boxes"].shape[0]), 2)
         self.assertTrue(bool(clean[0]["locate_proxy_active"]))
+        self.assertEqual(clean[0]["locate_proxy_gt_indices"].tolist(), [1])
+        self.assertEqual(int(clean[0]["locate_proxy_missed_count"]), 0)
+        self.assertEqual(int(clean[0]["locate_proxy_duplicate_count"]), 0)
+
+        # Even a deliberately wrong pose/box prediction cannot remap the
+        # referred external query to the other person.
+        aligned = align_targets_to_person_queries(
+            {
+                "pose_set_prediction": torch.tensor(True),
+                "pred_boxes": torch.tensor(
+                    [[[0.05, 0.10, 0.30, 0.90], [0.60, 0.15, 0.90, 0.95]]]
+                ),
+                "input_boxes": torch.tensor(
+                    [[[0.05, 0.10, 0.30, 0.90], [0.60, 0.15, 0.90, 0.95]]]
+                ),
+                "pred_keypoints": torch.zeros(1, 2, union, 3),
+                "person_logits": torch.zeros(1, 2),
+                "box_mask": torch.tensor([[True, False]]),
+                "proposal_source_ids": torch.tensor([[1, 0]]),
+            },
+            clean,
+            torch.tensor([1]),
+        )
+        self.assertEqual(aligned[0]["matched_gt_indices"].tolist(), [1, -1])
+        self.assertEqual(int(aligned[0]["ref_target"]), 0)
+
+    def test_locate_proxy_adapts_missed_and_duplicate_counts_to_crowd_size(self) -> None:
+        union = len(UNION_KEYPOINTS)
+
+        def make_target(count: int) -> dict[str, torch.Tensor]:
+            x1 = torch.linspace(0.02, 0.72, count)
+            y1 = torch.linspace(0.05, 0.25, count)
+            boxes = torch.stack([x1, y1, x1 + 0.18, y1 + 0.55], dim=-1)
+            return {
+                "boxes": boxes,
+                "loss_boxes": boxes.clone(),
+                "loss_areas": torch.full((count,), 0.099),
+                "keypoints": torch.zeros(count, union, 3),
+                "keypoint_valid": torch.zeros(count, union, dtype=torch.bool),
+                "visibility_valid": torch.zeros(count, union, dtype=torch.bool),
+                "box_context_scale": torch.ones(count),
+                "ref_target": torch.tensor(-1),
+            }
+
+        targets = [make_target(3), make_target(10)]
+        random.seed(23)
+        torch.manual_seed(23)
+        proxy, mask, clean = prepare_locate_proxy_conditioning(
+            targets,
+            torch.tensor([0, 0]),
+            torch.device("cpu"),
+            max_instances=20,
+            center_noise=0.03,
+            scale_noise=0.06,
+            miss_probability=1.0,
+            duplicate_probability=1.0,
+        )
+        for sample_idx, original_count in enumerate((3, 10)):
+            missed = int(clean[sample_idx]["locate_proxy_missed_count"])
+            duplicates = int(clean[sample_idx]["locate_proxy_duplicate_count"])
+            max_changed = min(3, max(1, (original_count + 2) // 3))
+            self.assertGreaterEqual(missed, 1)
+            self.assertLessEqual(missed, min(max_changed, original_count - 1))
+            self.assertGreaterEqual(duplicates, 1)
+            self.assertLessEqual(duplicates, max_changed)
+            sources = clean[sample_idx]["locate_proxy_gt_indices"]
+            self.assertEqual(int((sources >= 0).sum()), original_count - missed)
+            self.assertEqual(int((sources < 0).sum()), duplicates)
+            self.assertEqual(int(mask[sample_idx].sum()), int(sources.numel()))
+            real_count = original_count - missed
+            source_boxes = targets[sample_idx]["boxes"][sources[:real_count]]
+            self.assertFalse(
+                torch.allclose(proxy[sample_idx, :real_count], source_boxes)
+            )
+        self.assertEqual(int(clean[0]["locate_proxy_missed_count"]), 1)
+        self.assertEqual(int(clean[0]["locate_proxy_duplicate_count"]), 1)
 
     def test_pose_set_alignment_keeps_box_only_people_for_box_loss(self) -> None:
         union = len(UNION_KEYPOINTS)
@@ -455,9 +532,7 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 external_dim=16,
                 pose_decoder_layers=1,
                 refinement_steps=1,
-                human_decoder_layers=1,
                 decoder_heads=4,
-                pose_roi_size=4,
                 use_refinement=False,
                 pose_feature_channels=8,
                 use_global_person_queries=True,
@@ -613,10 +688,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertEqual(tuple(outputs["box_quality_logits"].shape), (1, 6))
         self.assertIn("debug_keypoint_envelope", outputs)
         self.assertEqual(int(outputs["proposal_source_ids"][0, 0]), 1)
-        self.assertEqual(
-            sum(p.numel() for p in model.roi_memory_proj.parameters() if p.requires_grad),
-            0,
-        )
         aligned = align_targets_to_person_queries(
             outputs, [target], torch.tensor([1])
         )
@@ -659,12 +730,16 @@ class MultiDatasetPoseTests(unittest.TestCase):
             model.proposal_objectness_heads[0].weight,
             model.multiscale_encoder[0].attention.offset_head.weight,
             model.p4_feature_proj[0].weight,
-            model.pose_decoder_coordinate_heads[0].net[-1].weight,
             model.ref_match_head.net[-1].weight,
-            model.external_box_refine_head.net[-1].weight,
         ):
-            self.assertIsNotNone(parameter.grad)
-            self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
+            grad = parameter.grad
+            self.assertTrue(grad is None or int(torch.count_nonzero(grad)) == 0)
+        for name, parameter in (
+            ("pose_coordinate", model.pose_decoder_coordinate_heads[0].net[-1].weight),
+            ("post_pose_box", model.external_box_refine_head.net[-1].weight),
+        ):
+            self.assertIsNotNone(parameter.grad, name)
+            self.assertGreater(float(parameter.grad.abs().sum()), 0.0, name)
 
     def test_progress_pose_includes_weighted_quality_head_contribution(self) -> None:
         postfix = build_progress_loss_postfix(
@@ -699,18 +774,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
             LossWeights(keypoint_dn=0.5),
         )
         self.assertEqual(postfix["posedn"], "0.600")
-
-    def test_progress_splits_main_box_and_box_dn(self) -> None:
-        postfix = build_progress_loss_postfix(
-            {
-                "loss_total": 2.5,
-                "loss_box_l1": 0.2,
-                "loss_box_dn": 1.5,
-            },
-            LossWeights(box_l1=5.0, box_dn=1.0),
-        )
-        self.assertEqual(postfix["box"], "1.000")
-        self.assertEqual(postfix["boxdn"], "1.500")
 
     def test_progress_pose_reports_single_coarse_coord_objective(self) -> None:
         postfix = build_progress_loss_postfix(
@@ -1831,56 +1894,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only regression"):
             apply_keypoint_decode_mode(outputs, "fused")
 
-    def test_box_denoising_builds_positive_and_negative_pairs(self) -> None:
-        target = {
-            "boxes": torch.tensor(
-                [
-                    [0.10, 0.10, 0.30, 0.70],
-                    [0.50, 0.20, 0.80, 0.90],
-                ]
-            )
-        }
-        torch.manual_seed(7)
-        dn = prepare_box_denoising(
-            [target],
-            torch.device("cpu"),
-            max_queries=8,
-            max_groups=2,
-            image_size=800,
-        )
-        self.assertIsNotNone(dn)
-        assert dn is not None
-        self.assertEqual(tuple(dn["dn_boxes"].shape), (1, 8, 4))
-        self.assertEqual(int(dn["dn_labels"].sum().item()), 4)
-        self.assertEqual(int(dn["dn_box_mask"].sum().item()), 8)
-        self.assertEqual(dn["dn_source_indices"].tolist(), [[0, 0, 1, 1, 0, 0, 1, 1]])
-        positive = dn["dn_labels"].bool()
-        self.assertTrue(torch.allclose(dn["dn_target_boxes"][positive], target["boxes"].repeat(2, 1)))
-
-    def test_box_denoising_uses_only_matched_generated_queries(self) -> None:
-        target = {
-            "boxes": torch.tensor(
-                [
-                    [0.10, 0.10, 0.30, 0.70],
-                    [0.50, 0.20, 0.80, 0.90],
-                ]
-            ),
-            "matched_gt_indices": torch.tensor([0, -1]),
-        }
-        dn = prepare_box_denoising(
-            [target],
-            torch.device("cpu"),
-            max_queries=4,
-            max_groups=2,
-            image_size=800,
-        )
-        self.assertIsNotNone(dn)
-        assert dn is not None
-        self.assertEqual(int(dn["dn_box_mask"].sum().item()), 4)
-        self.assertEqual(dn["dn_source_indices"].tolist(), [[0, 0, 0, 0]])
-        positive_targets = dn["dn_target_boxes"][dn["dn_labels"].bool()]
-        self.assertTrue(torch.allclose(positive_targets, target["boxes"][:1].repeat(2, 1)))
-
     def test_keypoint_denoising_uses_ks_ranges_and_matched_queries(self) -> None:
         union = len(UNION_KEYPOINTS)
         keypoints = torch.zeros(2, union, 3)
@@ -1943,32 +1956,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
             sorted(set(dn["keypoint_dn_group_ids"][0].tolist())),
             list(range(20)),
         )
-
-    def test_pose_dn_pairs_with_positive_box_dn_by_source_and_group(self) -> None:
-        union = len(UNION_KEYPOINTS)
-        keypoints = torch.zeros(1, union, 3)
-        keypoints[..., :2] = 0.5
-        valid = torch.zeros(1, union, dtype=torch.bool)
-        valid[:, 0] = True
-        target = {
-            "boxes": torch.tensor([[0.1, 0.1, 0.9, 0.9]]),
-            "keypoints": keypoints,
-            "keypoint_valid": valid,
-        }
-        box_dn = prepare_box_denoising(
-            [target], torch.device("cpu"), max_queries=4, max_groups=2
-        )
-        pose_dn = prepare_keypoint_denoising(
-            [target], torch.device("cpu"), max_queries=4, max_groups=2
-        )
-        paired = pair_keypoint_denoising_with_box_denoising(box_dn, pose_dn)
-        self.assertIsNotNone(paired)
-        assert paired is not None
-        self.assertEqual(
-            paired["keypoint_dn_box_query_indices"].tolist(),
-            [[0, 0, 2, 2]],
-        )
-        self.assertTrue(bool(paired["keypoint_dn_mask"].all()))
 
     def test_keypoint_dn_negative_has_no_coordinate_loss(self) -> None:
         union = len(UNION_KEYPOINTS)
@@ -2319,18 +2306,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
 
         self.assertAlmostEqual(run(-100.0), run(100.0), places=6)
 
-    def test_standard_roi_position_encoding_separates_spatial_tokens(self) -> None:
-        encoding = SinePositionEncoding(32)(4, 4, torch.device("cpu"))
-        adjacent_similarity = torch.nn.functional.cosine_similarity(
-            encoding[0], encoding[1], dim=0
-        )
-        corner_similarity = torch.nn.functional.cosine_similarity(
-            encoding[0], encoding[-1], dim=0
-        )
-        self.assertLess(float(adjacent_similarity), 0.99)
-        self.assertLess(float(corner_similarity), float(adjacent_similarity))
-        self.assertGreaterEqual(int(torch.linalg.matrix_rank(encoding)), 6)
-
     def test_group_pose_dn_attention_mask_is_asymmetric(self) -> None:
         model = QwenPoseModel(
             QwenPoseConfig(
@@ -2339,7 +2314,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 pose_decoder_layers=1,
                 refinement_steps=1,
                 decoder_heads=4,
-                pose_roi_size=4,
                 pose_feature_channels=8,
                 pose_coordinate_init="box_center",
             )
@@ -2365,10 +2339,8 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 external_dim=16,
                 pose_decoder_layers=3,
                 refinement_steps=1,
-                human_decoder_layers=1,
                 decoder_heads=4,
                 box_condition_scale=1.0,
-                pose_roi_size=4,
                 use_refinement=False,
                 pose_feature_channels=8,
                 pose_coordinate_init="anatomical_dynamic",
@@ -2441,48 +2413,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertIsNotNone(reference_output.weight.grad)
         self.assertGreater(int(torch.count_nonzero(reference_output.weight.grad)), 0)
 
-    def test_refinement_uses_box_relative_inverse_sigmoid_update(self) -> None:
-        model = QwenPoseModel(
-            QwenPoseConfig(
-                hidden_dim=32,
-                external_dim=16,
-                pose_decoder_layers=1,
-                refinement_steps=1,
-                human_decoder_layers=1,
-                decoder_heads=4,
-                box_condition_scale=1.0,
-                pose_roi_size=4,
-                use_refinement=True,
-                pose_feature_channels=8,
-                pose_coordinate_init="box_center",
-                use_global_person_queries=False,
-                use_detrpose_architecture=False,
-            )
-        ).eval()
-        assert model.refine_heads is not None
-        refine_output = model.refine_heads[0].net[-1]
-        self.assertIsInstance(refine_output, torch.nn.Linear)
-        with torch.no_grad():
-            refine_output.bias.copy_(torch.tensor([1.0, -1.0]))
-            outputs = model(
-                torch.tensor([SCHEMA_TO_ID["COCO17"]]),
-                torch.tensor([0]),
-                external_feature_map=torch.randn(1, 16, 8, 8),
-                external_text_embed=torch.zeros(1, 16),
-                target_boxes=torch.tensor([[[0.1, 0.2, 0.9, 0.8]]]),
-                target_box_mask=torch.tensor([[True]]),
-                pose_condition_box_mode="input",
-            )
-        expected_rel = torch.sigmoid(torch.tanh(torch.tensor([1.0, -1.0])) * 0.75)
-        expected_xy = torch.tensor([0.1, 0.2]) + expected_rel * torch.tensor([0.8, 0.6])
-        active = SCHEMA_INDICES["COCO17"]
-        torch.testing.assert_close(
-            outputs["keypoints"][0, 0, active, :2],
-            expected_xy.expand(int(active.numel()), -1),
-            atol=1e-5,
-            rtol=0.0,
-        )
-
     def test_schema_prior_buffer_is_checkpoint_self_contained(self) -> None:
         config = QwenPoseConfig(
             hidden_dim=32,
@@ -2490,7 +2420,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
             pose_decoder_layers=1,
             refinement_steps=1,
             decoder_heads=4,
-            pose_roi_size=4,
             pose_feature_channels=8,
             pose_coordinate_init="schema_prior",
             schema_joint_priors_path="configs/schema_joint_priors.json",
@@ -2520,7 +2449,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 pose_decoder_layers=1,
                 refinement_steps=1,
                 decoder_heads=4,
-                pose_roi_size=4,
                 pose_feature_channels=8,
                 pose_coordinate_init="box_center",
                 schema_joint_priors_path="/not/read/in/box_center/mode.json",
@@ -2537,7 +2465,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 pose_decoder_layers=1,
                 refinement_steps=1,
                 decoder_heads=4,
-                pose_roi_size=4,
                 pose_feature_channels=8,
                 pose_coordinate_init="learned_spread",
                 schema_joint_priors_path="/not/read/in/learned_spread/mode.json",
@@ -2561,7 +2488,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 refinement_steps=1,
                 decoder_heads=4,
                 box_condition_scale=1.0,
-                pose_roi_size=4,
                 use_refinement=False,
                 pose_feature_channels=8,
                 pose_coordinate_init="learned_spread",
@@ -2621,106 +2547,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
             0,
         )
 
-    def test_input_box_mode_opens_box_gradient(self) -> None:
-        model = QwenPoseModel(
-            QwenPoseConfig(
-                hidden_dim=32,
-                external_dim=16,
-                human_decoder_layers=1,
-                pose_decoder_layers=1,
-                refinement_steps=1,
-                decoder_heads=4,
-                box_condition_scale=1.0,
-                pose_roi_size=4,
-                use_refinement=False,
-                pose_feature_channels=8,
-                pose_coordinate_init="learned_spread",
-                use_global_person_queries=False,
-                use_detrpose_architecture=False,
-            )
-        ).train()
-        schema_ids = torch.tensor([SCHEMA_TO_ID["COCO17"]])
-        task_ids = torch.tensor([1])
-        images = torch.rand(1, 3, 64, 64)
-        feature_map = torch.randn(1, 16, 8, 8)
-        text_embed = torch.randn(1, 16)
-        box_mask = torch.tensor([[True]])
-
-        default_boxes = torch.tensor(
-            [[[0.1, 0.2, 0.9, 0.8]]],
-            requires_grad=True,
-        )
-        default_outputs = model(
-            schema_ids,
-            task_ids,
-            images=images,
-            external_feature_map=feature_map,
-            external_text_embed=text_embed,
-            target_boxes=default_boxes,
-            target_box_mask=box_mask,
-        )
-        default_outputs["keypoints"].sum().backward()
-        default_grad = default_boxes.grad
-        self.assertTrue(
-            default_grad is None or int(torch.count_nonzero(default_grad)) == 0
-        )
-
-        model.zero_grad(set_to_none=True)
-        input_boxes = torch.tensor(
-            [[[0.1, 0.2, 0.9, 0.8]]],
-            requires_grad=True,
-        )
-        input_outputs = model(
-            schema_ids,
-            task_ids,
-            images=images,
-            external_feature_map=feature_map.detach(),
-            external_text_embed=text_embed.detach(),
-            target_boxes=input_boxes,
-            target_box_mask=box_mask,
-            pose_condition_box_mode="input",
-        )
-        input_outputs["keypoints"].sum().backward()
-        self.assertIsNotNone(input_boxes.grad)
-        self.assertGreater(int(torch.count_nonzero(input_boxes.grad)), 0)
-
-    def test_box_center_deform_inherits_learned_coarse_reference(self) -> None:
-        model = QwenPoseModel(
-            QwenPoseConfig(
-                hidden_dim=32,
-                external_dim=16,
-                pose_decoder_layers=1,
-                refinement_steps=1,
-                decoder_heads=4,
-                box_condition_scale=1.0,
-                pose_roi_size=4,
-                use_refinement=False,
-                pose_feature_channels=8,
-                pose_coordinate_init="box_center",
-                use_global_person_queries=False,
-                use_detrpose_architecture=False,
-            )
-        ).eval()
-        with torch.no_grad():
-            coarse_output = model.coarse_xy_head.net[-1]
-            self.assertIsInstance(coarse_output, torch.nn.Linear)
-            coarse_output.bias.copy_(torch.logit(torch.tensor([0.25, 0.75])))
-            outputs = model(
-                torch.tensor([SCHEMA_TO_ID["COCO17"]]),
-                torch.tensor([0]),
-                images=torch.rand(1, 3, 64, 64),
-                external_feature_map=torch.randn(1, 16, 8, 8),
-                external_text_embed=torch.zeros(1, 16),
-                target_boxes=torch.tensor([[[0.1, 0.2, 0.9, 0.8]]]),
-                target_box_mask=torch.tensor([[True]]),
-            )
-        active = SCHEMA_INDICES["COCO17"]
-        expected = torch.tensor([0.30, 0.65]).expand(int(active.numel()), -1)
-        coarse_xy = outputs["coarse_keypoints"][0, 0, active, :2]
-        deform_xy = outputs["deform_keypoints"][0, 0, active, :2]
-        self.assertTrue(torch.allclose(coarse_xy, expected, atol=1e-6))
-        self.assertTrue(torch.allclose(deform_xy, coarse_xy, atol=1e-6))
-
     def test_locate_pose_feature_adds_native_learned_p4(self) -> None:
         model = QwenPoseModel(
             QwenPoseConfig(
@@ -2728,9 +2554,7 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 external_dim=16,
                 pose_decoder_layers=1,
                 refinement_steps=1,
-                human_decoder_layers=2,
                 decoder_heads=4,
-                pose_roi_size=4,
                 pose_feature_channels=8,
                 pose_coordinate_init="box_center",
                 schema_joint_priors_path="configs/schema_joint_priors.json",
@@ -2773,9 +2597,7 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 external_dim=16,
                 pose_decoder_layers=1,
                 refinement_steps=1,
-                human_decoder_layers=1,
                 decoder_heads=4,
-                pose_roi_size=4,
                 pose_feature_channels=8,
                 use_refinement=True,
                 pose_coordinate_init="box_center",
@@ -2805,203 +2627,6 @@ class MultiDatasetPoseTests(unittest.TestCase):
         torch.testing.assert_close(single["pred_boxes"][0], batched["pred_boxes"][0])
         torch.testing.assert_close(single["keypoints"][0], batched["keypoints"][0])
 
-    def test_hierarchical_box_and_pose_dn_share_source_and_group(self) -> None:
-        torch.manual_seed(11)
-        model = QwenPoseModel(
-            QwenPoseConfig(
-                hidden_dim=32,
-                external_dim=16,
-                pose_decoder_layers=1,
-                refinement_steps=1,
-                human_decoder_layers=2,
-                decoder_heads=4,
-                pose_roi_size=4,
-                pose_feature_channels=8,
-                pose_coordinate_init="box_center",
-                schema_joint_priors_path="configs/schema_joint_priors.json",
-                enable_box_denoising=True,
-                enable_keypoint_denoising=True,
-                use_global_person_queries=False,
-                use_detrpose_architecture=False,
-            )
-        ).train()
-        # DN samples must not depend on how many parameters the active visual
-        # architecture happened to initialize before this point.
-        torch.manual_seed(0)
-        union = len(UNION_KEYPOINTS)
-        keypoints = torch.zeros(1, union, 3)
-        valid = torch.zeros(1, union, dtype=torch.bool)
-        keypoints[0, 0] = torch.tensor([0.5, 0.5, 1.0])
-        valid[0, 0] = True
-        target = {
-            "boxes": torch.tensor([[0.1, 0.1, 0.9, 0.9]]),
-            "loss_boxes": torch.tensor([[0.1, 0.1, 0.9, 0.9]]),
-            "loss_areas": torch.tensor([0.64]),
-            "keypoints": keypoints,
-            "keypoint_valid": valid,
-            "visibility_valid": valid.clone(),
-        }
-        box_dn = prepare_box_denoising(
-            [target], torch.device("cpu"), max_queries=4, max_groups=2
-        )
-        keypoint_dn = prepare_keypoint_denoising(
-            [target], torch.device("cpu"), max_queries=4, max_groups=2
-        )
-        keypoint_dn = pair_keypoint_denoising_with_box_denoising(
-            box_dn, keypoint_dn
-        )
-        assert box_dn is not None
-        assert keypoint_dn is not None
-        images = torch.rand(1, 3, 800, 800)
-        external_feature_map = torch.randn(1, 16, 25, 25)
-        external_text_embed = torch.zeros(1, 16)
-        outputs = model(
-            torch.tensor([SCHEMA_TO_ID["COCO17"]]),
-            torch.tensor([0]),
-            images=images,
-            external_feature_map=external_feature_map,
-            external_text_embed=external_text_embed,
-            target_boxes=torch.tensor([[[0.1, 0.1, 0.9, 0.9]]]),
-            target_box_mask=torch.tensor([[True]]),
-            pose_condition_box_mode="input",
-            **box_dn,
-            **keypoint_dn,
-        )
-        self.assertEqual(tuple(outputs["pred_boxes"].shape), (1, 1, 4))
-        self.assertEqual(tuple(outputs["dn_pred_boxes"].shape), (1, 4, 4))
-        self.assertEqual(tuple(outputs["pred_keypoints"].shape[:2]), (1, 1))
-        self.assertNotIn("dn_keypoints", outputs)
-        self.assertEqual(tuple(outputs["keypoint_dn_keypoints"].shape[:2]), (1, 4))
-        self.assertEqual(
-            outputs["keypoint_dn_box_query_indices"].tolist(), [[0, 0, 2, 2]]
-        )
-        perturbed_keypoint_dn = dict(keypoint_dn)
-        perturbed_keypoint_dn["keypoint_dn_noisy_keypoints"] = (
-            1.0 - keypoint_dn["keypoint_dn_noisy_keypoints"]
-        )
-        perturbed_outputs = model(
-            torch.tensor([SCHEMA_TO_ID["COCO17"]]),
-            torch.tensor([0]),
-            images=images,
-            external_feature_map=external_feature_map,
-            external_text_embed=external_text_embed,
-            target_boxes=torch.tensor([[[0.1, 0.1, 0.9, 0.9]]]),
-            target_box_mask=torch.tensor([[True]]),
-            pose_condition_box_mode="input",
-            **box_dn,
-            **perturbed_keypoint_dn,
-        )
-        self.assertTrue(
-            torch.allclose(
-                outputs["pred_keypoints"],
-                perturbed_outputs["pred_keypoints"],
-                atol=1e-6,
-            )
-        )
-        self.assertFalse(any("simcc" in key.lower() for key in outputs))
-        active = SCHEMA_INDICES["COCO17"]
-        expected_center = torch.full((int(active.numel()), 2), 0.5)
-        self.assertTrue(
-            torch.allclose(
-                outputs["coarse_keypoints"][0, 0, active, :2],
-                expected_center,
-                atol=1e-6,
-            )
-        )
-        self.assertTrue(
-            torch.allclose(
-                outputs["deform_keypoints"][0, 0, active, :2],
-                expected_center,
-                atol=1e-6,
-            )
-        )
-        self.assertTrue(
-            torch.allclose(
-                outputs["keypoints"][0, 0, active, :2],
-                expected_center,
-                atol=1e-6,
-            )
-        )
-        # Only the first COCO joint is annotated in this synthetic DN target;
-        # undefined joints use the paired positive box-DN center rather than a
-        # main-query box or an anatomical mean pose.
-        paired_box = outputs["dn_pred_boxes"][0, 0]
-        paired_center = ((paired_box[:2] + paired_box[2:]) * 0.5).expand(
-            int(active.numel()) - 1, -1
-        )
-        self.assertTrue(
-            torch.allclose(
-                outputs["keypoint_dn_coarse_keypoints"][0, 0, active[1:], :2],
-                paired_center,
-                atol=1e-6,
-            )
-        )
-        dn_only, _ = compute_keypoint_denoising_loss(
-            outputs,
-            LossWeights(person_confidence=0.0, keypoint_dn=1.0),
-            outputs["keypoint_dn_graph_anchor"],
-        )
-        dn_only.backward(retain_graph=True)
-        human_grad = model.human_box_heads[-1].net[-1].weight.grad
-        self.assertTrue(
-            human_grad is None or int(torch.count_nonzero(human_grad)) == 0
-        )
-        self.assertIsNotNone(model.keypoint_dn_type_embed.weight.grad)
-        model.zero_grad(set_to_none=True)
-
-        # Main pose supervision consumes the refined human box as geometry but
-        # must not update the box decoder across the box->pose boundary.  Keep
-        # this assertion beside the pose-DN boundary check so concatenating the
-        # two query sets cannot accidentally reintroduce the gradient path.
-        pose_only, _ = compute_pose_losses(
-            outputs,
-            [target],
-            torch.tensor([0]),
-            LossWeights(
-                oks=0.0,
-                coord=0.0,
-                image_coord=1.0,
-                vis=0.0,
-                person_confidence=0.0,
-                ref_match=0.0,
-                box_objectness=0.0,
-                box_l1=0.0,
-                box_giou=0.0,
-                box_relative=0.0,
-                box_dn=0.0,
-                keypoint_dn=0.0,
-                coarse_coord=0.0,
-                deform_coord=0.0,
-                refine_coords=(),
-            ),
-        )
-        pose_only.backward(retain_graph=True)
-        human_grad = model.human_box_heads[-1].net[-1].weight.grad
-        self.assertTrue(
-            human_grad is None or int(torch.count_nonzero(human_grad)) == 0
-        )
-        self.assertIsNotNone(model.pose_xy_head.net[-1].weight.grad)
-        model.zero_grad(set_to_none=True)
-
-        loss, parts = compute_pose_losses(
-            outputs,
-            [target],
-            torch.tensor([0]),
-            LossWeights(
-                oks=0.0,
-                coord=0.0,
-                image_coord=0.0,
-                vis=0.1,
-                person_confidence=0.0,
-                keypoint_dn=1.0,
-            ),
-        )
-        loss.backward()
-        self.assertGreater(float(parts["loss_box_dn"].detach()), 0.0)
-        self.assertGreater(float(parts["loss_keypoint_dn"].detach()), 0.0)
-        self.assertIsNotNone(model.human_box_heads[-1].net[-1].weight.grad)
-        self.assertIsNotNone(model.keypoint_dn_type_embed.weight.grad)
-
     def test_missing_keypoint_dn_keeps_type_embedding_in_loss_graph(self) -> None:
         model = QwenPoseModel(
             QwenPoseConfig(
@@ -3009,9 +2634,7 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 external_dim=16,
                 pose_decoder_layers=1,
                 refinement_steps=1,
-                human_decoder_layers=1,
                 decoder_heads=4,
-                pose_roi_size=4,
                 use_refinement=False,
                 pose_feature_channels=8,
                 enable_keypoint_denoising=True,
@@ -3758,14 +3381,14 @@ class MultiDatasetPoseTests(unittest.TestCase):
                 refinement_steps=1,
                 decoder_heads=4,
                 box_condition_scale=1.0,
-                pose_roi_size=4,
                 pose_feature_channels=8,
                 enable_person_confidence_head=True,
                 schema_joint_priors_path="configs/schema_joint_priors.json",
             )
         ).eval()
         self.assertFalse(model.schema_embed.weight.requires_grad)
-        self.assertTrue(torch.equal(model.ref_visual_gates, torch.zeros_like(model.ref_visual_gates)))
+        self.assertFalse(hasattr(model, "ref_visual_modulators"))
+        self.assertFalse(hasattr(model, "ref_visual_gates"))
 
         feature = torch.randn(1, 16, 8, 8)
         images = torch.rand(1, 3, 64, 64)

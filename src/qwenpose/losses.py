@@ -547,6 +547,7 @@ def compute_pose_set_proposal_box_losses(
     fixed foreground class prior remains excluded from objectness supervision.
     """
     proposal_boxes = outputs.get("pred_boxes", outputs.get("input_boxes"))
+    pre_pose_boxes = outputs.get("pre_pose_boxes")
     objectness_logits = outputs.get("box_objectness_logits")
     box_mask = outputs.get("box_mask")
     if not all(
@@ -578,9 +579,12 @@ def compute_pose_set_proposal_box_losses(
     l1_sum = proposal_boxes.sum() * 0.0
     giou_sum = proposal_boxes.sum() * 0.0
     relative_sum = proposal_boxes.sum() * 0.0
+    pre_pose_l1_sum = proposal_boxes.sum() * 0.0
+    pre_pose_giou_sum = proposal_boxes.sum() * 0.0
     valid_count = 0
     objectness_positive_count = 0
     positive_count = 0
+    pre_pose_positive_count = 0
     for batch_idx, target in enumerate(targets):
         target_boxes = target.get("boxes")
         matched_gt_indices = target.get("matched_gt_indices")
@@ -629,6 +633,18 @@ def compute_pose_set_proposal_box_losses(
             giou_sum = giou_sum + giou.sum()
             relative_sum = relative_sum + relative.sum()
             positive_count += int(regression_positive.sum().item())
+            if torch.is_tensor(pre_pose_boxes) and torch.is_tensor(source_ids):
+                external_positive = source_ids[batch_idx, positive_queries].eq(1)
+                if external_positive.any():
+                    pre_queries = positive_queries[external_positive]
+                    pre_targets = gt_boxes[external_positive]
+                    pre_l1, pre_giou, _ = _box_regression_losses(
+                        pre_pose_boxes[batch_idx, pre_queries],
+                        pre_targets.to(dtype=pre_pose_boxes.dtype),
+                    )
+                    pre_pose_l1_sum = pre_pose_l1_sum + pre_l1.sum()
+                    pre_pose_giou_sum = pre_pose_giou_sum + pre_giou.sum()
+                    pre_pose_positive_count += int(external_positive.sum().item())
 
     # DETR-style positive normalization prevents the many background proposals
     # from shrinking this auxiliary objectness signal toward zero.
@@ -636,18 +652,24 @@ def compute_pose_set_proposal_box_losses(
     l1_loss = l1_sum / max(positive_count, 1)
     giou_loss = giou_sum / max(positive_count, 1)
     relative_loss = relative_sum / max(positive_count, 1)
+    pre_pose_l1_loss = pre_pose_l1_sum / max(pre_pose_positive_count, 1)
+    pre_pose_giou_loss = pre_pose_giou_sum / max(pre_pose_positive_count, 1)
     zero = proposal_boxes.sum() * 0.0
     total = (
         float(weights.box_objectness) * objectness_loss
         + float(weights.box_l1) * l1_loss
         + float(weights.box_giou) * giou_loss
         + float(weights.box_relative) * relative_loss
+        + 0.5 * float(weights.box_l1) * pre_pose_l1_loss
+        + 0.5 * float(weights.box_giou) * pre_pose_giou_loss
     )
     return total, {
         "loss_box_objectness": objectness_loss,
         "loss_box_l1": l1_loss,
         "loss_box_giou": giou_loss,
         "loss_box_relative": relative_loss,
+        "loss_pre_pose_box_l1": pre_pose_l1_loss,
+        "loss_pre_pose_box_giou": pre_pose_giou_loss,
         # BoxDN was removed from the pose-set graph; keep the metric key stable.
         "loss_box_dn": zero,
         "box_valid_queries": torch.as_tensor(

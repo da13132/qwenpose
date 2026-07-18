@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260717)
+    parser.add_argument(
+        "--reset-keypoint-visibility-head",
+        action="store_true",
+        help="Keep the current architecture but reinitialize the saturated visibility head.",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +110,11 @@ def migrate_pre_pose_hidden_layers(
         for suffix in ("weight", "bias"):
             source_key = f"external_box_refine_head.net.{layer_index}.{suffix}"
             target_key = f"pre_pose_box_refine_head.net.{layer_index}.{suffix}"
+            # A current-architecture checkpoint already has the canonical
+            # pre-pose tensor.  The legacy external-head migration is only a
+            # fallback for older checkpoints where that tensor is absent.
+            if target_key in source:
+                continue
             if source_key not in source or target_key not in target:
                 continue
             if source[source_key].shape != target[target_key].shape:
@@ -128,12 +138,21 @@ def main() -> None:
     loaded: list[str] = []
     skipped_shape: list[str] = []
     skipped_missing: list[str] = []
+    reset_prefixes = (
+        ("keypoint_visibility_head.",)
+        if args.reset_keypoint_visibility_head
+        else ()
+    )
+    reset_tensors: list[str] = []
     for key, value in source_state.items():
         if key not in initialized_state:
             skipped_missing.append(key)
             continue
         if value.shape != initialized_state[key].shape:
             skipped_shape.append(key)
+            continue
+        if any(key.startswith(prefix) for prefix in reset_prefixes):
+            reset_tensors.append(key)
             continue
         initialized_state[key] = value.to(dtype=initialized_state[key].dtype)
         loaded.append(key)
@@ -162,6 +181,7 @@ def main() -> None:
         "special_migrations": special_migrations,
         "skipped_shape": skipped_shape,
         "skipped_removed": skipped_missing,
+        "reset_tensors": reset_tensors,
     }
 
     checkpoint_dir = args.output.expanduser().resolve() / "checkpoint-0"
@@ -177,6 +197,7 @@ def main() -> None:
         "special_migrations": special_migrations,
         "skipped_shape": skipped_shape,
         "skipped_removed_count": len(skipped_missing),
+        "reset_tensors": reset_tensors,
     }
     (checkpoint_dir / "qwenpose_state.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",

@@ -695,6 +695,7 @@ class MultiDatasetPoseTests(unittest.TestCase):
             oks=1.0,
             image_coord=5.0,
             keypoint_confidence=0.1,
+            keypoint_quality=0.0,
             person_confidence=1.0,
             ref_match=1.0,
             keypoint_dn=1.0,
@@ -900,6 +901,32 @@ class MultiDatasetPoseTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(mapped[0, wrist, :2], torch.tensor([0.40, 0.40]), atol=1e-6))
         self.assertAlmostEqual(abs(float(torch.det(matrix[:2, :2]))), 2.25, places=6)
+
+    def test_affine_out_of_frame_joint_becomes_visibility_negative(self) -> None:
+        union = len(UNION_KEYPOINTS)
+        wrist = UNION_TO_ID["left_wrist"]
+        keypoints = torch.zeros(1, union, 3)
+        keypoints[0, wrist] = torch.tensor([0.9, 0.5, 1.0])
+        valid = torch.zeros(1, union, dtype=torch.bool)
+        valid[0, wrist] = True
+        visibility_valid = torch.zeros_like(valid)
+        visibility_valid[0, wrist] = True
+        matrix = torch.tensor(
+            [[1.0, 0.0, 20.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        mapped, mapped_valid, mapped_visibility = transform_pose_keypoints(
+            keypoints,
+            valid,
+            visibility_valid,
+            matrix,
+            100,
+            100,
+            horizontal_flip=False,
+        )
+        self.assertFalse(bool(mapped_valid[0, wrist]))
+        self.assertTrue(bool(mapped_visibility[0, wrist]))
+        self.assertEqual(float(mapped[0, wrist, 2]), 0.0)
 
     def test_letterbox_scales_long_side_and_pads_annotations_to_square(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1561,6 +1588,49 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertNotIn((80, 180, 255), pixels)
         self.assertNotIn((240, 70, 70), pixels)
 
+    def test_training_visualization_hides_threshold_equal_visibility(self) -> None:
+        union = len(UNION_KEYPOINTS)
+        coco_indices = SCHEMA_INDICES["COCO17"]
+        schema_valid = torch.zeros(1, union, dtype=torch.bool)
+        schema_valid[:, coco_indices] = True
+        keypoints = torch.zeros(1, 1, union, 3)
+        for offset, joint_idx in enumerate(coco_indices.tolist()):
+            keypoints[0, 0, joint_idx] = torch.tensor(
+                [0.30 + 0.02 * (offset % 4), 0.25 + 0.05 * (offset // 4), 0.5]
+            )
+        outputs = {
+            "boxes": torch.tensor([[[0.15, 0.10, 0.75, 0.90]]]),
+            "box_mask": torch.tensor([[True]]),
+            "person_logits": torch.tensor([[10.0]]),
+            "keypoints": keypoints,
+            "keypoint_valid_mask": schema_valid,
+            "pose_lqe_joint_logits": torch.full((1, 1, union), 10.0),
+        }
+        target = {
+            "boxes": torch.zeros(0, 4),
+            "keypoints": torch.zeros(0, union, 3),
+            "keypoint_valid": torch.zeros(0, union, dtype=torch.bool),
+            "dataset": "coco",
+            "schema": "COCO17",
+            "task": "ALL_POSE",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "source.png"
+            output_path = Path(tmpdir) / "vis.png"
+            Image.new("RGB", (128, 128), (255, 255, 255)).save(image_path)
+            save_pose_visualization(
+                outputs,
+                {
+                    "image_paths": [str(image_path)],
+                    "targets": [target],
+                    "source_datasets": ["coco"],
+                },
+                output_path,
+                keypoint_visibility_threshold=0.5,
+            )
+            pixels = list(Image.open(output_path).convert("RGB").getdata())
+        self.assertNotIn((240, 70, 70), pixels)
+
     def test_visualization_keeps_high_pose_when_box_score_is_low(self) -> None:
         union = len(UNION_KEYPOINTS)
         coco_indices = SCHEMA_INDICES["COCO17"]
@@ -1685,39 +1755,54 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertIn((crowdpose_head, neck), edges)
         self.assertNotIn((head_top, neck), edges)
 
-    def test_all_annotated_joints_train_as_visible_and_crowdpose_head_is_separate(self) -> None:
+    def test_dataset_visibility_targets_include_invisible_schema_negatives(self) -> None:
         mpii_kpts, mpii_valid, mpii_vis_valid = mpii_to_union(
             [[10.0, 20.0]] * 16,
-            [1] * 16,
+            [1] + [0] * 15,
             100.0,
             100.0,
         )
-        self.assertTrue(torch.equal(mpii_vis_valid, mpii_valid))
-        self.assertEqual(float(mpii_kpts[..., 2].sum()), 16.0)
+        mpii_schema = SCHEMA_INDICES["MPII16"]
+        self.assertTrue(bool(mpii_vis_valid[mpii_schema].all()))
+        self.assertEqual(int(mpii_valid.sum()), 1)
+        self.assertEqual(float(mpii_kpts[..., 2].sum()), 1.0)
 
-        coco_flat = [10.0, 20.0, 1.0] + [0.0, 0.0, 0.0] * 16
+        coco_flat = (
+            [10.0, 20.0, 2.0]
+            + [12.0, 22.0, 1.0]
+            + [0.0, 0.0, 0.0] * 15
+        )
         coco_kpts, coco_valid, coco_vis_valid = coco_to_union(coco_flat, 100.0, 100.0)
         self.assertTrue(bool(coco_valid[UNION_TO_ID["nose"]]))
-        self.assertTrue(bool(coco_vis_valid[UNION_TO_ID["nose"]]))
+        self.assertTrue(bool(coco_valid[UNION_TO_ID["left_eye"]]))
+        self.assertTrue(bool(coco_vis_valid[SCHEMA_INDICES["COCO17"]].all()))
         self.assertEqual(float(coco_kpts[UNION_TO_ID["nose"], 2]), 1.0)
+        self.assertEqual(float(coco_kpts[UNION_TO_ID["left_eye"], 2]), 0.0)
+        self.assertEqual(float(coco_kpts[UNION_TO_ID["left_ankle"], 2]), 0.0)
 
         flat = []
         for idx in range(14):
-            flat.extend([float(idx + 1), float(idx + 2), 1.0])
+            flat.extend([float(idx + 1), float(idx + 2), 2.0 if idx == 0 else 0.0])
         crowd_kpts, crowd_valid, crowd_vis_valid = crowdpose_to_union(flat, 100.0, 100.0)
         head_idx = UNION_TO_ID["crowdpose_head"]
         old_head_top_idx = UNION_TO_ID["head_top"]
-        self.assertTrue(bool(crowd_valid[head_idx]))
+        first_joint = int(SCHEMA_INDICES["CrowdPose14"][0])
+        self.assertTrue(bool(crowd_valid[first_joint]))
+        self.assertTrue(bool(crowd_vis_valid[SCHEMA_INDICES["CrowdPose14"]].all()))
         self.assertTrue(bool(crowd_vis_valid[head_idx]))
         self.assertFalse(bool(crowd_valid[old_head_top_idx]))
-        self.assertEqual(float(crowd_kpts[head_idx, 2]), 1.0)
+        self.assertEqual(float(crowd_kpts[first_joint, 2]), 1.0)
+        self.assertEqual(float(crowd_kpts[head_idx, 2]), 0.0)
 
-        aic_flat = [10.0, 20.0, 2.0] + [0.0, 0.0, 3.0] * 13
+        aic_flat = [10.0, 20.0, 1.0] + [12.0, 22.0, 2.0] + [0.0, 0.0, 3.0] * 12
         aic_kpts, aic_valid, aic_vis_valid = aic_to_union(aic_flat, 100.0, 100.0)
         aic_joint = int(SCHEMA_INDICES["AIC14"][0])
+        aic_occluded = int(SCHEMA_INDICES["AIC14"][1])
         self.assertTrue(bool(aic_valid[aic_joint]))
-        self.assertTrue(bool(aic_vis_valid[aic_joint]))
+        self.assertTrue(bool(aic_valid[aic_occluded]))
+        self.assertTrue(bool(aic_vis_valid[SCHEMA_INDICES["AIC14"]].all()))
         self.assertEqual(float(aic_kpts[aic_joint, 2]), 1.0)
+        self.assertEqual(float(aic_kpts[aic_occluded, 2]), 0.0)
 
     def test_schema_priors_have_correct_left_right_order(self) -> None:
         priors = build_schema_joint_priors("configs/schema_joint_priors.json")
@@ -2223,17 +2308,20 @@ class MultiDatasetPoseTests(unittest.TestCase):
         self.assertLess(float(logits.grad[0, 0]), 0.0)
         self.assertGreater(float(logits.grad[0, 1]), 0.0)
 
-    def test_missing_gt_joints_do_not_become_confidence_negatives(self) -> None:
+    def test_missing_gt_joints_are_visibility_negatives_for_annotated_people(self) -> None:
         union = len(UNION_KEYPOINTS)
         target_keypoints = torch.zeros(1, union, 3)
-        target_keypoints[0, 0, :2] = torch.tensor([0.5, 0.5])
+        target_keypoints[0, 0] = torch.tensor([0.5, 0.5, 1.0])
         valid = torch.zeros(1, union, dtype=torch.bool)
         valid[0, 0] = True
+        visibility_valid = torch.zeros_like(valid)
+        visibility_valid[:, SCHEMA_INDICES["COCO17"]] = True
         target = {
             "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
             "loss_areas": torch.tensor([1.0]),
             "keypoints": target_keypoints,
             "keypoint_valid": valid,
+            "visibility_valid": visibility_valid,
         }
 
         def run(invalid_logit: float) -> float:
@@ -2262,7 +2350,53 @@ class MultiDatasetPoseTests(unittest.TestCase):
             )
             return float(parts["loss_keypoint_confidence"])
 
-        self.assertAlmostEqual(run(-100.0), run(100.0), places=6)
+        self.assertLess(run(-100.0), run(100.0))
+
+    def test_joint_lqe_is_directly_supervised_by_per_joint_oks(self) -> None:
+        union = len(UNION_KEYPOINTS)
+        valid = torch.zeros(1, union, dtype=torch.bool)
+        valid[0, 0] = True
+        target_keypoints = torch.zeros(1, union, 3)
+        target_keypoints[0, 0] = torch.tensor([0.5, 0.5, 1.0])
+        target = {
+            "boxes": torch.tensor([[0.1, 0.1, 0.9, 0.9]]),
+            "loss_boxes": torch.tensor([[0.1, 0.1, 0.9, 0.9]]),
+            "loss_areas": torch.tensor([0.64]),
+            "keypoints": target_keypoints,
+            "keypoint_valid": valid,
+            "visibility_valid": torch.zeros_like(valid),
+        }
+
+        def run(logit: float) -> float:
+            pred = target_keypoints.unsqueeze(0).clone()
+            outputs = {
+                "box_mask": torch.tensor([[True]]),
+                "keypoints": pred,
+                "keypoint_valid_mask": torch.ones(1, union, dtype=torch.bool),
+                "pose_lqe_joint_logits": torch.full((1, 1, union), logit),
+            }
+            _, parts = compute_pose_losses(
+                outputs,
+                [target],
+                torch.tensor([0]),
+                LossWeights(
+                    oks=0.0,
+                    image_coord=0.0,
+                    keypoint_confidence=0.0,
+                    keypoint_quality=1.0,
+                    person_confidence=0.0,
+                    ref_match=0.0,
+                    box_objectness=0.0,
+                    box_quality=0.0,
+                    box_l1=0.0,
+                    box_giou=0.0,
+                    box_relative=0.0,
+                    keypoint_dn=0.0,
+                ),
+            )
+            return float(parts["loss_keypoint_quality"])
+
+        self.assertLess(run(10.0), run(-10.0))
 
     def test_unmatched_queries_do_not_supervise_joint_visibility(self) -> None:
         union = len(UNION_KEYPOINTS)

@@ -537,6 +537,12 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Only draw joints whose learned visibility probability reaches this threshold.",
     )
+    parser.add_argument(
+        "--visualize_keypoint_quality_threshold",
+        type=float,
+        default=0.3,
+        help="Only draw joints whose learned localization quality reaches this threshold.",
+    )
 
     parser.add_argument("--w_oks", type=float, default=2.0)
     parser.add_argument("--w_coord", type=float, default=0.0)
@@ -548,6 +554,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
     )
+    parser.add_argument("--w_keypoint_quality", type=float, default=0.1)
     parser.add_argument("--w_hard_joint", type=float, default=0.0)
     parser.add_argument("--hard_joint_fraction", type=float, default=0.2)
     return parser.parse_args()
@@ -1004,6 +1011,10 @@ def main() -> None:
         raise ValueError(
             "--visualize_keypoint_visibility_threshold must be in [0, 1]."
         )
+    if not 0.0 <= args.visualize_keypoint_quality_threshold <= 1.0:
+        raise ValueError(
+            "--visualize_keypoint_quality_threshold must be in [0, 1]."
+        )
     if args.qwen_box_max_new_tokens <= 0:
         raise ValueError("--qwen_box_max_new_tokens must be positive.")
     if args.locate_box_max_new_tokens <= 0:
@@ -1141,6 +1152,7 @@ def main() -> None:
         coord=args.w_coord,
         image_coord=args.w_image_coord,
         keypoint_confidence=args.w_keypoint_confidence,
+        keypoint_quality=args.w_keypoint_quality,
         hard_joint=args.w_hard_joint,
         hard_joint_fraction=args.hard_joint_fraction,
     )
@@ -1310,6 +1322,7 @@ def main() -> None:
                                     max_instances=args.visualize_max_instances,
                                     score_threshold=args.score_threshold,
                                     keypoint_visibility_threshold=args.visualize_keypoint_visibility_threshold,
+                                    keypoint_quality_threshold=args.visualize_keypoint_quality_threshold,
                                     prediction_row=rows_by_mode[mode][local_idx],
                                     ref_pose_quality_alpha=args.ref_pose_quality_alpha,
                                 )

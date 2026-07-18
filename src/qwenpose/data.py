@@ -34,7 +34,7 @@ from .schemas import (
 
 
 TASK_TO_ID = {"ALL_POSE": 0, "REF_POSE": 1}
-RECORD_CACHE_VERSION = 12
+RECORD_CACHE_VERSION = 13
 
 ALL_POSE_PROMPT = "Locate all the instances that match the following description: person."
 
@@ -494,8 +494,12 @@ def transform_pose_keypoints(
         & (out[..., 1] >= 0.0)
         & (out[..., 1] <= 1.0)
     )
+    # Coordinate supervision is meaningful only while the transformed joint
+    # remains on the image.  Visibility supervision has different semantics:
+    # a schema joint that leaves the image is a useful invisible negative, so
+    # retain its supervision mask and only clear its binary target.
+    out[..., 2] = torch.where(in_bounds, out[..., 2], torch.zeros_like(out[..., 2]))
     valid = valid & in_bounds
-    visibility_valid = visibility_valid & in_bounds
     out[~valid] = 0.0
     return out, valid, visibility_valid
 
@@ -1267,11 +1271,11 @@ def aic_to_union(
     image_width: float,
     image_height: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Treat every labeled AIC joint as a positive visibility target.
+    """Preserve AIC visible/occluded/missing semantics.
 
-    In the local AIC annotations, both visible (`v == 1`) and occluded
-    (`v == 2`) joints supervise coordinates and visibility. Missing/outside
-    joints (`v >= 3`) remain excluded.
+    In the local annotations, ``v == 1`` is visible, ``v == 2`` is occluded,
+    and ``v >= 3`` is missing/outside.  The latter two are visibility
+    negatives, while both labeled cases continue to supervise coordinates.
     """
     if isinstance(flat_keypoints, dict):
         flat_keypoints = list(flat_keypoints.values())
@@ -1286,13 +1290,13 @@ def aic_to_union(
     for local_idx, union_idx in enumerate(spec.indices.tolist()):
         x, y, v = flat_keypoints[local_idx * 3 : local_idx * 3 + 3]
         visibility = float(v)
+        visibility_valid[union_idx] = True
+        keypoints[union_idx, 2] = 1.0 if visibility == 1.0 else 0.0
         if visibility <= 0 or visibility >= 3:
             continue
         keypoints[union_idx, 0] = float(x) / width
         keypoints[union_idx, 1] = float(y) / height
-        keypoints[union_idx, 2] = 1.0
         valid[union_idx] = True
-        visibility_valid[union_idx] = True
     return keypoints.clamp_(0.0, 1.0), valid, visibility_valid
 
 

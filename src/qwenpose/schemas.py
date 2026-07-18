@@ -199,6 +199,16 @@ def _schema_to_union_impl(
     for local_idx, union_idx in enumerate(spec.indices.tolist()):
         x, y, v = flat_keypoints[local_idx * 3 : local_idx * 3 + 3]
         visibility = float(v)
+
+        # Visibility is a schema-wide binary task, independent from whether a
+        # coordinate can be supervised.  This makes missing/truncated joints
+        # real negatives instead of silently dropping them from the BCE.
+        if visibility_target == "coco":
+            keypoints[union_idx, 2] = 1.0 if visibility > 1.0 else 0.0
+            visibility_valid[union_idx] = True
+        elif visibility_target == "positive_is_visible":
+            keypoints[union_idx, 2] = 1.0 if visibility > 0.0 else 0.0
+            visibility_valid[union_idx] = True
         if visibility <= 0:
             continue
 
@@ -206,9 +216,8 @@ def _schema_to_union_impl(
         keypoints[union_idx, 1] = float(y) / height
         coord_valid[union_idx] = True
 
-        if visibility_target == "coco":
-            keypoints[union_idx, 2] = 1.0 if visibility > 1.0 else 0.0
-            visibility_valid[union_idx] = True
+        if visibility_target in {"coco", "positive_is_visible"}:
+            pass
         elif visibility_target == "visible_if_valid":
             keypoints[union_idx, 2] = 1.0
             visibility_valid[union_idx] = True
@@ -246,18 +255,18 @@ def coco_to_union(
     image_width: float,
     image_height: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Treat every annotated COCO joint as a positive visibility target.
+    """Preserve COCO visible/occluded/missing semantics.
 
-    Both visible (v=2) and occluded-but-labeled (v=1) joints supervise
-    coordinates and the shared visibility head. Missing joints (v=0) remain
-    excluded from all pose losses.
+    Visible joints (v=2) are positive visibility targets. Occluded (v=1) and
+    missing/truncated (v=0) schema joints are visibility negatives; only v>0
+    joints retain coordinate and OKS supervision.
     """
     return _schema_to_union_impl(
         flat_keypoints,
         "COCO17",
         image_width,
         image_height,
-        visibility_target="visible_if_valid",
+        visibility_target="coco",
     )
 
 
@@ -266,13 +275,13 @@ def crowdpose_to_union(
     image_width: float,
     image_height: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Treat every annotated CrowdPose joint as visible while keeping its head separate."""
+    """Use COCO-style visibility targets while keeping the CrowdPose head separate."""
     return _schema_to_union_impl(
         flat_keypoints,
         "CrowdPose14",
         image_width,
         image_height,
-        visibility_target="visible_if_valid",
+        visibility_target="coco",
     )
 
 
@@ -290,5 +299,5 @@ def mpii_to_union(
         "MPII16",
         image_width,
         image_height,
-        visibility_target="visible_if_valid",
+        visibility_target="positive_is_visible",
     )

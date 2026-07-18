@@ -531,6 +531,12 @@ def parse_args() -> argparse.Namespace:
         help="Weight for matched per-keypoint presence/visibility BCE.",
     )
     parser.add_argument(
+        "--w_keypoint_quality",
+        type=float,
+        default=0.1,
+        help="Weight for direct per-keypoint localization-quality supervision.",
+    )
+    parser.add_argument(
         "--w_person_confidence",
         type=float,
         default=1.0,
@@ -713,6 +719,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Only draw predicted joints whose learned visibility probability reaches this threshold.",
+    )
+    parser.add_argument(
+        "--visualize_keypoint_quality_threshold",
+        type=float,
+        default=0.3,
+        help="Only draw predicted joints whose learned localization quality reaches this threshold.",
     )
     parser.add_argument(
         "--visualize_nms_iou_thresh",
@@ -4378,6 +4390,7 @@ def update_dataset_metric_ema(
         "loss_image_coord",
         "loss_oks",
         "loss_keypoint_confidence",
+        "loss_keypoint_quality",
         "loss_person_confidence",
         "loss_ref_match",
         "ref_match_accuracy",
@@ -4491,6 +4504,7 @@ def _weighted_loss_items(
         "loss_keypoint_confidence",
         confidence_weight,
     )
+    add("pose", "jointq", "loss_keypoint_quality", weights.keypoint_quality)
     add("pose", "pscore", "loss_person_confidence", weights.person_confidence)
     add("ref", "match", "loss_ref_match", weights.ref_match)
     for decoder_idx, decoder_weight in enumerate(
@@ -4584,6 +4598,7 @@ def format_loss_weights(weights: LossWeights) -> str:
         f"oks={_format_loss_weight(weights.oks)} "
         f"image_coord={_format_loss_weight(weights.image_coord)} "
         f"keypoint_confidence={_format_loss_weight(weights.keypoint_confidence if weights.vis is None else weights.vis)} "
+        f"keypoint_quality={_format_loss_weight(weights.keypoint_quality)} "
         f"person_confidence={_format_loss_weight(weights.person_confidence)} "
         f"ref_match={_format_loss_weight(weights.ref_match)} "
         f"hard={_format_loss_weight(weights.hard_joint)} "
@@ -4789,6 +4804,7 @@ def save_pose_visualization(
     max_instances: int = 8,
     score_threshold: float = 0.05,
     keypoint_visibility_threshold: float = 0.5,
+    keypoint_quality_threshold: float = 0.3,
     draw_all_schema_keypoints: bool = False,
     prediction_row: dict[str, Any] | None = None,
     ref_pose_quality_alpha: float = 0.25,
@@ -4863,6 +4879,16 @@ def save_pose_visualization(
     )
     ref_scores = sample_ref_logits.sigmoid()
     schema_valid = outputs["keypoint_valid_mask"][sample_idx].detach().cpu().bool()
+    pose_lqe_joint_logits = outputs.get("pose_lqe_joint_logits")
+    keypoint_quality_scores = (
+        pose_lqe_joint_logits[sample_idx, :num_queries]
+        .detach()
+        .sigmoid()
+        .float()
+        .cpu()
+        if torch.is_tensor(pose_lqe_joint_logits)
+        else torch.ones_like(keypoints[..., 2])
+    )
 
     target = batch["targets"][sample_idx]
     source_datasets = batch.get("source_datasets", [])
@@ -5100,7 +5126,8 @@ def save_pose_visualization(
             schema_valid
             if draw_all_schema_keypoints
             else schema_valid
-            & (keypoints[idx, :, 2] >= float(keypoint_visibility_threshold))
+            & (keypoints[idx, :, 2] > float(keypoint_visibility_threshold))
+            & (keypoint_quality_scores[idx] > float(keypoint_quality_threshold))
         )
         _draw_pose(
             draw,
@@ -6068,6 +6095,10 @@ def main() -> None:
         raise ValueError(
             "--visualize_keypoint_visibility_threshold must be in [0, 1]."
         )
+    if not 0.0 <= args.visualize_keypoint_quality_threshold <= 1.0:
+        raise ValueError(
+            "--visualize_keypoint_quality_threshold must be in [0, 1]."
+        )
     if not 0.0 <= args.locate_proxy_probability <= 1.0:
         raise ValueError("--locate_proxy_probability must be in [0, 1].")
     if args.locate_proxy_center_noise < 0.0 or args.locate_proxy_scale_noise < 0.0:
@@ -6090,6 +6121,8 @@ def main() -> None:
         raise ValueError("All box refinement loss weights must be non-negative.")
     if args.w_keypoint_confidence < 0.0:
         raise ValueError("--w_keypoint_confidence must be non-negative.")
+    if args.w_keypoint_quality < 0.0:
+        raise ValueError("--w_keypoint_quality must be non-negative.")
     if args.w_keypoint_dn < 0.0:
         raise ValueError("--w_keypoint_dn must be non-negative.")
     if args.w_person_confidence < 0.0:
@@ -6778,6 +6811,46 @@ def main() -> None:
         )
         if is_main_process():
             print(f"Initialized QwenPose extra modules from {init_checkpoint}")
+
+    # DeepSpeed creates FP32 optimizer master parameters from the model values
+    # present at ``deepspeed.initialize`` time.  Loading a lightweight
+    # (model-only) checkpoint after that point updates the module parameters but
+    # leaves those master copies stale; the first optimizer step then writes the
+    # pre-checkpoint/random values back into the model.  Full DeepSpeed
+    # checkpoints must still be restored through ``engine.load_checkpoint``, but
+    # model-only resumes have to be applied before the optimizer is constructed.
+    preloaded_deepspeed_resume: tuple[int, Path, dict[str, object]] | None = None
+    if use_deepspeed and args.resume_from_checkpoint is not None:
+        candidate_checkpoint = resolve_training_checkpoint(args.resume_from_checkpoint)
+        has_deepspeed_state = (
+            candidate_checkpoint.is_dir()
+            and (candidate_checkpoint / DEEPSPEED_TAG).exists()
+        )
+        if not has_deepspeed_state:
+            (
+                preloaded_step,
+                _,
+                _,
+                preloaded_checkpoint,
+                preloaded_payload,
+            ) = load_training_checkpoint(
+                training_model,
+                optimizer=None,
+                checkpoint_path=candidate_checkpoint,
+                load_optimizer=False,
+                scaler=None,
+                load_scaler=False,
+            )
+            preloaded_deepspeed_resume = (
+                preloaded_step,
+                preloaded_checkpoint,
+                preloaded_payload,
+            )
+            if is_main_process():
+                print(
+                    "Preloaded lightweight checkpoint before DeepSpeed optimizer "
+                    f"initialization: {preloaded_checkpoint}"
+                )
     if is_main_process():
         print(f"Backbone: {backbone_name}")
         print(
@@ -6942,6 +7015,7 @@ def main() -> None:
         coord=args.w_coord,
         image_coord=args.w_image_coord,
         keypoint_confidence=args.w_keypoint_confidence,
+        keypoint_quality=args.w_keypoint_quality,
         person_confidence=args.w_person_confidence,
         ref_match=args.w_ref_match,
         lm=(0.0 if backbone_name == "eagle" else args.w_lm),
@@ -7023,6 +7097,9 @@ def main() -> None:
             optimizer_loaded = True
             used_deepspeed_checkpoint = True
             resume_container = dict(client_state or {})
+        elif preloaded_deepspeed_resume is not None:
+            global_step, resolved_checkpoint, payload = preloaded_deepspeed_resume
+            resume_container = dict(payload)
         else:
             global_step, optimizer_loaded, scaler_loaded, resolved_checkpoint, payload = load_training_checkpoint(
                 active_model,
@@ -7735,6 +7812,7 @@ def main() -> None:
                                 sample_idx=vis_sample_idx,
                                 max_instances=args.visualize_max_instances,
                                 keypoint_visibility_threshold=args.visualize_keypoint_visibility_threshold,
+                                keypoint_quality_threshold=args.visualize_keypoint_quality_threshold,
                                 draw_all_schema_keypoints=False,
                                 proposal_nms_iou_thresh=args.visualize_nms_iou_thresh,
                                 proposal_objectness_threshold=args.visualize_objectness_threshold,

@@ -392,8 +392,11 @@ W_OKS="${W_OKS:-2.0}"
 # W_IMAGE_COORD：最终关键点整图归一化 SmoothL1 loss 权重。
 W_IMAGE_COORD="${W_IMAGE_COORD:-8.0}"
 
-# W_KEYPOINT_CONFIDENCE：每个关键点定位质量置信度 loss 权重。
+# W_KEYPOINT_CONFIDENCE：每个关键点二值可见性 loss 权重（兼容旧参数名）。
 W_KEYPOINT_CONFIDENCE="${W_KEYPOINT_CONFIDENCE:-0.1}"
+
+# W_KEYPOINT_QUALITY：逐关键点 detached OKS 定位质量监督权重。
+W_KEYPOINT_QUALITY="${W_KEYPOINT_QUALITY:-0.1}"
 
 # W_PERSON_CONFIDENCE：人体实例质量置信度 loss 权重；0 表示关闭该头。
 W_PERSON_CONFIDENCE="${W_PERSON_CONFIDENCE:-0.5}"
@@ -496,7 +499,10 @@ VISUALIZE_OBJECTNESS_THRESHOLD="${VISUALIZE_OBJECTNESS_THRESHOLD:-0.05}"
 VISUALIZE_POSE_THRESHOLD="${VISUALIZE_POSE_THRESHOLD:-0.05}"
 
 # 预测关键点可见性低于该阈值时不绘制该点及相关骨架边。
-VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD="${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD:-0.50}"
+VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD="${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD:-0.60}"
+
+# 预测关键点定位质量低于该阈值时不绘制该点及相关骨架边。
+VISUALIZE_KEYPOINT_QUALITY_THRESHOLD="${VISUALIZE_KEYPOINT_QUALITY_THRESHOLD:-0.30}"
 
 # VISUALIZE_MIN_GT_AREA_RATIO：最大 GT 人体面积低于该比例时跳过可视化。
 VISUALIZE_MIN_GT_AREA_RATIO="${VISUALIZE_MIN_GT_AREA_RATIO:-0.005}"
@@ -655,6 +661,8 @@ common_args() {
     --w_image_coord "${W_IMAGE_COORD}"
     # --w_keypoint_confidence：逐关键点存在性/可见性 BCE 权重（兼容旧参数名）。
     --w_keypoint_confidence "${W_KEYPOINT_CONFIDENCE}"
+    # --w_keypoint_quality：逐关键点 detached OKS 定位质量监督权重。
+    --w_keypoint_quality "${W_KEYPOINT_QUALITY}"
     # --w_person_confidence：直接 pose AP/OKS 分数头 loss 权重（兼容旧参数名）。
     --w_person_confidence "${W_PERSON_CONFIDENCE}"
     # --w_ref_match：RefHuman 文本匹配 loss 权重。
@@ -721,6 +729,8 @@ common_args() {
     --visualize_pose_threshold "${VISUALIZE_POSE_THRESHOLD}"
     # --visualize_keypoint_visibility_threshold：不可见点及相关边不绘制。
     --visualize_keypoint_visibility_threshold "${VISUALIZE_KEYPOINT_VISIBILITY_THRESHOLD}"
+    # --visualize_keypoint_quality_threshold：低定位质量点及相关边不绘制。
+    --visualize_keypoint_quality_threshold "${VISUALIZE_KEYPOINT_QUALITY_THRESHOLD}"
     # --visualize_min_gt_area_ratio：小人体可视化过滤阈值。
     --visualize_min_gt_area_ratio "${VISUALIZE_MIN_GT_AREA_RATIO}"
     # --device：训练设备类型；物理卡由 CUDA_VISIBLE_DEVICES 控制。

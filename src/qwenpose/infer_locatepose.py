@@ -244,6 +244,12 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="只绘制可见性概率达到该阈值的关键点。",
     )
+    parser.add_argument(
+        "--visualize_keypoint_quality_threshold",
+        type=float,
+        default=0.3,
+        help="只绘制定位质量概率达到该阈值的关键点。",
+    )
     # --disable_progress：关闭 tqdm 进度条；适合写日志或非交互环境。
     parser.add_argument("--disable_progress", action="store_true", help="关闭进度条。")
     # --device：PyTorch PoseHead/Locate 特征推理设备；指定 gpu 时通常保持 cuda 即可。
@@ -1175,6 +1181,14 @@ def main() -> None:
         raise ValueError("--box_nms_iou_thresh must be in [0, 1].")
     if not 0.0 <= args.post_pose_nms_iou_thresh <= 1.0:
         raise ValueError("--post_pose_nms_iou_thresh must be in [0, 1].")
+    if not 0.0 <= args.visualize_keypoint_visibility_threshold <= 1.0:
+        raise ValueError(
+            "--visualize_keypoint_visibility_threshold must be in [0, 1]."
+        )
+    if not 0.0 <= args.visualize_keypoint_quality_threshold <= 1.0:
+        raise ValueError(
+            "--visualize_keypoint_quality_threshold must be in [0, 1]."
+        )
     if args.ref_pose_quality_alpha < 0.0:
         raise ValueError("--ref_pose_quality_alpha must be non-negative.")
     if args.locate_box_max_new_tokens <= 0:
@@ -1402,6 +1416,7 @@ def main() -> None:
                                 max_instances=args.visualize_max_instances,
                                 score_threshold=args.score_threshold,
                                 keypoint_visibility_threshold=args.visualize_keypoint_visibility_threshold,
+                                keypoint_quality_threshold=args.visualize_keypoint_quality_threshold,
                                 prediction_row=rows[local_idx],
                                 ref_pose_quality_alpha=args.ref_pose_quality_alpha,
                             )

@@ -63,6 +63,8 @@ class LossWeights:
     image_coord: float = 5.0
     # Legacy flag name; this now weights per-joint presence/visibility BCE.
     keypoint_confidence: float = 0.1
+    # Direct per-joint localization quality trained against detached OKS.
+    keypoint_quality: float = 0.1
     # Direct pose AP score trained with evaluator-aligned detached OKS targets.
     person_confidence: float = 0.0
     # RefHuman expression-to-person classification over the generated candidates.
@@ -1039,6 +1041,7 @@ def compute_box_conditioned_pose_losses(
     total_image_coord = torch.tensor(0.0, device=device)
     total_hard_joint = torch.tensor(0.0, device=device)
     total_confidence = torch.tensor(0.0, device=device)
+    total_keypoint_quality = torch.tensor(0.0, device=device)
     total_coarse_coord = torch.tensor(0.0, device=device)
     total_deform_coord = torch.tensor(0.0, device=device)
     total_joint_loss = torch.zeros(len(UNION_KEYPOINTS), device=device)
@@ -1064,6 +1067,7 @@ def compute_box_conditioned_pose_losses(
 
     num_pos = 0
     num_confidence_instances = 0
+    num_keypoint_quality_instances = 0
     num_hard_groups = 0
 
     for b, target in enumerate(targets):
@@ -1094,7 +1098,13 @@ def compute_box_conditioned_pose_losses(
             matched_people = supervised_people
 
         visibility_valid = target.get("visibility_valid", gt_valid).to(device)[:n].bool()
-        visibility_people = matched_people & visibility_valid.any(dim=-1)
+        # Box-only annotations do not tell us that every joint is invisible.
+        # Use schema-wide negatives only for people with at least one pose
+        # coordinate, which covers partial/truncated annotated people without
+        # turning wholly unannotated boxes into false all-zero skeletons.
+        visibility_people = (
+            matched_people & supervised_people & visibility_valid.any(dim=-1)
+        )
         visibility_logits_all = outputs.get(
             "pred_keypoint_visibility_logits",
             outputs.get("keypoint_confidence_logits"),
@@ -1132,6 +1142,28 @@ def compute_box_conditioned_pose_losses(
         n = int(supervised_people.sum().item())
 
         pred_keypoints = pred_keypoints_all[supervised_people]
+
+        keypoint_quality_logits_all = outputs.get("pose_lqe_joint_logits")
+        if torch.is_tensor(keypoint_quality_logits_all):
+            keypoint_quality_logits = keypoint_quality_logits_all[b, q]
+            keypoint_quality_targets = per_joint_oks_score(
+                pred_keypoints[..., :2].detach(),
+                gt_keypoints[..., :2],
+                loss_areas,
+                sigmas,
+            ).detach()
+            keypoint_quality_joint_loss = _quality_focal_loss(
+                keypoint_quality_logits,
+                keypoint_quality_targets,
+            )
+            keypoint_quality_per_instance = _mean_valid_joints(
+                keypoint_quality_joint_loss,
+                gt_valid,
+            )
+            total_keypoint_quality = (
+                total_keypoint_quality + keypoint_quality_per_instance.sum()
+            )
+            num_keypoint_quality_instances += n
 
         coord_joint = per_joint_normalized_coord_loss(
             pred_keypoints, gt_keypoints, gt_valid, loss_boxes
@@ -1194,6 +1226,8 @@ def compute_box_conditioned_pose_losses(
         "loss_image_coord": total_image_coord / denom,
         "loss_hard_joint": total_hard_joint / max(num_hard_groups, 1),
         "loss_keypoint_confidence": total_confidence / max(num_confidence_instances, 1),
+        "loss_keypoint_quality": total_keypoint_quality
+        / max(num_keypoint_quality_instances, 1),
     }
     loss_parts["loss_keypoint_visibility"] = loss_parts[
         "loss_keypoint_confidence"
@@ -1220,6 +1254,7 @@ def compute_box_conditioned_pose_losses(
         + weights.image_coord * loss_parts["loss_image_coord"]
         + weights.hard_joint * loss_parts["loss_hard_joint"]
         + _confidence_weight(weights) * loss_parts["loss_keypoint_confidence"]
+        + weights.keypoint_quality * loss_parts["loss_keypoint_quality"]
         + graph_anchor
     )
     for decoder_idx, decoder_weight in enumerate(
